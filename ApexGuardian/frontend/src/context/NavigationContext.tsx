@@ -336,6 +336,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
   const activateRoute = (newRoute: CandidateRoute, preservePosition: boolean = false) => {
     if (isTransitioningRouteRef.current) return;
+    if (!newRoute || !newRoute.geometry?.coordinates) return;
+
+    console.log(`[NavigationContext] Activating new route ${newRoute.route_id} with ${newRoute.geometry.coordinates.length} points.`);
+
     isTransitioningRouteRef.current = true;
 
     if (animationFrameIdRef.current) {
@@ -347,8 +351,24 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // Find where we are on the new route
       const proj = projectPointOntoRoute(currentLocation, newRoute);
       simDistanceTraversedRef.current = proj.distanceAlongRouteMeters;
-      setCurrentLocation(proj.projectedPoint);
-      // Ensure we don't jump backwards or out of bounds (handled by proj distance)
+      // IMPORTANT: Do not teleport the vehicle to the projected point.
+      // Let the simulation loop smoothly interpolate from the current physical location.
+      
+      // Deterministic Debug Check
+      const firstCoord = newRoute.geometry.coordinates[0];
+      const lastCoord = newRoute.geometry.coordinates[newRoute.geometry.coordinates.length - 1];
+      const totalRouteDistance = newRoute.distance_meters || 0;
+      const distToDest = selectedDestination ? haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat) : 0;
+      
+      console.log(`[REROUTE ACTIVATION DEBUG]
+      - currentLocation: [${currentLocation.lon.toFixed(5)}, ${currentLocation.lat.toFixed(5)}]
+      - route length points: ${newRoute.geometry.coordinates.length}
+      - new route first: [${firstCoord[0].toFixed(5)}, ${firstCoord[1].toFixed(5)}]
+      - new route last: [${lastCoord[0].toFixed(5)}, ${lastCoord[1].toFixed(5)}]
+      - projected distance along route: ${proj.distanceAlongRouteMeters.toFixed(1)}m
+      - total route geometry distance: ${totalRouteDistance.toFixed(1)}m
+      - distance from currentLocation to destination: ${distToDest.toFixed(1)}m`);
+      
     } else {
       simDistanceTraversedRef.current = 0;
       if (newRoute.geometry?.coordinates?.length > 0) {
