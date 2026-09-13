@@ -4,13 +4,13 @@ import React, { useEffect, useRef } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { useNavigation, BENGALURU_CENTER } from "@/context/NavigationContext";
-import { reverseGeocode } from "@/lib/api";
+import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 
 export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
 
 export const BENGALURU_MAX_BOUNDS: maplibregl.LngLatBoundsLike = [
-  [77.3500, 12.7000],
-  [77.8500, 13.2500],
+  [77.4000, 12.8000], // South-West
+  [77.8000, 13.1500], // North-East
 ];
 
 export const MapCanvas: React.FC = () => {
@@ -18,6 +18,9 @@ export const MapCanvas: React.FC = () => {
   const mapRef = useRef<maplibregl.Map | null>(null);
   const originMarkerRef = useRef<maplibregl.Marker | null>(null);
   const destMarkerRef = useRef<maplibregl.Marker | null>(null);
+  const vehicleMarkerRef = useRef<maplibregl.Marker | null>(null);
+  const hotspotMarkersRef = useRef<maplibregl.Marker[]>([]);
+  const lastCameraFollowTimeRef = useRef<number>(0);
 
   const {
     selectedOrigin,
@@ -35,9 +38,14 @@ export const MapCanvas: React.FC = () => {
     setPinDropMode,
     calculateRoutes,
     activeLayerMode,
+    isEmergencyMode,
+    isNavigating,
+    currentLocation,
+    vehicleBearing,
+    activeRerouteRecommendation,
   } = useNavigation();
 
-  // Initialize MapLibre GL with High-DPI Crisp Tile Specs & Spatial Bounds
+  // Initialize MapLibre GL
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) return;
 
@@ -48,15 +56,11 @@ export const MapCanvas: React.FC = () => {
         sources: {
           "carto-positron-hd": {
             type: "raster",
-            tiles: [
-              "https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png",
-              "https://b.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}@2x.png"
-            ],
-            tileSize: 512,
-            zoomOffset: -1,
-            maxzoom: 18,
-            attribution: "&copy; OpenStreetMap contributors &copy; CARTO"
-          }
+            tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+            tileSize: 256,
+            maxzoom: 19,
+            attribution: "&copy; OpenStreetMap contributors",
+          },
         },
         layers: [
           {
@@ -64,19 +68,22 @@ export const MapCanvas: React.FC = () => {
             type: "raster",
             source: "carto-positron-hd",
             minzoom: 0,
-            maxzoom: 19
-          }
-        ]
+            maxzoom: 20,
+          },
+        ],
       },
       center: [BENGALURU_CENTER.lon, BENGALURU_CENTER.lat],
       zoom: 12.5,
       minZoom: 10,
-      maxZoom: 18,
+      maxZoom: 19,
       maxBounds: BENGALURU_MAX_BOUNDS,
       pitch: 0,
       bearing: 0,
       attributionControl: false,
-      pixelRatio: typeof window !== "undefined" ? window.devicePixelRatio || 1 : 1,
+    });
+
+    map.on("load", () => {
+      map.resize();
     });
 
     map.on("zoom", () => setCurrentZoom(map.getZoom()));
@@ -85,14 +92,19 @@ export const MapCanvas: React.FC = () => {
     mapRef.current = map;
     mapRefContainer.current = map;
 
+    const timer = setTimeout(() => {
+      if (mapRef.current) mapRef.current.resize();
+    }, 250);
+
     return () => {
+      clearTimeout(timer);
       map.remove();
       mapRef.current = null;
       mapRefContainer.current = null;
     };
   }, [setCurrentZoom]);
 
-  // ResizeObserver & Window Resize Handler
+  // Window Resize Listener
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapContainerRef.current) return;
@@ -111,7 +123,15 @@ export const MapCanvas: React.FC = () => {
     };
   }, []);
 
-  // Map Click Listener for Pin Drop Modes with Reverse Geocoding
+  // Update cursor based on pinDropMode
+  useEffect(() => {
+    if (mapRef.current) {
+      mapRef.current.getCanvas().style.cursor = pinDropMode !== "none" ? "crosshair" : "";
+    }
+  }, [pinDropMode]);
+
+
+  // Map Click Listener for Pin Drop
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
@@ -122,7 +142,7 @@ export const MapCanvas: React.FC = () => {
       const { lng, lat } = e.lngLat;
       const roundedLat = parseFloat(lat.toFixed(5));
       const roundedLon = parseFloat(lng.toFixed(5));
-      
+
       let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
       try {
         const rev = await reverseGeocode(roundedLat, roundedLon);
@@ -154,23 +174,35 @@ export const MapCanvas: React.FC = () => {
     return () => {
       map.off("click", handleMapClick);
     };
-  }, [pinDropMode, selectedOrigin, selectedDestination, setSelectedOrigin, setSelectedDestination, setSourceQuery, setDestinationQuery, setPinDropMode, calculateRoutes]);
+  }, [
+    pinDropMode,
+    selectedOrigin,
+    selectedDestination,
+    setSelectedOrigin,
+    setSelectedDestination,
+    setSourceQuery,
+    setDestinationQuery,
+    setPinDropMode,
+    calculateRoutes,
+  ]);
 
-  // Update Draggable Source (Green) and Destination (Red) Markers with Reverse Geocoding
+  // Origin Marker (Section 5: Matching Drop-Pin Style in Emerald Green)
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
 
-    // Green Source Marker
     if (selectedOrigin) {
       if (!originMarkerRef.current) {
         const el = document.createElement("div");
-        el.className = "relative flex items-center justify-center w-6 h-6 cursor-grab active:cursor-grabbing";
+        el.className =
+          "cursor-grab active:cursor-grabbing hover:scale-110 transition duration-300";
         el.innerHTML = `
-          <span className="absolute inline-flex w-full h-full rounded-full bg-emerald-400 opacity-75 animate-ping"></span>
-          <span className="relative inline-flex w-4 h-4 rounded-full bg-emerald-600 border-2 border-white shadow-md"></span>
+          <svg width="34" height="44" viewBox="0 0 32 42" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M16 0C7.163 0 0 7.163 0 16C0 28 16 42 16 42C16 42 32 28 32 16C32 7.163 24.837 0 16 0ZM16 22C12.686 22 10 19.314 10 16C10 12.686 12.686 10 16 10C19.314 10 22 12.686 22 16C22 19.314 19.314 22 16 22Z" fill="#10B981"/>
+            <path d="M16 20C18.2091 20 20 18.2091 20 16C20 13.7909 18.2091 12 16 12C13.7909 12 12 13.7909 12 16C12 18.2091 13.7909 20 16 20Z" fill="#047857"/>
+          </svg>
         `;
-        const marker = new maplibregl.Marker({ element: el, draggable: true })
+        const marker = new maplibregl.Marker({ element: el, anchor: "bottom", draggable: true })
           .setLngLat([selectedOrigin.lon, selectedOrigin.lat])
           .addTo(map);
 
@@ -178,7 +210,7 @@ export const MapCanvas: React.FC = () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
-          
+
           let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
           try {
             const rev = await reverseGeocode(roundedLat, roundedLon);
@@ -203,12 +235,18 @@ export const MapCanvas: React.FC = () => {
       originMarkerRef.current.remove();
       originMarkerRef.current = null;
     }
+  }, [selectedOrigin, selectedDestination, setSelectedOrigin, setSourceQuery, calculateRoutes]);
 
-    // Red Destination Marker
+  // Destination Marker
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
     if (selectedDestination) {
       if (!destMarkerRef.current) {
         const el = document.createElement("div");
-        el.className = "cursor-grab active:cursor-grabbing transform -translate-x-1/2 -translate-y-full hover:scale-110 transition duration-300";
+        el.className =
+          "cursor-grab active:cursor-grabbing hover:scale-110 transition duration-300";
         el.innerHTML = `
           <svg width="34" height="44" viewBox="0 0 32 42" fill="none" xmlns="http://www.w3.org/2000/svg">
             <path d="M16 0C7.163 0 0 7.163 0 16C0 28 16 42 16 42C16 42 32 28 32 16C32 7.163 24.837 0 16 0ZM16 22C12.686 22 10 19.314 10 16C10 12.686 12.686 10 16 10C19.314 10 22 12.686 22 16C22 19.314 19.314 22 16 22Z" fill="#EA4335"/>
@@ -223,7 +261,7 @@ export const MapCanvas: React.FC = () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
-          
+
           let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
           try {
             const rev = await reverseGeocode(roundedLat, roundedLon);
@@ -248,173 +286,402 @@ export const MapCanvas: React.FC = () => {
       destMarkerRef.current.remove();
       destMarkerRef.current = null;
     }
-  }, [selectedOrigin, selectedDestination, setSelectedOrigin, setSelectedDestination, setSourceQuery, setDestinationQuery, calculateRoutes]);
+  }, [selectedDestination, selectedOrigin, setSelectedDestination, setDestinationQuery, calculateRoutes]);
 
-  // Clean Polyline Map Canvas Rendering (Case A: Dual Routes vs Case B: Single Route)
+  // Smooth Vehicle Marker & Camera Follow (Section 4)
   useEffect(() => {
     const map = mapRef.current;
-    if (!map || routes.length === 0) return;
+    if (!map) return;
+
+    if (isNavigating && currentLocation) {
+      if (!vehicleMarkerRef.current) {
+        const el = document.createElement("div");
+        el.className = "relative flex items-center justify-center pointer-events-none";
+        el.style.width = "42px";
+        el.style.height = "42px";
+        el.innerHTML = `
+          <div class="absolute w-10 h-10 rounded-full bg-blue-500/25 animate-ping"></div>
+          <div class="vehicle-inner relative w-9 h-9 rounded-full bg-slate-900 border-2 border-white shadow-2xl flex items-center justify-center transition-transform duration-75 ease-out">
+            <svg class="w-5 h-5 text-blue-400 fill-current" viewBox="0 0 24 24">
+              <path d="M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z" />
+            </svg>
+          </div>
+        `;
+
+        vehicleMarkerRef.current = new maplibregl.Marker({ element: el })
+          .setLngLat([currentLocation.lon, currentLocation.lat])
+          .addTo(map);
+      } else {
+        // Smooth fractional position updates
+        vehicleMarkerRef.current.setLngLat([currentLocation.lon, currentLocation.lat]);
+        const innerIcon = vehicleMarkerRef.current.getElement().querySelector(".vehicle-inner") as HTMLElement;
+        if (innerIcon) {
+          innerIcon.style.transform = `rotate(${vehicleBearing}deg)`;
+        }
+      }
+
+      // Smooth camera follow without competing with marker animation
+      const now = performance.now();
+      if (now - lastCameraFollowTimeRef.current > 200) {
+        lastCameraFollowTimeRef.current = now;
+        map.easeTo({
+          center: [currentLocation.lon, currentLocation.lat],
+          duration: 250,
+          easing: (t) => t,
+          zoom: Math.max(14.5, map.getZoom()),
+        });
+      }
+    } else if (vehicleMarkerRef.current) {
+      vehicleMarkerRef.current.remove();
+      vehicleMarkerRef.current = null;
+    }
+  }, [isNavigating, currentLocation, vehicleBearing]);
+
+  // Render Multi-Color Congestion Segments & Congestion Drop Pins (Sections 3 & 6)
+  const renderedLayersRef = useRef<string[]>([]);
+  const renderedSourcesRef = useRef<string[]>([]);
+  const renderedListenersRef = useRef<{ layerId: string; listener: any }[]>([]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const cleanupOldRoutes = () => {
+      renderedLayersRef.current.forEach((layerId) => {
+        if (map.getLayer(layerId)) {
+          map.removeLayer(layerId);
+        }
+      });
+      renderedLayersRef.current = [];
+
+      renderedSourcesRef.current.forEach((sourceId) => {
+        if (map.getSource(sourceId)) {
+          map.removeSource(sourceId);
+        }
+      });
+      renderedSourcesRef.current = [];
+
+      renderedListenersRef.current.forEach(({ layerId, listener }) => {
+        map.off("click", layerId, listener);
+      });
+      renderedListenersRef.current = [];
+
+      // Clear all hotspot drop pin markers
+      hotspotMarkersRef.current.forEach((m) => m.remove());
+      hotspotMarkersRef.current = [];
+    };
 
     const renderPolylines = () => {
-      const hasAIRoute = routes.some((r) => r.is_ai_recommended && routes.length > 1);
-      const standardRoute = routes.find((r) => !r.is_ai_recommended) || routes[0];
-      const aiRoute = routes.find((r) => r.is_ai_recommended && routes.length > 1);
+      cleanupOldRoutes();
+      if (!routes || routes.length === 0) return;
 
-      const isStandardActive = routes[activeRouteIndex]?.route_index === standardRoute?.route_index && !routes[activeRouteIndex]?.is_ai_recommended;
+      // Draw non-active routes first, then active route on top
+      const sortedIndices = routes.map((_, idx) => idx).sort((a, b) => {
+        if (a === activeRouteIndex) return 1;
+        if (b === activeRouteIndex) return -1;
+        return 0;
+      });
 
-      // 1. STANDARD ROUTE LAYER (Slate Grey #64748B)
-      if (standardRoute && standardRoute.geometry) {
-        if (map.getSource("source-standard")) {
-          (map.getSource("source-standard") as maplibregl.GeoJSONSource).setData({
-            type: "Feature",
-            properties: { type: "standard" },
-            geometry: standardRoute.geometry as any,
+      sortedIndices.forEach((idx) => {
+        const route = routes[idx];
+        if (!route || !route.geometry) return;
+
+        const isSelected = idx === activeRouteIndex;
+        const isAI = Boolean(route.is_ai_recommended);
+
+        // Layer Mode Filtering
+        if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;
+        if (activeLayerMode === "STANDARD_ONLY" && isAI && routes.length > 1) return;
+
+        if (route.segments && route.segments.length > 0) {
+          // Render Segmented Color-Coded Polyline for All Routes
+          route.segments.forEach((seg, sIdx) => {
+            const sourceId = `seg-source-${idx}-${sIdx}`;
+            const casingLayerId = `seg-casing-${idx}-${sIdx}`;
+            const lineLayerId = `seg-line-${idx}-${sIdx}`;
+
+            let segmentColor = seg.color;
+            if (!isAI && seg.congestion_level === "CLEAR") {
+              segmentColor = "#3B82F6";
+            }
+
+            map.addSource(sourceId, {
+              type: "geojson",
+              data: {
+                type: "Feature",
+                properties: { level: seg.congestion_level, color: segmentColor, routeIndex: idx },
+                geometry: {
+                  type: "LineString",
+                  coordinates: seg.coordinates,
+                },
+              },
+            });
+            renderedSourcesRef.current.push(sourceId);
+
+            // Casing Glow
+            map.addLayer({
+              id: casingLayerId,
+              type: "line",
+              source: sourceId,
+              layout: { "line-join": "round", "line-cap": "round" },
+              paint: {
+                "line-color": isSelected ? "#0F172A" : "#1E293B",
+                "line-width": isSelected ? 12 : 8,
+                "line-opacity": isSelected ? 0.45 : 0.2,
+              },
+            });
+            renderedLayersRef.current.push(casingLayerId);
+
+            // Segment Line
+            map.addLayer({
+              id: lineLayerId,
+              type: "line",
+              source: sourceId,
+              layout: { "line-join": "round", "line-cap": "round" },
+              paint: {
+                "line-color": segmentColor,
+                "line-width": isSelected ? 7 : 5,
+                "line-opacity": isSelected ? 1.0 : 0.65,
+              },
+            });
+            renderedLayersRef.current.push(lineLayerId);
+
+            // Click-to-switch behavior
+            if (!isSelected) {
+              const clickListener = () => {
+                if (!isNavigating) {
+                  setActiveRouteIndex(idx);
+                }
+              };
+              map.on("click", lineLayerId, clickListener);
+              renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
+            }
           });
+
+          // Section 3: Render Distinct Congestion Drop Pins Anchored Directly at Hotspot GPS Points
+          if (route.hotspots && route.hotspots.length > 0) {
+            route.hotspots.forEach((hotspot) => {
+              const el = document.createElement("div");
+              const level = hotspot.congestion_level || "HEAVY";
+              const isSevere = level === "SEVERE";
+              const isModerate = level === "MODERATE";
+              const delayM = Math.max(1, Math.round((hotspot.estimated_delay_seconds || 120) / 60));
+
+              let pinFill = "#DC2626"; // Red (Heavy)
+              let pinStroke = "#F87171";
+              let shadowColor = "rgba(220, 38, 38, 0.4)";
+              let iconSvg = "";
+              let titleColor = "text-rose-400";
+              let badgeBg = "bg-rose-600 text-white";
+
+              if (isModerate) {
+                pinFill = "#D97706"; // Amber (Moderate)
+                pinStroke = "#FBBF24";
+                shadowColor = "rgba(217, 119, 6, 0.35)";
+                titleColor = "text-amber-400";
+                badgeBg = "bg-amber-600 text-white";
+                // Shape: Single vehicle silhouette
+                iconSvg = `
+                  <path d="M22 13H14c-.5 0-.9.3-1.1.7L11.5 16v4.5c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7V16l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#D97706"/>
+                `;
+              } else if (isSevere) {
+                pinFill = "#991B1B"; // Crimson Maroon (Severe)
+                pinStroke = "#E11D48";
+                shadowColor = "rgba(225, 29, 72, 0.6)";
+                titleColor = "text-rose-400";
+                badgeBg = "bg-rose-700 text-white ring-1 ring-rose-400";
+                // Shape: Queued vehicles + warning badge (!)
+                iconSvg = `
+                  <path d="M19 10h-4c-.3 0-.5.2-.6.4L13.5 12h7l-.7-1.6c-.1-.2-.4-.4-.8-.4z" fill="#991B1B" opacity="0.6"/>
+                  <path d="M22 13.5H14c-.5 0-.9.3-1.1.7L11.5 16.5V21c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-4.5l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#991B1B"/>
+                  <circle cx="28" cy="8" r="5.5" fill="#FBBF24" stroke="#78350F" stroke-width="1"/>
+                  <path d="M28 5v4M28 10v1" stroke="#991B1B" stroke-width="1.5" stroke-linecap="round"/>
+                `;
+              } else {
+                // Shape: Group of 3 vehicles
+                iconSvg = `
+                  <path d="M15 13H11c-.3 0-.5.2-.6.4l-1.4 1.8V18c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-.5h6v.5c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-2.8l-1.4-1.8c-.1-.2-.3-.4-.6-.4zm-4.1.5h4.2l.4 1.2h-5l.4-1.2zm4.1 3c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5zm-4 0c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5z" fill="#DC2626" opacity="0.5"/>
+                  <path d="M26 13h-4c-.3 0-.5.2-.6.4L20 15.2V18c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-.5h6v.5c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-2.8l-1.4-1.8c-.1-.2-.3-.4-.6-.4zm-4.1.5h4.2l.4 1.2h-5l.4-1.2zm4.1 3c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5zm-4 0c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5z" fill="#DC2626" opacity="0.5"/>
+                  <path d="M22 17.5h-8c-.5 0-.9.3-1.1.7L11.5 20.5V25c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-4.5l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#DC2626"/>
+                `;
+              }
+              // Opacity for non-selected route pins
+              if (!isSelected) {
+                el.style.opacity = "0.5";
+                el.style.pointerEvents = "none";
+              } else {
+                el.style.opacity = "1";
+              }
+
+              el.className = "relative cursor-pointer group";
+              el.style.width = "36px";
+              el.style.height = "48px";
+              el.innerHTML = `
+                <div class="relative flex flex-col items-center transform -translate-x-1/2 -translate-y-full hover:scale-110 active:scale-95 transition duration-200" style="filter: drop-shadow(0 4px 10px ${shadowColor});">
+                  ${isSevere && isSelected ? '<span class="absolute -bottom-1 w-6 h-6 rounded-full bg-rose-500/40 animate-ping pointer-events-none"></span>' : ''}
+
+                  <!-- Teardrop Pin SVG (36x48) -->
+                  <svg width="36" height="48" viewBox="0 0 36 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <!-- Outer Pin Teardrop Shape -->
+                    <path d="M18 0C8.06 0 0 8.06 0 18C0 31.5 18 48 18 48C18 48 36 31.5 36 18C36 8.06 27.94 0 18 0Z" fill="${pinFill}" stroke="${pinStroke}" stroke-width="1.5"/>
+                    <!-- Inner White Emblem Circle -->
+                    <circle cx="18" cy="18" r="11.5" fill="#FFFFFF"/>
+                    <!-- Severity Icon Glyphs -->
+                    ${iconSvg}
+                  </svg>
+
+                  <!-- Delay Badge Mini Tag -->
+                  <div class="absolute -top-1.5 -right-2 px-1.5 py-0.5 rounded-full text-[10px] font-black shadow-md border border-white/40 ${badgeBg}">
+                    +${delayM}m
+                  </div>
+                </div>
+              `;
+
+              // Interactive Popup on Click / Hover (only if selected)
+              if (isSelected) {
+                const popupContent = `
+                  <div class="p-2.5 rounded-xl bg-slate-900/95 text-white text-xs space-y-1 shadow-2xl border border-slate-700 min-w-[170px] backdrop-blur-md">
+                    <div class="font-extrabold text-xs flex items-center gap-1.5 ${titleColor}">
+                      <span>${hotspot.location_name}</span>
+                    </div>
+                    <div class="flex items-center justify-between text-slate-300 font-semibold pt-1 border-t border-slate-800 text-[11px]">
+                      <span>Estimated Delay:</span>
+                      <span class="font-black text-rose-400">+${delayM} min</span>
+                    </div>
+                    <div class="flex items-center justify-between text-slate-300 text-[11px]">
+                      <span>Average Speed:</span>
+                      <span class="font-bold text-amber-300">${hotspot.average_speed_kmh} km/h</span>
+                    </div>
+                    <div class="text-[10px] text-slate-400 font-medium pt-0.5">
+                      ${hotspot.description || hotspot.cause || "Traffic congestion bottleneck"}
+                    </div>
+                  </div>
+                `;
+
+                const popup = new maplibregl.Popup({
+                  offset: [0, -42],
+                  closeButton: false,
+                  className: "custom-hotspot-popup",
+                }).setHTML(popupContent);
+
+                const marker = new maplibregl.Marker({ element: el, anchor: "bottom" })
+                  .setLngLat([hotspot.lon, hotspot.lat])
+                  .setPopup(popup)
+                  .addTo(map);
+
+                hotspotMarkersRef.current.push(marker);
+              } else {
+                const marker = new maplibregl.Marker({ element: el, anchor: "bottom" })
+                  .setLngLat([hotspot.lon, hotspot.lat])
+                  .addTo(map);
+                hotspotMarkersRef.current.push(marker);
+              }
+            });
+          }
         } else {
-          map.addSource("source-standard", {
+          // Fallback if no segments data (should not happen, but safe)
+          const sourceId = `route-source-${idx}`;
+          const casingLayerId = `route-casing-${idx}`;
+          const lineLayerId = `route-line-${idx}`;
+
+          map.addSource(sourceId, {
             type: "geojson",
             data: {
               type: "Feature",
-              properties: { type: "standard" },
-              geometry: standardRoute.geometry as any,
+              properties: { routeIndex: idx },
+              geometry: route.geometry as any,
             },
           });
-        }
+          renderedSourcesRef.current.push(sourceId);
 
-        const stdVis = (activeLayerMode === "AI_ONLY" && hasAIRoute) ? "none" : "visible";
-
-        if (!map.getLayer("layer-standard-casing")) {
           map.addLayer({
-            id: "layer-standard-casing",
+            id: casingLayerId,
             type: "line",
-            source: "source-standard",
-            layout: { "line-join": "round", "line-cap": "round", "visibility": stdVis },
+            source: sourceId,
+            layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-              "line-color": "#334155",
-              "line-width": isStandardActive ? 10 : 8,
-              "line-opacity": isStandardActive ? 0.35 : 0.20,
-              "line-offset": hasAIRoute ? -3.5 : 0,
+              "line-color": isSelected ? "#0F172A" : "#1E293B",
+              "line-width": isSelected ? 12 : 8,
+              "line-opacity": isSelected ? 0.45 : 0.2,
             },
           });
-        } else {
-          map.setLayoutProperty("layer-standard-casing", "visibility", stdVis);
-        }
+          renderedLayersRef.current.push(casingLayerId);
 
-        if (!map.getLayer("layer-standard")) {
           map.addLayer({
-            id: "layer-standard",
+            id: lineLayerId,
             type: "line",
-            source: "source-standard",
-            layout: { "line-join": "round", "line-cap": "round", "visibility": stdVis },
+            source: sourceId,
+            layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-              "line-color": isStandardActive ? "#3B82F6" : "#64748B",
-              "line-width": isStandardActive ? 7 : 6,
-              "line-opacity": isStandardActive ? 0.98 : 0.85,
-              "line-offset": hasAIRoute ? -3.5 : 0,
+              "line-color": isSelected ? (isEmergencyMode ? "#EF4444" : "#3B82F6") : "#64748B",
+              "line-width": isSelected ? 7 : 5,
+              "line-opacity": isSelected ? 1.0 : 0.65,
             },
           });
+          renderedLayersRef.current.push(lineLayerId);
 
-          map.on("click", "layer-standard", () => {
-            const stdIdx = routes.findIndex((r) => r.route_index === standardRoute.route_index);
-            if (stdIdx !== -1) setActiveRouteIndex(stdIdx);
-          });
-          map.on("mouseenter", "layer-standard", () => {
-            map.getCanvas().style.cursor = "pointer";
-          });
-          map.on("mouseleave", "layer-standard", () => {
-            map.getCanvas().style.cursor = "";
-          });
-        } else {
-          map.setLayoutProperty("layer-standard", "visibility", stdVis);
+          if (!isSelected) {
+            const clickListener = () => {
+              if (!isNavigating) {
+                setActiveRouteIndex(idx);
+              }
+            };
+            map.on("click", lineLayerId, clickListener);
+            renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
+          }
         }
-      }
+      });
 
-      // 2. AI RECOMMENDED BYPASS LAYER (Emerald Green #10B981) - Rendered ONLY if Case A (hasAIRoute === true)
-      if (hasAIRoute && aiRoute && aiRoute.geometry) {
-        if (map.getSource("source-ai")) {
-          (map.getSource("source-ai") as maplibregl.GeoJSONSource).setData({
+      // Render Ghost Reroute Line if active (Features 8 & 9)
+      if (activeRerouteRecommendation?.recommended_route?.geometry) {
+        const rerouteSourceId = "ghost-reroute-source";
+        const rerouteLineId = "ghost-reroute-line";
+
+        map.addSource(rerouteSourceId, {
+          type: "geojson",
+          data: {
             type: "Feature",
-            properties: { type: "ai" },
-            geometry: aiRoute.geometry as any,
-          });
-        } else {
-          map.addSource("source-ai", {
-            type: "geojson",
-            data: {
-              type: "Feature",
-              properties: { type: "ai" },
-              geometry: aiRoute.geometry as any,
-            },
-          });
-        }
+            properties: {},
+            geometry: activeRerouteRecommendation.recommended_route.geometry as any,
+          },
+        });
+        renderedSourcesRef.current.push(rerouteSourceId);
 
-        const aiVis = (activeLayerMode === "STANDARD_ONLY") ? "none" : "visible";
-
-        if (!map.getLayer("layer-ai-casing")) {
-          map.addLayer({
-            id: "layer-ai-casing",
-            type: "line",
-            source: "source-ai",
-            layout: { "line-join": "round", "line-cap": "round", "visibility": aiVis },
-            paint: {
-              "line-color": "#047857",
-              "line-width": isStandardActive ? 8 : 12,
-              "line-opacity": isStandardActive ? 0.20 : 0.45,
-              "line-offset": 0,
-            },
-          });
-        } else {
-          map.setLayoutProperty("layer-ai-casing", "visibility", aiVis);
-        }
-
-        if (!map.getLayer("layer-ai")) {
-          map.addLayer({
-            id: "layer-ai",
-            type: "line",
-            source: "source-ai",
-            layout: { "line-join": "round", "line-cap": "round", "visibility": aiVis },
-            paint: {
-              "line-color": "#10B981",
-              "line-width": isStandardActive ? 4 : 7,
-              "line-opacity": isStandardActive ? 0.50 : 0.95,
-              "line-offset": 0,
-            },
-          });
-
-          map.on("click", "layer-ai", () => {
-            const aiIdx = routes.findIndex((r) => r.route_index === aiRoute.route_index);
-            if (aiIdx !== -1) setActiveRouteIndex(aiIdx);
-          });
-          map.on("mouseenter", "layer-ai", () => {
-            map.getCanvas().style.cursor = "pointer";
-          });
-          map.on("mouseleave", "layer-ai", () => {
-            map.getCanvas().style.cursor = "";
-          });
-        } else {
-          map.setLayoutProperty("layer-ai", "visibility", aiVis);
-        }
-      } else {
-        // Hide AI layer if Case B (Single Route)
-        if (map.getLayer("layer-ai")) map.setLayoutProperty("layer-ai", "visibility", "none");
-        if (map.getLayer("layer-ai-casing")) map.setLayoutProperty("layer-ai-casing", "visibility", "none");
+        map.addLayer({
+          id: rerouteLineId,
+          type: "line",
+          source: rerouteSourceId,
+          layout: { "line-join": "round", "line-cap": "round" },
+          paint: {
+            "line-color": "#10B981",
+            "line-width": 6,
+            "line-dasharray": [2, 2],
+            "line-opacity": 0.9,
+          },
+        });
+        renderedLayersRef.current.push(rerouteLineId);
       }
 
-      // Fit bounds framing ALL candidate routes
-      if (routes.length > 0) {
+      // Auto-fit bounds when not actively driving
+      if (!isNavigating) {
         const bounds = new maplibregl.LngLatBounds();
+        let hasPoints = false;
         routes.forEach((r) => {
           if (r.geometry && r.geometry.coordinates) {
             r.geometry.coordinates.forEach((coord: number[]) => {
               bounds.extend([coord[0], coord[1]]);
+              hasPoints = true;
             });
           }
         });
-        map.fitBounds(bounds, {
-          padding: { top: 120, bottom: 200, left: 120, right: 120 },
-          maxZoom: 15,
-          duration: 1000,
-        });
+
+        if (hasPoints) {
+          map.fitBounds(bounds, {
+            padding: { top: 100, bottom: 180, left: 100, right: 100 },
+            maxZoom: 15,
+            duration: 800,
+          });
+        }
       }
     };
 
@@ -423,14 +690,28 @@ export const MapCanvas: React.FC = () => {
     } else {
       map.once("load", renderPolylines);
     }
-  }, [routes, activeRouteIndex, setActiveRouteIndex, activeLayerMode]);
+  }, [
+    routes,
+    activeRouteIndex,
+    setActiveRouteIndex,
+    activeLayerMode,
+    isEmergencyMode,
+    isNavigating,
+    activeRerouteRecommendation,
+  ]);
 
-  // Handle re-center trigger
+  // Recenter trigger
   useEffect(() => {
     const map = mapRef.current;
     if (!map || recenterTrigger === 0) return;
 
-    if (selectedDestination) {
+    if (currentLocation) {
+      map.flyTo({
+        center: [currentLocation.lon, currentLocation.lat],
+        zoom: 15,
+        duration: 1200,
+      });
+    } else if (selectedDestination) {
       map.flyTo({
         center: [selectedDestination.lon, selectedDestination.lat],
         zoom: 14,
@@ -443,7 +724,22 @@ export const MapCanvas: React.FC = () => {
         duration: 1200,
       });
     }
-  }, [recenterTrigger, selectedDestination]);
+  }, [recenterTrigger, selectedDestination, currentLocation]);
 
-  return <div ref={mapContainerRef} className="absolute inset-0 w-full h-full" />;
+  return (
+    <div className="absolute inset-0 w-full h-full pointer-events-none">
+      <div
+        ref={mapContainerRef}
+        className="pointer-events-auto"
+        style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0 }}
+      />
+      {pinDropMode !== "none" && (
+        <div className="absolute top-6 left-1/2 transform -translate-x-1/2 z-50 bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse">
+          <p className="text-sm font-bold tracking-wide text-center">
+            Tap the map to set your <span className="text-blue-400">{pinDropMode === "source" ? "starting" : "destination"}</span> point
+          </p>
+        </div>
+      )}
+    </div>
+  );
 };

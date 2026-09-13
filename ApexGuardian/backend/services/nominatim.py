@@ -37,43 +37,11 @@ class NominatimService:
                         })
                     if results:
                         return results
+                    return []
         except Exception as err:
             print(f"[Nominatim WARNING] Search place online lookup failed: {err}")
 
-        # Local fallback if external Nominatim API is rate-limited or blocked
-        q_lower = query.lower()
-        if "indira" in q_lower:
-            return [{
-                "display_name": "Indiranagar 100 Feet Road, Bengaluru, Karnataka, India",
-                "lat": 12.9784,
-                "lon": 77.6408,
-                "place_id": "fallback_indiranagar",
-                "address_type": "suburb"
-            }]
-        elif "mg" in q_lower:
-            return [{
-                "display_name": "MG Road, Mahatma Gandhi Road, Bengaluru, Karnataka, India",
-                "lat": 12.9756,
-                "lon": 77.6066,
-                "place_id": "fallback_mgroad",
-                "address_type": "road"
-            }]
-        elif "mysore" in q_lower:
-            return [{
-                "display_name": "Mysore Road, Bengaluru, Karnataka, India",
-                "lat": 12.9582,
-                "lon": 77.5678,
-                "place_id": "fallback_mysorerd",
-                "address_type": "road"
-            }]
-        else:
-            return [{
-                "display_name": f"{query.title()}, Bengaluru, Karnataka, India",
-                "lat": 12.9716,
-                "lon": 77.5946,
-                "place_id": "fallback_generic",
-                "address_type": "location"
-            }]
+        return []
 
     @staticmethod
     async def reverse_geocode(lat: float, lon: float) -> str:

@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+
+# pytest
+.pytest_cache/
+**/.pytest_cache/
+
+# Node
+node_modules/
+dist/
+.next/
+out/
+build/
+.tsbuildinfo
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# ML Weights (Only track the canonical V3 fixed weights)
+backend/ml/weights/*.pkl
+!backend/ml/weights/congestion_model_v3_fixed.pkl

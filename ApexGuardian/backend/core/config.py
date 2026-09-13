@@ -8,9 +8,9 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
     OSRM_BASE_URL: str = "https://router.project-osrm.org"
-    MODEL_WEIGHTS_PATH: str = "ml/weights/xgboost_traffic.pkl"
+    MODEL_WEIGHTS_PATH: str = "ml/weights/congestion_model_v3_fixed.pkl"
     DATASET_PATH: str = "ml/datasets/cleaned_traffic.csv"
-    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000", "*"]
+    CORS_ORIGINS: list[str] = ["http://localhost:3000", "http://127.0.0.1:3000"]
 
     model_config = SettingsConfigDict(
         env_file=os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env"),

@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useState } from "react";
-import { Plus, Minus, Target, Layers } from "lucide-react";
+import { Plus, Minus, Target, Layers, Siren } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
 import { mapRefContainer } from "@/components/map/MapCanvas";
 
@@ -11,6 +11,8 @@ export const MapControls: React.FC = () => {
     activeLayerMode,
     toggleLayerMode,
     currentZoom,
+    isEmergencyMode,
+    toggleEmergencyMode,
   } = useNavigation();
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -29,9 +31,9 @@ export const MapControls: React.FC = () => {
 
   const handleLayerToggle = () => {
     toggleLayerMode();
-    let msg = "Layer: Showing All Routes";
-    if (activeLayerMode === "ALL") msg = "Layer: Showing AI Recommended Only";
-    else if (activeLayerMode === "AI_ONLY") msg = "Layer: Showing Standard Route Only";
+    let msg = "Showing All Routes";
+    if (activeLayerMode === "ALL") msg = "Showing Recommended Route Only";
+    else if (activeLayerMode === "AI_ONLY") msg = "Showing Standard Route Only";
 
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 2500);
@@ -86,6 +88,18 @@ export const MapControls: React.FC = () => {
           }`}
         >
           <Layers className="w-5 h-5" />
+        </button>
+
+        <button
+          onClick={toggleEmergencyMode}
+          title={isEmergencyMode ? "Emergency Mode Active (Ambulance Priority)" : "Enable Emergency / Ambulance Mode"}
+          className={`w-11 h-11 rounded-full glass-panel flex items-center justify-center transition shadow-lg hover:scale-105 active:scale-95 ${
+            isEmergencyMode
+              ? "bg-rose-600 text-white border-rose-500 shadow-rose-500/30 animate-pulse"
+              : "text-slate-700 hover:text-rose-600"
+          }`}
+        >
+          <Siren className="w-5 h-5" />
         </button>
       </div>
     </>
