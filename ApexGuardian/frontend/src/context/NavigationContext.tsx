@@ -48,14 +48,14 @@ export function calculateBearingAngle(lon1: number, lat1: number, lon2: number, 
   return (deg + 360) % 360;
 }
 
-export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; segmentIndex: number } {
+export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
   let minDistance = Infinity;
   let bestProj: Coordinate = point;
   let bestDistAlong = 0;
   let bestSegmentIdx = 0;
 
   const coords = route.geometry.coordinates;
-  if (!coords || coords.length < 2) return { projectedPoint: point, distanceAlongRouteMeters: 0, segmentIndex: 0 };
+  if (!coords || coords.length < 2) return { projectedPoint: point, distanceAlongRouteMeters: 0, distanceToRouteMeters: 0, segmentIndex: 0 };
 
   let currentRouteDist = 0;
 
@@ -97,7 +97,7 @@ export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute):
     currentRouteDist += segLen;
   }
 
-  return { projectedPoint: bestProj, distanceAlongRouteMeters: bestDistAlong, segmentIndex: bestSegmentIdx };
+  return { projectedPoint: bestProj, distanceAlongRouteMeters: bestDistAlong, distanceToRouteMeters: minDistance, segmentIndex: bestSegmentIdx };
 }
 
 interface NavigationContextType {
@@ -338,8 +338,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     if (isTransitioningRouteRef.current) return;
     if (!newRoute || !newRoute.geometry?.coordinates) return;
 
-    console.log(`[NavigationContext] Activating new route ${newRoute.route_id} with ${newRoute.geometry.coordinates.length} points.`);
-
+    // REROUTE STATE VERSIONING: Generate an activation ID
+    const activationId = Date.now().toString() + Math.random().toString(36).substr(2, 5);
+    
     isTransitioningRouteRef.current = true;
 
     if (animationFrameIdRef.current) {
@@ -347,34 +348,62 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       animationFrameIdRef.current = null;
     }
 
+    const firstCoord = newRoute.geometry.coordinates[0];
+    const lastCoord = newRoute.geometry.coordinates[newRoute.geometry.coordinates.length - 1];
+    const totalRouteDistance = newRoute.distance_meters || 0;
+    const distToDest = selectedDestination && currentLocation ? haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat) : 0;
+    
+    let proj: ReturnType<typeof projectPointOntoRoute> | null = null;
+    let fallbackToStart = false;
+
     if (preservePosition && currentLocation) {
-      // Find where we are on the new route
-      const proj = projectPointOntoRoute(currentLocation, newRoute);
-      simDistanceTraversedRef.current = proj.distanceAlongRouteMeters;
-      // IMPORTANT: Do not teleport the vehicle to the projected point.
-      // Let the simulation loop smoothly interpolate from the current physical location.
+      proj = projectPointOntoRoute(currentLocation, newRoute);
       
-      // Deterministic Debug Check
-      const firstCoord = newRoute.geometry.coordinates[0];
-      const lastCoord = newRoute.geometry.coordinates[newRoute.geometry.coordinates.length - 1];
-      const totalRouteDistance = newRoute.distance_meters || 0;
-      const distToDest = selectedDestination ? haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat) : 0;
-      
-      console.log(`[REROUTE ACTIVATION DEBUG]
-      - currentLocation: [${currentLocation.lon.toFixed(5)}, ${currentLocation.lat.toFixed(5)}]
-      - route length points: ${newRoute.geometry.coordinates.length}
-      - new route first: [${firstCoord[0].toFixed(5)}, ${firstCoord[1].toFixed(5)}]
-      - new route last: [${lastCoord[0].toFixed(5)}, ${lastCoord[1].toFixed(5)}]
-      - projected distance along route: ${proj.distanceAlongRouteMeters.toFixed(1)}m
-      - total route geometry distance: ${totalRouteDistance.toFixed(1)}m
-      - distance from currentLocation to destination: ${distToDest.toFixed(1)}m`);
-      
+      // VERIFY activateRoute safety
+      const isImplausiblyFar = proj.distanceToRouteMeters > 500; // 500m off-route is implausible
+      const isProjectedNearEndWhileNotActuallyNearDest = 
+        (totalRouteDistance - proj.distanceAlongRouteMeters < 50) && (distToDest > 100);
+
+      if (isImplausiblyFar || isProjectedNearEndWhileNotActuallyNearDest) {
+        console.warn(`[NavigationContext] Reroute projection rejected. distanceToRouteMeters: ${proj.distanceToRouteMeters}m, projectedDist: ${proj.distanceAlongRouteMeters}m, totalRouteDist: ${totalRouteDistance}m, distToDest: ${distToDest}m`);
+        fallbackToStart = true;
+      } else {
+        simDistanceTraversedRef.current = proj.distanceAlongRouteMeters;
+        // IMPORTANT: Do not teleport the vehicle to the projected point (proj.projectedPoint).
+        // Let the simulation loop smoothly interpolate from the physical currentLocation.
+      }
     } else {
+      fallbackToStart = true;
+    }
+
+    if (fallbackToStart) {
       simDistanceTraversedRef.current = 0;
       if (newRoute.geometry?.coordinates?.length > 0) {
-        const firstCoord = newRoute.geometry.coordinates[0];
         setCurrentLocation({ lon: firstCoord[0], lat: firstCoord[1] });
       }
+    }
+
+    // PART 1 & 2 - DETERMINISTIC DEBUG CHECK
+    if (preservePosition && currentLocation && proj) {
+      console.log(`[REROUTE ACTIVATION DEBUG]`, {
+        routeId: newRoute.route_id,
+        activationId,
+        source: newRoute.source || "unknown",
+        distance_meters: newRoute.distance_meters,
+        duration_seconds: newRoute.duration_seconds,
+        predicted_duration_seconds: newRoute.predicted_duration_seconds,
+        geometryCoordinateCount: newRoute.geometry.coordinates.length,
+        firstCoordinate: firstCoord,
+        lastCoordinate: lastCoord,
+        currentLocationBeforeActivation: { ...currentLocation },
+        projectedPoint: proj.projectedPoint,
+        projectedDistanceAlongRouteM: proj.distanceAlongRouteMeters,
+        distanceToRouteMeters: proj.distanceToRouteMeters,
+        currentLocationAfterActivation: fallbackToStart ? { lon: firstCoord[0], lat: firstCoord[1] } : { ...currentLocation },
+        distanceCurrentToDestinationM: distToDest,
+        totalRouteDistanceM: totalRouteDistance,
+        simDistanceTraversedM: simDistanceTraversedRef.current
+      });
     }
 
     lastFrameTimeRef.current = performance.now();
@@ -553,7 +582,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         animationFrameIdRef.current = requestAnimationFrame(animateDrive);
         return;
       }
-      if (!isNavigating || !isSimPlaying || !activeRoute) return;
+      if (!isNavigating || !isSimPlaying || !activeRoute || !currentLocation) return;
+      // Measure distance to route polyline once per route activation
+      if (!lastFrameTimeRef.current || (now - lastFrameTimeRef.current < 100 && simDistanceTraversedRef.current === 0)) {
+        const { distanceToRouteMeters } = projectPointOntoRoute(currentLocation, activeRoute);
+        console.log(`[NavigationContext] initial frame - distance from physical location to route polyline: ${distanceToRouteMeters.toFixed(2)}m`);
+      }
+
       const dtSeconds = Math.min(0.1, (now - lastFrameTimeRef.current) / 1000);
       lastFrameTimeRef.current = now;
 
@@ -566,9 +601,21 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           ? haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat)
           : 0;
 
+        const MIN_REASONABLE_ROUTE_DISTANCE = 50; // Guard against 9m phantom routes
+        
+        if (totalRouteDistanceM < MIN_REASONABLE_ROUTE_DISTANCE && distToDest > 50) {
+          console.error(`[NavigationContext] CATASTROPHIC ROUTE ERROR: Route is only ${Math.round(totalRouteDistanceM)}m long, but destination is ${Math.round(distToDest)}m away. ABORTING ARRIVAL.`);
+          // We do not arrive. The route is fundamentally broken.
+          // Fallback logic could go here, but for now we halt simulation to prevent teleportation.
+          setIsSimPlaying(false);
+          return;
+        }
+
         if (distToDest <= 50) {
           if (totalRouteDistanceM < 50) {
             console.log("[NavigationContext] Arrived on short route segment:", Math.round(totalRouteDistanceM), "m");
+          } else {
+            console.log("[NavigationContext] Arrived at destination.");
           }
           setSimProgressPercent(100);
           setIsSimPlaying(false);
