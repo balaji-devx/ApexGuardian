@@ -405,7 +405,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
       // Ensure we are physically on route before fetching a reroute
       const proj = projectPointOntoRoute(currentLocation, activeRoute);
-      if (proj.distanceFromVehicleToRouteMeters > 500) {
+      const distanceFromVehicleToRouteMeters = haversineMeters(currentLocation.lon, currentLocation.lat, proj.projectedPoint.lon, proj.projectedPoint.lat);
+      if (distanceFromVehicleToRouteMeters > 500) {
         console.warn("[REROUTE BLOCKED] Current vehicle position is not on active route.");
         return;
       }
@@ -827,6 +828,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         // Real-time navigation & congestion states
         currentLocation,
         vehicleBearing,
+        isApplyingReroute,
         currentVehicleSpeed,
         simProgressPercent,
         isSimPlaying,

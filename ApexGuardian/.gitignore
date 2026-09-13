@@ -41,3 +41,6 @@ tsconfig.tsbuildinfo
 # ML Weights (Only track the canonical V3 fixed weights)
 backend/ml/weights/*.pkl
 !backend/ml/weights/congestion_model_v3_fixed.pkl
+
+# Do not ignore frontend lib directory
+!frontend/src/lib/

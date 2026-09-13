@@ -1,0 +1,15 @@
+ApexGuardian/frontend/src/app/globals.css
+ApexGuardian/frontend/src/app/layout.tsx
+ApexGuardian/frontend/src/app/page.tsx
+ApexGuardian/frontend/src/components/map/MapCanvas.tsx
+ApexGuardian/frontend/src/components/ui/AdvanceAlertBanner.tsx
+ApexGuardian/frontend/src/components/ui/FloatingSearchPanel.tsx
+ApexGuardian/frontend/src/components/ui/MapControls.tsx
+ApexGuardian/frontend/src/components/ui/NavigationControlsHUD.tsx
+ApexGuardian/frontend/src/components/ui/NoFasterRouteToast.tsx
+ApexGuardian/frontend/src/components/ui/RerouteModal.tsx
+ApexGuardian/frontend/src/components/ui/RouteCard.tsx
+ApexGuardian/frontend/src/components/ui/TrafficLegend.tsx
+ApexGuardian/frontend/src/components/ui/TurnByTurnDrawer.tsx
+ApexGuardian/frontend/src/context/NavigationContext.tsx
+ApexGuardian/frontend/src/lib/api.ts
