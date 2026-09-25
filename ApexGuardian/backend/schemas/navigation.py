@@ -1,5 +1,20 @@
 from typing import List, Dict, Any, Optional
+from enum import Enum
 from pydantic import BaseModel, Field
+
+class CongestionLevel(str, Enum):
+    LOW = "LOW"
+    MODERATE = "MODERATE"
+    HEAVY = "HEAVY"
+    SEVERE = "SEVERE"
+
+class TrafficTestMode(str, Enum):
+    REAL = "real"
+    NORMAL = "normal"
+    MODERATE = "moderate"
+    HEAVY = "heavy"
+    SEVERE = "severe"
+    DYNAMIC = "dynamic"
 
 class LocationSearchResponse(BaseModel):
     """Geocoded location search result."""
@@ -16,6 +31,9 @@ class RouteRequest(BaseModel):
     dest_lat: float
     dest_lon: float
     is_emergency_mode: bool = False
+    # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
+    traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
+    traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
 
 class CongestionSegment(BaseModel):
     """Sub-segment of a route with localized real-time and predicted congestion metrics."""
@@ -26,7 +44,7 @@ class CongestionSegment(BaseModel):
     freeflow_speed_kmh: float = 45.0
     current_speed_kmh: float = 45.0
     delay_seconds: float = 0.0
-    congestion_level: str = "CLEAR"  # CLEAR, MODERATE, HEAVY, SEVERE
+    congestion_level: CongestionLevel = CongestionLevel.LOW
     color: str = "#10B981"  # Hex color for MapLibre rendering
     congestion_factor: float = 1.0
     density_index: float = 20.0  # 0 to 100
@@ -40,7 +58,7 @@ class CongestionHotspot(BaseModel):
     lat: float
     lon: float
     distance_from_origin_m: float
-    congestion_level: str = "HEAVY"  # MODERATE, HEAVY, SEVERE
+    congestion_level: CongestionLevel = CongestionLevel.HEAVY
     average_speed_kmh: float = 15.0
     estimated_delay_seconds: float = 0.0
     description: str = ""
@@ -109,10 +127,14 @@ class RerouteRequest(BaseModel):
     original_remaining_duration_seconds: float = 0.0
     avoid_hotspots: List[Dict[str, float]] = Field(default_factory=list)
     is_emergency_mode: bool = False
+    # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
+    traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
+    traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
 
 class RerouteRecommendation(BaseModel):
-    """Fastest alternative route recommendation evaluated from current location."""
+    """Alternative route recommendation evaluated from the current location."""
     is_reroute_recommended: bool = False
+    is_congestion_avoidance: bool = False
     time_saved_seconds: float = 0.0
     time_saved_minutes: float = 0.0
     original_remaining_seconds: float = 0.0

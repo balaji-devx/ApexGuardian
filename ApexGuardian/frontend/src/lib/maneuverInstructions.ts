@@ -91,9 +91,9 @@ export function getManeuverInstruction(step: OSRMStep): string {
     if (modifier === "slight right") return withRoad("Bear right");
     if (modifier === "sharp left") return withRoad("Make a sharp left");
     if (modifier === "sharp right") return withRoad("Make a sharp right");
-    if (modifier === "uturn") return withRoad("Make a U-turn");
+    if (modifier === "uturn" || modifier === "u-turn") return withRoad("Make a U-turn");
     if (modifier === "straight") return withRoad("Continue straight");
-    return withRoad("Turn");
+    return roadName ? `Continue on ${roadName}` : "Continue straight ahead";
   }
 
   // Continue on new road name
@@ -137,8 +137,15 @@ export function getManeuverInstruction(step: OSRMStep): string {
     return withRoad("Continue through the roundabout");
   }
 
+  if (type === "exit roundabout" || type === "exit rotary") {
+    if (exit !== undefined) {
+      return withRoad(`Exit the roundabout at the ${getOrdinal(exit)} exit`);
+    }
+    return withRoad("Exit the roundabout");
+  }
+
   // Ramps
-  if (type === "on ramp") {
+  if (type === "on ramp" || type === "ramp") {
     if (modifier === "left") return withRoad("Take the ramp on the left");
     if (modifier === "right") return withRoad("Take the ramp on the right");
     if (modifier === "slight left") return withRoad("Take the slight left ramp");
@@ -216,8 +223,14 @@ export function getManeuverAnnouncement(step: OSRMStep, distanceMeters: number):
  * Converts a number to its ordinal form (1 -> "1st", 2 -> "2nd", etc.)
  */
 function getOrdinal(n: number): string {
-  const suffixes = ["th", "st", "nd", "rd"];
-  const mod100 = n % 100;
-  const suffix = suffixes[(mod100 - 20) % 10] || suffixes[mod100] || suffixes[0];
-  return `${n}${suffix}`;
+  const ordinals = [
+    "", "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+    "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth",
+  ];
+  if (!Number.isFinite(n) || n < 1) return "next";
+  const ordinal = Math.floor(n);
+  if (ordinals[ordinal]) return ordinals[ordinal];
+  const mod100 = ordinal % 100;
+  const suffix = mod100 >= 11 && mod100 <= 13 ? "th" : ordinal % 10 === 1 ? "st" : ordinal % 10 === 2 ? "nd" : ordinal % 10 === 3 ? "rd" : "th";
+  return `${ordinal}${suffix}`;
 }

@@ -1,32 +1,44 @@
 "use client";
 
 import React, { useState } from "react";
-import { Info, ChevronRight, Activity } from "lucide-react";
+import { Activity } from "lucide-react";
+import { OVERLAY_Z } from "@/lib/layoutZones";
 
-export const TrafficLegend: React.FC = () => {
+interface TrafficLegendProps {
+  placement?: "navigation" | "sidebar";
+}
+
+export const TrafficLegend: React.FC<TrafficLegendProps> = ({ placement = "navigation" }) => {
   const [isExpanded, setIsExpanded] = useState(false);
+  const placementClass = placement === "sidebar"
+    ? "relative z-0 w-fit max-w-full self-start pointer-events-auto"
+    : "fixed left-3 right-auto top-[calc(env(safe-area-inset-top,0px)+17rem)] w-[min(16rem,calc(100vw-5rem))] pointer-events-auto";
 
   return (
-    <div className="fixed bottom-6 right-4 z-20 pointer-events-auto">
+    <div className={placementClass} style={placement === "navigation" ? { zIndex: OVERLAY_Z.infoPanel } : undefined}>
       <div
         className={`glass-panel rounded-2xl shadow-xl border border-slate-200/80 transition-all duration-300 ${
-          isExpanded ? "p-3.5 w-64" : "p-2 cursor-pointer"
+          isExpanded ? "p-3.5 w-full" : "p-2"
         }`}
-        onClick={() => !isExpanded && setIsExpanded(true)}
       >
         {!isExpanded ? (
-          <div className="flex items-center gap-2 text-xs font-bold text-slate-700 select-none">
+          <button
+            type="button"
+            onClick={() => setIsExpanded(true)}
+            aria-label="Open live traffic legend"
+            className="flex w-full items-center gap-2 text-left text-xs font-bold text-slate-700 select-none"
+          >
             <span className="relative flex h-2.5 w-2.5">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
             </span>
             <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-600">Live Traffic</span>
-            <div className="flex items-center gap-1 ml-1">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-500 inline-block" />
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 inline-block" />
-            </div>
-          </div>
+            <span className="ml-1 flex items-center gap-1">
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-500" />
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-amber-500" />
+              <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-500" />
+            </span>
+          </button>
         ) : (
           <div className="space-y-2 text-xs">
             <div className="flex items-center justify-between border-b border-slate-200/60 pb-1.5">
@@ -35,13 +47,15 @@ export const TrafficLegend: React.FC = () => {
                 <span>Traffic on This Route</span>
               </div>
               <button
+                type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   setIsExpanded(false);
                 }}
-                className="text-slate-400 hover:text-slate-700 text-xs px-1.5 py-0.5 rounded-md hover:bg-slate-100"
+                aria-label="Close traffic legend"
+                className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-slate-500 hover:text-slate-900 hover:bg-slate-100"
               >
-                ✕
+                <span aria-hidden="true">✕</span>
               </button>
             </div>
 

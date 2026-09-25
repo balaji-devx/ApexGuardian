@@ -11,8 +11,9 @@ import {
 import { AlertManager, ActiveCongestionAlert } from "@/lib/alertManager";
 import { TTSService, SpeechPriority } from "@/lib/ttsService";
 import { PushNotificationService } from "@/lib/pushNotificationService";
-import { RerouteEngine } from "@/lib/rerouteEngine";
+import { RerouteEngine, routesHaveSameGeometry } from "@/lib/rerouteEngine";
 import { getManeuverInstruction, getManeuverAnnouncement } from "@/lib/maneuverInstructions";
+import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode } from "@/lib/trafficScenario";
 
 export interface Coordinate {
   lat: number;
@@ -48,6 +49,15 @@ export function calculateBearingAngle(lon1: number, lat1: number, lon2: number, 
   return (deg + 360) % 360;
 }
 
+function getUpcomingAvoidHotspots(route: CandidateRoute, distanceAlongRouteM: number) {
+  return (route.hotspots || [])
+    .filter((hotspot) =>
+      (hotspot.congestion_level === "HEAVY" || hotspot.congestion_level === "SEVERE") &&
+      hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
+    )
+    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.6 }));
+}
+
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
   let minDistance = Infinity;
   let bestProj: Coordinate = point;
@@ -74,7 +84,7 @@ export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute):
     const dy = lat2 - lat1;
     const px = (point.lon - lon1) * cosLat;
     const py = point.lat - lat1;
-    
+
     const lenSq = dx * dx + dy * dy;
     let t = 0;
     if (lenSq !== 0) {
@@ -133,13 +143,15 @@ interface NavigationContextType {
   setIsEmergencyMode: React.Dispatch<React.SetStateAction<boolean>>;
   toggleEmergencyMode: () => void;
   swapSourceAndDestination: () => void;
-  calculateRoutes: (origin?: Coordinate | null, dest?: Coordinate | null, emergencyOverride?: boolean) => Promise<void>;
+  calculateRoutes: (origin?: Coordinate | null, dest?: Coordinate | null, emergencyOverride?: boolean) => Promise<boolean>;
 
   // Real-Time Navigation & Congestion States
   currentLocation: Coordinate | null;
   vehicleBearing: number;
   currentVehicleSpeed: number;
   simProgressPercent: number;
+  simDistanceRemainingM: number;
+  simEtaSeconds: number;
   isSimPlaying: boolean;
   setIsSimPlaying: (playing: boolean) => void;
   simSpeedMultiplier: number;
@@ -151,6 +163,12 @@ interface NavigationContextType {
   acceptReroute: (recommendation: RerouteRecommendation) => void;
   triggerDynamicRerouteCheck: (force?: boolean) => Promise<void>;
   isApplyingReroute: boolean;
+  noRouteReason: string | null;
+  dismissNoRouteReason: () => void;
+  navigationHudHeight: number;
+  setNavigationHudHeight: React.Dispatch<React.SetStateAction<number>>;
+  trafficTestMode: TrafficTestMode;
+  runTrafficTest: (mode: TrafficTestMode) => Promise<void>;
 
   nextManeuver: any;
   nextManeuverDistanceM: number;
@@ -185,16 +203,31 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [currentZoom, setCurrentZoom] = useState(12.5);
   const [pinDropMode, setPinDropMode] = useState<PinDropMode>("none");
   const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+  const [trafficTestMode, setTrafficTestMode] = useState<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
+  const trafficTestModeRef = useRef<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
+  const lastDynamicPhaseRef = useRef<string>("LOW");
+  const dynamicProgressRef = useRef(0);
 
   // Real-Time Simulation & Navigation Telemetry
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
+  const currentLocationRef = useRef<Coordinate | null>(null);
   const [vehicleBearing, setVehicleBearing] = useState<number>(0);
   const [currentVehicleSpeed, setCurrentVehicleSpeed] = useState<number>(45.0);
   const [simProgressPercent, setSimProgressPercent] = useState<number>(0);
+  const [simDistanceRemainingM, setSimDistanceRemainingM] = useState<number>(0);
+  const [simEtaSeconds, setSimEtaSeconds] = useState<number>(0);
   const [isSimPlaying, setIsSimPlaying] = useState<boolean>(true);
-  const [simSpeedMultiplier, setSimSpeedMultiplier] = useState<number>(1);
+  const [simSpeedMultiplier, setSimSpeedMultiplierState] = useState<number>(1);
+  const simSpeedMultiplierRef = useRef(1);
+  const setSimSpeedMultiplier = useCallback((multiplier: number) => {
+    const normalizedMultiplier = Math.max(1, multiplier);
+    simSpeedMultiplierRef.current = normalizedMultiplier;
+    setSimSpeedMultiplierState(normalizedMultiplier);
+  }, []);
   const [activeAlert, setActiveAlert] = useState<ActiveCongestionAlert | null>(null);
   const [activeRerouteRecommendation, setActiveRerouteRecommendation] = useState<RerouteRecommendation | null>(null);
+  const [noRouteReason, setNoRouteReason] = useState<string | null>(null);
+  const [navigationHudHeight, setNavigationHudHeight] = useState(0);
 
   const [nextManeuver, setNextManeuver] = useState<any>(null);
   const [nextManeuverDistanceM, setNextManeuverDistanceM] = useState<number>(500);
@@ -205,7 +238,6 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const lastFrameTimeRef = useRef<number>(0);
   const lastAlertCheckDistanceRef = useRef<number>(-999);
   const lastAutoRerouteCheckTimeRef = useRef<number>(0);
-  const spokenManeuverTiersRef = useRef<Map<number, Set<string>>>(new Map());
   const animationFrameIdRef = useRef<number | null>(null);
   const lastRerouteInteractionTimeRef = useRef<number>(0);
   const isTransitioningRouteRef = useRef<boolean>(false);
@@ -221,28 +253,36 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     const unsubAlert = AlertManager.subscribe((alert) => {
       setActiveAlert(alert);
+      if (!alert) {
+        PushNotificationService.clearCongestionAlert();
+        if (RerouteEngine.getActiveRecommendation()) {
+          RerouteEngine.dismissRecommendation();
+          setActiveRerouteRecommendation(null);
+        }
+      }
     });
-    const unsubReroute = RerouteEngine.subscribe((rec) => {
+    const unsubReroute = RerouteEngine.subscribe((rec, reason) => {
+      setNoRouteReason(reason);
       if (!rec || !rec.is_reroute_recommended || !rec.recommended_route) {
         setActiveRerouteRecommendation(null);
+        PushNotificationService.clearRerouteAlert();
         return;
       }
       
       const now = Date.now();
       if (now - lastRerouteInteractionTimeRef.current < 30000) {
         // Cooldown active, ignore new recommendations
+        RerouteEngine.dismissRecommendation();
         return;
       }
 
-      // Check if genuinely different
+      // Compare against the remaining active geometry, not total route distance:
+      // reroute geometry starts at the vehicle while the active route starts at origin.
       const currentRoute = activeRouteRef.current;
-      if (currentRoute) {
-        // simple heuristic: if total distance is within 5% and bearing/steps are similar
-        const distDiff = Math.abs(currentRoute.distance_meters - rec.recommended_route.distance_meters);
-        if (distDiff < currentRoute.distance_meters * 0.05) {
-          // Likely the same route, just advanced slightly
+      if (currentRoute && routesHaveSameGeometry(rec.recommended_route, currentRoute)) {
+          // Dismiss duplicates so periodic checks can recover, and avoid stale UI.
+          RerouteEngine.dismissRecommendation();
           return;
-        }
       }
 
       setActiveRerouteRecommendation(rec);
@@ -266,14 +306,17 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const calculateRoutes = async (
     origin?: Coordinate | null,
     dest?: Coordinate | null,
-    emergencyOverride?: boolean
-  ) => {
+    emergencyOverride?: boolean,
+    trafficMode: TrafficTestMode = trafficTestModeRef.current,
+    trafficProgress: number = 0
+  ): Promise<boolean> => {
     const originCoord = origin || selectedOrigin;
     const destCoord = dest || selectedDestination;
-    if (!originCoord || !destCoord) return;
+    if (!originCoord || !destCoord) return false;
 
     const emergency = emergencyOverride !== undefined ? emergencyOverride : isEmergencyMode;
 
+    TTSService.reset();
     setIsLoadingRoutes(true);
     try {
       const response = await fetchRoutes(
@@ -281,7 +324,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         originCoord.lon,
         destCoord.lat,
         destCoord.lon,
-        emergency
+        emergency,
+        trafficMode,
+        trafficProgress
       );
       if (response.success && response.candidates.length > 0) {
         setRoutes(response.candidates);
@@ -289,16 +334,85 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
-        spokenManeuverTiersRef.current.clear();
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
+        setActiveRerouteRecommendation(null);
+        lastDynamicPhaseRef.current = "LOW";
+        return true;
       }
+      return false;
     } catch (err) {
       console.error("[NavigationContext] Routing calculation error:", err);
+      return false;
     } finally {
       setIsLoadingRoutes(false);
     }
   };
+
+  const runTrafficTest = async (mode: TrafficTestMode) => {
+    TTSService.warmUp();
+    trafficTestModeRef.current = mode;
+    setTrafficTestMode(mode);
+    setIsNavigating(false);
+    setIsSimPlaying(true);
+    setSimSpeedMultiplier(1);
+    setIsEmergencyMode(false);
+    setActiveLayerMode("ALL");
+    setActiveRerouteRecommendation(null);
+    AlertManager.reset();
+    RerouteEngine.dismissRecommendation();
+    RerouteEngine.dismissNoRouteReason();
+    lastDynamicPhaseRef.current = "LOW";
+    dynamicProgressRef.current = 0;
+
+    let origin = selectedOrigin;
+    let destination = selectedDestination;
+    if (mode !== "real") {
+      origin = { lat: 12.9756, lon: 77.6066, name: "MG Road, Bengaluru" };
+      destination = { lat: 12.9352, lon: 77.6245, name: "Koramangala, Bengaluru" };
+      setSelectedOrigin(origin);
+      setSelectedDestination(destination);
+      setSourceQuery(origin.name || "MG Road, Bengaluru");
+      setDestinationQuery(destination.name || "Koramangala, Bengaluru");
+    }
+    if (!origin || !destination) return;
+    const loaded = await calculateRoutes(origin, destination, false, mode, 0);
+    if (loaded) setIsNavigating(true);
+  };
+
+  const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number) => {
+    const destination = selectedDestination;
+    const start = route.geometry?.coordinates?.[0];
+    if (!destination || !start || trafficTestModeRef.current === "real") return;
+
+    try {
+      const response = await fetchRoutes(
+        start[1], start[0], destination.lat, destination.lon,
+        isEmergencyMode, trafficTestModeRef.current, progress
+      );
+      const evaluatedRoute = response.candidates?.[0];
+      if (!response.success || !evaluatedRoute) return;
+
+      setRoutes((currentRoutes) => currentRoutes.map((currentRoute) =>
+        currentRoute.route_id === route.route_id
+          ? {
+              ...currentRoute,
+              segments: evaluatedRoute.segments,
+              hotspots: evaluatedRoute.hotspots,
+              clear_distance_km: evaluatedRoute.clear_distance_km,
+              moderate_distance_km: evaluatedRoute.moderate_distance_km,
+              heavy_distance_km: evaluatedRoute.heavy_distance_km,
+              severe_distance_km: evaluatedRoute.severe_distance_km,
+              total_delay_seconds: evaluatedRoute.total_delay_seconds,
+              predicted_duration_seconds: evaluatedRoute.predicted_duration_seconds,
+              predicted_duration_minutes: evaluatedRoute.predicted_duration_minutes,
+            }
+          : currentRoute
+      ));
+    } catch (error) {
+      console.warn("[NavigationContext] Could not refresh test traffic conditions:", error);
+    }
+  }, [selectedDestination, isEmergencyMode]);
 
   const toggleEmergencyMode = () => {
     const newEmergency = !isEmergencyMode;
@@ -332,11 +446,14 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     lastRerouteInteractionTimeRef.current = Date.now();
     setActiveRerouteRecommendation(null);
     RerouteEngine.dismissRecommendation();
+    PushNotificationService.clearRerouteAlert();
   };
 
-  const activateRoute = (newRoute: CandidateRoute, preservePosition: boolean = false) => {
-    if (isTransitioningRouteRef.current) return;
-    if (!newRoute || !newRoute.geometry?.coordinates) return;
+  const dismissNoRouteReason = () => RerouteEngine.dismissNoRouteReason();
+
+  const activateRoute = (newRoute: CandidateRoute, preservePosition: boolean = false): boolean => {
+    if (isTransitioningRouteRef.current) return false;
+    if (!newRoute || !newRoute.geometry?.coordinates) return false;
 
     // REROUTE STATE VERSIONING: Generate an activation ID
     const activationId = Date.now().toString() + Math.random().toString(36).substr(2, 5);
@@ -364,9 +481,21 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const isProjectedNearEndWhileNotActuallyNearDest = 
         (totalRouteDistance - proj.distanceAlongRouteMeters < 50) && (distToDest > 100);
 
-      if (isImplausiblyFar || isProjectedNearEndWhileNotActuallyNearDest) {
-        console.warn(`[NavigationContext] Reroute projection rejected. distanceToRouteMeters: ${proj.distanceToRouteMeters}m, projectedDist: ${proj.distanceAlongRouteMeters}m, totalRouteDist: ${totalRouteDistance}m, distToDest: ${distToDest}m`);
-        fallbackToStart = true;
+      // 7. HARD INVARIANT: candidate geometry must be consistent with reported distance
+      let calculatedPolylineM = 0;
+      for (let i = 1; i < newRoute.geometry.coordinates.length; i++) {
+        calculatedPolylineM += haversineMeters(
+          newRoute.geometry.coordinates[i-1][0], newRoute.geometry.coordinates[i-1][1],
+          newRoute.geometry.coordinates[i][0], newRoute.geometry.coordinates[i][1]
+        );
+      }
+      const isGeometryAbsurd = Math.abs(calculatedPolylineM - totalRouteDistance) > Math.max(500, totalRouteDistance * 0.2);
+
+      if (isImplausiblyFar || isProjectedNearEndWhileNotActuallyNearDest || isGeometryAbsurd) {
+        console.warn(`[NavigationContext] CATASTROPHIC ROUTE ERROR: Reroute projection rejected. distanceToRouteMeters: ${proj.distanceToRouteMeters}m, projectedDist: ${proj.distanceAlongRouteMeters}m, totalRouteDist: ${totalRouteDistance}m, distToDest: ${distToDest}m, calculatedPolyline: ${calculatedPolylineM}m`);
+        // 1. NEVER call setCurrentLocation(firstCoord) for a rejected reroute.
+        // A failed/invalid route must never change the physical vehicle position.
+        return false; // ABORT ACTIVATION COMPLETELY
       } else {
         simDistanceTraversedRef.current = proj.distanceAlongRouteMeters;
         // IMPORTANT: Do not teleport the vehicle to the projected point (proj.projectedPoint).
@@ -379,7 +508,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     if (fallbackToStart) {
       simDistanceTraversedRef.current = 0;
       if (newRoute.geometry?.coordinates?.length > 0) {
-        setCurrentLocation({ lon: firstCoord[0], lat: firstCoord[1] });
+        const startLocation = { lon: firstCoord[0], lat: firstCoord[1] };
+        currentLocationRef.current = startLocation;
+        setCurrentLocation(startLocation);
       }
     }
 
@@ -409,12 +540,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     lastFrameTimeRef.current = performance.now();
     lastAlertCheckDistanceRef.current = -999;
     lastAutoRerouteCheckTimeRef.current = Date.now();
-    spokenManeuverTiersRef.current.clear();
     lastRerouteInteractionTimeRef.current = Date.now();
     
     AlertManager.reset();
     RerouteEngine.dismissRecommendation();
-    TTSService.clearQueue();
+    TTSService.reset();
 
     // Make newRoute the active route at index 0
     setRoutes((prev) => [newRoute, ...prev.filter((r) => r.route_id !== newRoute.route_id)]);
@@ -425,25 +555,73 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isTransitioningRouteRef.current = false;
       });
     });
+    return true;
   };
 
   const acceptReroute = (recommendation: RerouteRecommendation) => {
     if (!recommendation || !recommendation.recommended_route) return;
     
-    setIsApplyingReroute(true);
-    TTSService.speak(
-      `Reroute accepted. Taking alternative route saving ~${Math.round(recommendation.time_saved_minutes)} minutes.`,
-      SpeechPriority.HIGH
-    );
+    // 2. Log and verify the exact recommended_route object entering acceptReroute
+    const recRoute = recommendation.recommended_route;
+    let calcGeomLength = 0;
+    if (recRoute.geometry?.coordinates) {
+      for (let i = 1; i < recRoute.geometry.coordinates.length; i++) {
+        calcGeomLength += haversineMeters(
+          recRoute.geometry.coordinates[i-1][0], recRoute.geometry.coordinates[i-1][1],
+          recRoute.geometry.coordinates[i][0], recRoute.geometry.coordinates[i][1]
+        );
+      }
+    }
+    const distDest = (selectedDestination && recRoute.geometry?.coordinates?.length) ? haversineMeters(
+      recRoute.geometry.coordinates[0][0], recRoute.geometry.coordinates[0][1],
+      selectedDestination.lon, selectedDestination.lat
+    ) : 0;
 
-    activateRoute(recommendation.recommended_route, true);
+    console.log(`[ACCEPT REROUTE DIAGNOSTIC] Entering acceptReroute():`, {
+      route_id: recRoute.route_id,
+      source: recRoute.source,
+      distance_meters: recRoute.distance_meters,
+      geometry_coordinates_length: recRoute.geometry?.coordinates?.length,
+      first_coordinate: recRoute.geometry?.coordinates?.[0],
+      last_coordinate: recRoute.geometry?.coordinates?.[recRoute.geometry.coordinates.length - 1],
+      destination_distance: distDest,
+      calculated_geometry_length: calcGeomLength
+    });
+
+    setIsApplyingReroute(true);
+    const switched = activateRoute(recommendation.recommended_route, true);
     setIsApplyingReroute(false);
+    if (switched) {
+      if (recommendation.is_congestion_avoidance) {
+        const viaRoad = recommendation.recommended_route?.steps?.find(
+          (step) => Boolean(step.name?.trim()) && step.maneuver?.type !== "depart",
+        )?.name?.trim();
+        TTSService.speakRerouteSuggestion(recommendation.time_saved_minutes, viaRoad, true);
+      } else {
+        TTSService.announce(
+          `Route updated. The new route saves about ${Math.round(recommendation.time_saved_minutes)} minutes.`,
+          SpeechPriority.NORMAL,
+          `route_updated_${recommendation.recommended_route?.route_id || Date.now()}`,
+        );
+      }
+    } else {
+      setActiveRerouteRecommendation(null);
+      RerouteEngine.dismissRecommendation();
+      TTSService.announce(
+        "Could not switch routes. Continue on the current route.",
+        SpeechPriority.NORMAL,
+        "reroute_switch_failed",
+      );
+    }
   };
 
-  // Sync Simulation Speed with TTS Speech Rate (Section 6)
+  // Speech rate is evaluated at dequeue time from the same ref used by the turn thresholds.
   useEffect(() => {
-    TTSService.setRate(1.05 * Math.min(2.0, 1 + (simSpeedMultiplier - 1) * 0.25));
-  }, [simSpeedMultiplier]);
+    TTSService.setRateProvider(() =>
+      Math.min(2.0, 1.05 * (1 + (simSpeedMultiplierRef.current - 1) * 0.25)),
+    );
+    return () => TTSService.reset();
+  }, []);
 
   const triggerDynamicRerouteCheck = useCallback(
     async (force: boolean = false) => {
@@ -462,6 +640,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
       // Check distance to destination
       const distToDest = haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat);
+      if (distToDest <= 500) return;
       
       const totalRouteDistance = activeRoute.distance_meters || 1;
       const traversedDist = simDistanceTraversedRef.current;
@@ -481,7 +660,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           remainingSec,
           currentVehicleSpeed,
           isEmergencyMode,
-          force
+          force,
+          trafficTestModeRef.current,
+          progressRatio,
+          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist) : []
         );
         
         // Ignore stale responses
@@ -503,25 +685,31 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const activeRoute = routes[activeRouteIndex];
       if (activeRoute && activeRoute.geometry?.coordinates?.length > 0) {
         const firstCoord = activeRoute.geometry.coordinates[0];
-        setCurrentLocation({ lon: firstCoord[0], lat: firstCoord[1] });
+        const startLocation = { lon: firstCoord[0], lat: firstCoord[1] };
+        currentLocationRef.current = startLocation;
+        setCurrentLocation(startLocation);
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
-        spokenManeuverTiersRef.current.clear();
+        TTSService.warmUp();
         setSimProgressPercent(0);
+        setSimDistanceRemainingM(activeRoute.distance_meters || 0);
+        setSimEtaSeconds(activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0);
         setIsSimPlaying(true);
         lastFrameTimeRef.current = performance.now();
 
-        TTSService.speak(
+        TTSService.announce(
           isEmergencyMode
             ? "Starting Emergency Priority Navigation. Clear corridor mode active."
             : "Starting navigation. Drive safely.",
-          SpeechPriority.HIGH
+          SpeechPriority.NORMAL,
+          `navigation_started_${activeRoute.route_id || activeRouteIndex}`,
         );
         hasInitializedJourneyRef.current = true;
       }
     } else {
       hasInitializedJourneyRef.current = false;
+      TTSService.reset();
       if (animationFrameIdRef.current) {
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = null;
@@ -529,7 +717,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       AlertManager.reset();
       RerouteEngine.dismissRecommendation();
       RerouteEngine.dismissNoRouteReason();
+      currentLocationRef.current = null;
       setCurrentLocation(null);
+      setActiveRerouteRecommendation(null);
     }
   }, [isNavigating, activeRouteIndex, routes, isEmergencyMode]);
 
@@ -582,10 +772,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         animationFrameIdRef.current = requestAnimationFrame(animateDrive);
         return;
       }
-      if (!isNavigating || !isSimPlaying || !activeRoute || !currentLocation) return;
+      const liveLocation = currentLocationRef.current;
+      if (!isNavigating || !isSimPlaying || !activeRoute || !liveLocation) return;
       // Measure distance to route polyline once per route activation
       if (!lastFrameTimeRef.current || (now - lastFrameTimeRef.current < 100 && simDistanceTraversedRef.current === 0)) {
-        const { distanceToRouteMeters } = projectPointOntoRoute(currentLocation, activeRoute);
+        const { distanceToRouteMeters } = projectPointOntoRoute(liveLocation, activeRoute);
         console.log(`[NavigationContext] initial frame - distance from physical location to route polyline: ${distanceToRouteMeters.toFixed(2)}m`);
       }
 
@@ -597,8 +788,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // Section 3: Arrival sanity check
       if (currentDist >= totalRouteDistanceM) {
         // Enforce strict arrival: must actually be near destination
-        const distToDest = selectedDestination && currentLocation 
-          ? haversineMeters(currentLocation.lon, currentLocation.lat, selectedDestination.lon, selectedDestination.lat)
+        const distToDest = selectedDestination && liveLocation
+          ? haversineMeters(liveLocation.lon, liveLocation.lat, selectedDestination.lon, selectedDestination.lat)
           : 0;
 
         const MIN_REASONABLE_ROUTE_DISTANCE = 50; // Guard against 9m phantom routes
@@ -618,10 +809,22 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             console.log("[NavigationContext] Arrived at destination.");
           }
           setSimProgressPercent(100);
+          setSimDistanceRemainingM(0);
+          setSimEtaSeconds(0);
           setIsSimPlaying(false);
+          AlertManager.reset();
+          RerouteEngine.dismissRecommendation();
+          RerouteEngine.dismissNoRouteReason();
+          setActiveRerouteRecommendation(null);
+          PushNotificationService.clearCongestionAlert();
+          PushNotificationService.clearRerouteAlert();
           const lastPt = coords[totalPoints - 1];
           setCurrentLocation({ lon: lastPt[0], lat: lastPt[1] });
-          TTSService.speak("You have arrived at your destination.", SpeechPriority.CRITICAL);
+          TTSService.announce(
+            "You have arrived at your destination.",
+            SpeechPriority.CRITICAL,
+            `arrived_${activeRoute.route_id || activeRouteIndex}`,
+          );
           return;
         } else {
           // False arrival due to malformed route, do not trigger arrival.
@@ -634,6 +837,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
       // Progress ratio (0.0 to 1.0)
       const progressRatio = Math.min(1.0, currentDist / totalRouteDistanceM);
+      const scenarioProgress = trafficTestModeRef.current === "dynamic"
+        ? Math.max(dynamicProgressRef.current, progressRatio)
+        : progressRatio;
+      if (trafficTestModeRef.current === "dynamic") dynamicProgressRef.current = scenarioProgress;
 
       // Determine current segment speed
       let speedKmh = 40.0;
@@ -687,10 +894,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       currentBearingRef.current = smoothedBearing;
 
       // Update state
+      currentLocationRef.current = newLocation;
       setCurrentLocation(newLocation);
       setVehicleBearing(smoothedBearing);
       setCurrentVehicleSpeed(Math.round(speedKmh));
       setSimProgressPercent(Math.min(100, Math.round(progressRatio * 100)));
+      setSimDistanceRemainingM(Math.max(0, totalRouteDistanceM - newDist));
+      setSimEtaSeconds(Math.max(0, Math.round(
+        (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0) * (1 - progressRatio)
+      )));
 
       // Speed-Aware Congestion Alert Evaluation (Throttled per ~80m of progress)
       if (Math.abs(newDist - lastAlertCheckDistanceRef.current) >= 80) {
@@ -702,19 +914,22 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             alert.locationName,
             alert.distanceText,
             alert.averageSpeedKmh,
-            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined
+            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
+            true,
+            alert.congestionLevel
           );
 
           PushNotificationService.sendCongestionAlert(
             alert.locationName,
             alert.distanceText,
             alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
-            alert.averageSpeedKmh
+            alert.averageSpeedKmh,
+            alert.congestionLevel
           );
 
           // Proactively check for reroute when a new congestion alert stage triggers
           // Only check if no recommendation is already pending
-          if (selectedDestination && !RerouteEngine.getActiveRecommendation()) {
+          if ((alert.congestionLevel === "HEAVY" || alert.congestionLevel === "SEVERE") && selectedDestination && !RerouteEngine.getActiveRecommendation()) {
             const traversed = simDistanceTraversedRef.current;
             const activeRouteDist = activeRoute.distance_meters || 1;
             const activeRatio = Math.min(1.0, traversed / activeRouteDist);
@@ -728,10 +943,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
               remainingSec,
               speedKmh,
               isEmergencyMode,
-              true // Force check on new hotspot alert
+              true,
+              trafficTestModeRef.current,
+              Math.min(1, newDist / totalRouteDistanceM),
+              getUpcomingAvoidHotspots(activeRoute, newDist)
             );
           }
-        });
+        }, newDist);
       }
 
       // Step-by-step Turn Maneuver Guidance & Two-Tier Voice Announcements
@@ -755,40 +973,71 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           estDistToTurn = 0;
         }
 
-        const step = activeRoute.steps[currentStepIndex];
+        // OSRM's current step describes the maneuver that entered this road; the next
+        // step is the maneuver still ahead of the vehicle. Clamp to the arrival step.
+        const upcomingStepIndex = Math.min(currentStepIndex + 1, activeRoute.steps.length - 1);
+        const upcomingStep = activeRoute.steps[upcomingStepIndex];
 
-        if (step) {
-          setNextManeuver(step);
+        if (upcomingStep) {
+          setNextManeuver(upcomingStep);
           setNextManeuverDistanceM(Math.round(estDistToTurn));
 
-          const stepTiers = spokenManeuverTiersRef.current.get(currentStepIndex) || new Set<string>();
-
-          const advanceThreshold = 400 * simSpeedMultiplier;
-          const imminentThreshold = 150 * simSpeedMultiplier;
+          const speedMultiplier = simSpeedMultiplierRef.current;
+          const advanceThreshold = 400 * speedMultiplier;
+          const imminentThreshold = 150 * speedMultiplier;
           
           const routeId = activeRoute.route_id || `idx-${activeRouteIndex}`;
 
           // Tier 1: Advance Heads-up
           if (
             estDistToTurn <= advanceThreshold &&
-            estDistToTurn > imminentThreshold &&
-            !stepTiers.has("advance")
+            estDistToTurn > imminentThreshold
           ) {
-            stepTiers.add("advance");
-            spokenManeuverTiersRef.current.set(currentStepIndex, stepTiers);
-            const announcement = getManeuverAnnouncement(step, estDistToTurn);
+            const announcement = getManeuverAnnouncement(upcomingStep, estDistToTurn);
             if (announcement) {
-              TTSService.speak(announcement, SpeechPriority.CRITICAL, 15, `${routeId}_${currentStepIndex}_advance`);
+              TTSService.announce(
+                announcement,
+                SpeechPriority.CRITICAL,
+                `${routeId}_${upcomingStepIndex}_advance`,
+                30 * 60_000,
+              );
             }
           }
 
           // Tier 2: Imminent
-          if (estDistToTurn <= imminentThreshold && !stepTiers.has("imminent")) {
-            stepTiers.add("imminent");
-            spokenManeuverTiersRef.current.set(currentStepIndex, stepTiers);
-            let modifier = step.maneuver?.modifier || "ahead";
-            const imminentText = `Turn ${modifier}`;
-            TTSService.speak(imminentText, SpeechPriority.CRITICAL, 15, `${routeId}_${currentStepIndex}_imminent`);
+          if (estDistToTurn <= imminentThreshold) {
+            const imminentText = getManeuverInstruction(upcomingStep);
+            TTSService.announce(
+              imminentText,
+              SpeechPriority.CRITICAL,
+              `${routeId}_${upcomingStepIndex}_imminent`,
+              30 * 60_000,
+            );
+          }
+        }
+      }
+
+      // Dynamic demo phases are tied to route progress, so the conditions change with the journey.
+      if (trafficTestModeRef.current === "dynamic") {
+        const phase = dynamicTrafficPhase(scenarioProgress);
+        if (phase !== lastDynamicPhaseRef.current) {
+          lastDynamicPhaseRef.current = phase;
+          void refreshTrafficScenario(activeRoute, scenarioProgress);
+          if (phase === "LOW") {
+            AlertManager.reset();
+            RerouteEngine.dismissRecommendation();
+            setActiveRerouteRecommendation(null);
+            TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
+          }
+          if (phase === "HEAVY" && selectedDestination) {
+            const remainingRatio = Math.max(0, 1 - scenarioProgress);
+            const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
+            RerouteEngine.checkAndReevaluate(
+              interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
+              remainingSeconds, speedKmh, isEmergencyMode, true,
+              trafficTestModeRef.current, scenarioProgress,
+              getUpcomingAvoidHotspots(activeRoute, newDist)
+            );
           }
         }
       }
@@ -814,7 +1063,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           remainingSec,
           speedKmh,
           isEmergencyMode,
-          false
+          false,
+          trafficTestModeRef.current,
+          trafficTestModeRef.current === "dynamic" ? scenarioProgress : activeRatio,
+          []
         );
       }
 
@@ -837,6 +1089,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     activeRouteIndex,
     selectedDestination,
     isEmergencyMode,
+    refreshTrafficScenario,
   ]);
 
   // Backend Health Polling
@@ -887,6 +1140,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         pinDropMode,
         setPinDropMode,
         isEmergencyMode,
+        trafficTestMode,
+        runTrafficTest,
         setIsEmergencyMode,
         toggleEmergencyMode,
         swapSourceAndDestination,
@@ -898,6 +1153,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isApplyingReroute,
         currentVehicleSpeed,
         simProgressPercent,
+        simDistanceRemainingM,
+        simEtaSeconds,
         isSimPlaying,
         setIsSimPlaying,
         simSpeedMultiplier,
@@ -908,6 +1165,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         dismissReroute,
         acceptReroute,
         triggerDynamicRerouteCheck,
+        noRouteReason,
+        dismissNoRouteReason,
+        navigationHudHeight,
+        setNavigationHudHeight,
 
         nextManeuver,
         nextManeuverDistanceM,

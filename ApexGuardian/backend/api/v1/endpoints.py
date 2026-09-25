@@ -22,6 +22,8 @@ from services.traffic_service import LiveTrafficService
 from services.congestion_detector import CongestionDetector
 from services.reroute_engine import DynamicRerouteEngine
 from services.notification_service import PushNotificationService
+from services.route_selection import rank_processed_routes
+from services.traffic_scenario import apply_traffic_test_scenario
 from ml.recommender import RouteScorer
 
 logger = logging.getLogger("apexguardian.api")
@@ -139,6 +141,10 @@ async def calculate_route(request: RouteRequest):
                 base_duration_s=base_dur_s,
                 is_emergency_mode=request.is_emergency_mode
             )
+            if not request.is_emergency_mode:
+                analysis = apply_traffic_test_scenario(
+                    analysis, request.traffic_test_mode, request.traffic_progress
+                )
 
             candidate["segments"] = analysis["segments"]
             candidate["hotspots"] = analysis["hotspots"]
@@ -157,6 +163,11 @@ async def calculate_route(request: RouteRequest):
             candidate["predicted_duration_minutes"] = round(final_predicted_dur / 60.0, 1)
 
             processed_candidates.append(CandidateRoute(**candidate))
+
+        # Rank by the final ETA after segment-level delays have been added.
+        # This keeps ML as the primary estimate while allowing material road
+        # congestion to affect the initial recommendation.
+        rank_processed_routes(processed_candidates)
 
         return RouteResponse(
             success=True,
@@ -179,7 +190,9 @@ async def evaluate_reroute(request: RerouteRequest):
         dest_lon=request.dest_lon,
         original_remaining_duration_s=request.original_remaining_duration_seconds,
         avoid_hotspots=request.avoid_hotspots,
-        is_emergency_mode=request.is_emergency_mode
+        is_emergency_mode=request.is_emergency_mode,
+        traffic_test_mode=request.traffic_test_mode,
+        traffic_progress=request.traffic_progress,
     )
     return recommendation
 

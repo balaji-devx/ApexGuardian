@@ -1,4 +1,4 @@
-import { CongestionHotspot } from "./api";
+import { CongestionHotspot, CongestionLevel } from "./api";
 
 export interface ActiveCongestionAlert {
   hotspotId: string;
@@ -6,7 +6,7 @@ export interface ActiveCongestionAlert {
   distanceMeters: number;
   distanceText: string;
   stage: 1 | 2 | 3;
-  congestionLevel: "MODERATE" | "HEAVY" | "SEVERE";
+  congestionLevel: CongestionLevel;
   averageSpeedKmh: number;
   estimatedDelaySeconds: number;
   description: string;
@@ -75,7 +75,8 @@ export class AlertManager {
     userLon: number,
     hotspots: CongestionHotspot[],
     currentSpeedKmh: number,
-    onNewStageAlert?: (alert: ActiveCongestionAlert) => void
+    onNewStageAlert?: (alert: ActiveCongestionAlert) => void,
+    distanceAlongRouteMeters?: number
   ): ActiveCongestionAlert | null {
     if (!hotspots || hotspots.length === 0) {
       if (this.activeAlert !== null) {
@@ -98,7 +99,12 @@ export class AlertManager {
     let minDistance = Infinity;
 
     for (const hotspot of hotspots) {
-      const dist = this.haversineMeters(userLat, userLon, hotspot.lat, hotspot.lon);
+      const routeDistance = distanceAlongRouteMeters === undefined
+        ? this.haversineMeters(userLat, userLon, hotspot.lat, hotspot.lon)
+        : hotspot.distance_from_origin_m - distanceAlongRouteMeters;
+      const dist = distanceAlongRouteMeters === undefined
+        ? routeDistance
+        : (routeDistance >= 0 ? routeDistance : Infinity);
       if (dist < minDistance && dist <= stage1ThresholdM + 300) {
         minDistance = dist;
         closestHotspot = hotspot;

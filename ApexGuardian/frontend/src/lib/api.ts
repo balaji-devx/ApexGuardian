@@ -1,3 +1,5 @@
+import { DEFAULT_TRAFFIC_MODE } from "./trafficScenario";
+
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api/v1";
 
 export interface HealthResponse {
@@ -15,6 +17,9 @@ export interface PlaceSearchResult {
   address_type: string;
 }
 
+export type CongestionLevel = "LOW" | "MODERATE" | "HEAVY" | "SEVERE";
+export type TrafficTestMode = "real" | "normal" | "moderate" | "heavy" | "severe" | "dynamic";
+
 export interface CongestionSegment {
   segment_index: number;
   coordinates: number[][];
@@ -23,7 +28,7 @@ export interface CongestionSegment {
   freeflow_speed_kmh: number;
   current_speed_kmh: number;
   delay_seconds: number;
-  congestion_level: "CLEAR" | "MODERATE" | "HEAVY" | "SEVERE";
+  congestion_level: CongestionLevel;
   color: string;
   congestion_factor: number;
   density_index: number;
@@ -37,7 +42,7 @@ export interface CongestionHotspot {
   lat: number;
   lon: number;
   distance_from_origin_m: number;
-  congestion_level: "MODERATE" | "HEAVY" | "SEVERE";
+  congestion_level: CongestionLevel;
   average_speed_kmh: number;
   estimated_delay_seconds: number;
   description: string;
@@ -98,7 +103,7 @@ export interface TrafficFactorData {
   current_speed_kmh: number;
   freeflow_speed_kmh: number;
   density_index: number;
-  congestion_level: "CLEAR" | "MODERATE" | "HEAVY" | "SEVERE";
+  congestion_level: CongestionLevel;
   congestion_factor: number;
   incident_description?: string;
   historical_baseline_speed_kmh: number;
@@ -106,6 +111,7 @@ export interface TrafficFactorData {
 
 export interface RerouteRecommendation {
   is_reroute_recommended: boolean;
+  is_congestion_avoidance: boolean;
   time_saved_seconds: number;
   time_saved_minutes: number;
   original_remaining_seconds: number;
@@ -148,7 +154,9 @@ export async function fetchRoutes(
   originLon: number,
   destLat: number,
   destLon: number,
-  isEmergencyMode: boolean = false
+  isEmergencyMode: boolean = false,
+  trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
+  trafficProgress: number = 0
 ): Promise<RouteResponse> {
   const res = await fetch(`${API_BASE_URL}/route`, {
     method: "POST",
@@ -159,6 +167,8 @@ export async function fetchRoutes(
       dest_lat: destLat,
       dest_lon: destLon,
       is_emergency_mode: isEmergencyMode,
+      traffic_test_mode: trafficTestMode,
+      traffic_progress: trafficProgress,
     }),
   });
   if (!res.ok) throw new Error("Failed to calculate routes");
@@ -171,8 +181,10 @@ export async function evaluateReroute(
   destLat: number,
   destLon: number,
   originalRemainingSeconds: number,
-  avoidHotspots: Array<{ lat: number; lon: number }> = [],
-  isEmergencyMode: boolean = false
+  avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = [],
+  isEmergencyMode: boolean = false,
+  trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
+  trafficProgress: number = 0
 ): Promise<RerouteRecommendation> {
   const res = await fetch(`${API_BASE_URL}/reroute/evaluate`, {
     method: "POST",
@@ -185,6 +197,8 @@ export async function evaluateReroute(
       original_remaining_duration_seconds: originalRemainingSeconds,
       avoid_hotspots: avoidHotspots,
       is_emergency_mode: isEmergencyMode,
+      traffic_test_mode: trafficTestMode,
+      traffic_progress: trafficProgress,
     }),
   });
   if (!res.ok) throw new Error("Failed to evaluate alternative reroutes");

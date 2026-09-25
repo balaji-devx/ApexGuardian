@@ -21,7 +21,7 @@ def test_live_traffic_service_point_factors():
     assert "current_speed_kmh" in factors
     assert "congestion_level" in factors
     assert factors["current_speed_kmh"] > 0
-    assert factors["congestion_level"] in ["CLEAR", "MODERATE", "HEAVY", "SEVERE"]
+    assert factors["congestion_level"] in ["LOW", "MODERATE", "HEAVY", "SEVERE"]
     assert factors["color"].startswith("#")
 
 
@@ -135,4 +135,3 @@ def test_nearest_point_along_route_calculation():
     for i in range(1, closest_idx + 1):
         running_dist += CongestionDetector.haversine_distance(coords[i-1], coords[i])
     assert running_dist > 500.0
-

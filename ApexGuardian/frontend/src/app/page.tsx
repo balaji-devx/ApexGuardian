@@ -9,9 +9,11 @@ import { TurnByTurnDrawer } from "@/components/ui/TurnByTurnDrawer";
 import { AdvanceAlertBanner } from "@/components/ui/AdvanceAlertBanner";
 import { RerouteModal } from "@/components/ui/RerouteModal";
 import { NavigationControlsHUD } from "@/components/ui/NavigationControlsHUD";
+import { NoFasterRouteToast } from "@/components/ui/NoFasterRouteToast";
 import { TrafficLegend } from "@/components/ui/TrafficLegend";
 import { useNavigation } from "@/context/NavigationContext";
 import { ShieldCheck, Wifi, WifiOff, Siren } from "lucide-react";
+import { OVERLAY_Z } from "@/lib/layoutZones";
 
 export default function Home() {
   const {
@@ -25,6 +27,8 @@ export default function Home() {
     acceptReroute,
     triggerDynamicRerouteCheck,
     isApplyingReroute,
+    noRouteReason,
+    dismissNoRouteReason,
   } = useNavigation();
 
   return (
@@ -48,26 +52,29 @@ export default function Home() {
         isApplying={isApplyingReroute}
       />
 
+      {!activeRerouteRecommendation && (
+        <NoFasterRouteToast reason={noRouteReason} onDismiss={dismissNoRouteReason} />
+      )}
+
       {/* Active Driving Turn-by-Turn HUD & Simulation Controls */}
       <NavigationControlsHUD />
 
-      {/* Feature 1: Traffic Classification Color Legend */}
-      <TrafficLegend />
-
       {/* Left Sidebar UI Layout */}
       {!isNavigating && (
-        <div className="fixed left-4 top-4 bottom-4 z-20 flex flex-col gap-4 w-[calc(100vw-32px)] sm:w-[420px] pointer-events-none">
+        <div className="fixed left-4 top-4 bottom-4 flex flex-col gap-4 w-[calc(100vw-32px)] sm:w-[420px] overflow-y-auto pointer-events-none" style={{ zIndex: OVERLAY_Z.sidebar }}>
           <FloatingSearchPanel />
           <RouteCard />
           <TurnByTurnDrawer />
+          <TrafficLegend placement="sidebar" />
         </div>
       )}
+      {isNavigating && <TrafficLegend placement="navigation" />}
 
       {/* Standard Map Controls (Zoom, Recenter, Layers) */}
       <MapControls />
 
       {/* Top-Right Backend Health & Mode Status Badges */}
-      <div className="fixed top-4 right-4 z-20 flex items-center gap-2 pointer-events-auto">
+      <div className="fixed top-4 right-4 flex items-center gap-2 pointer-events-auto" style={{ zIndex: OVERLAY_Z.statusBadge }}>
         {isEmergencyMode && (
           <div className="glass-panel px-3.5 py-2 rounded-full flex items-center gap-2 shadow-lg text-xs font-black text-rose-600 border border-rose-500/50 bg-rose-50/95 animate-pulse">
             <Siren className="w-3.5 h-3.5 fill-current" />

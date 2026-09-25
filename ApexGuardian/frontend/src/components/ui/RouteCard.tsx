@@ -15,6 +15,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
+import { TTSService } from "@/lib/ttsService";
 
 export const RouteCard: React.FC = () => {
   const [showHotspotList, setShowHotspotList] = useState(false);
@@ -405,7 +406,15 @@ export const RouteCard: React.FC = () => {
 
         {/* CTA Button */}
         <button
-          onClick={() => setIsNavigating(!isNavigating)}
+          onClick={() => {
+            if (isNavigating) {
+              TTSService.reset();
+              setIsNavigating(false);
+            } else {
+              TTSService.warmUp();
+              setIsNavigating(true);
+            }
+          }}
           className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 ${
             isNavigating
               ? "bg-rose-700 hover:bg-rose-800 text-white shadow-rose-700/30"

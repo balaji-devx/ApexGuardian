@@ -2,6 +2,7 @@ import math
 import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
+from schemas.navigation import CongestionLevel
 
 class LiveTrafficService:
     """Real-Time Traffic Factor Integration Service (Feature 2).
@@ -230,18 +231,20 @@ class LiveTrafficService:
         speed_ratio = current_speed / max(1.0, freeflow_speed)
         congestion_factor = freeflow_speed / max(1.0, current_speed)
 
+        # Shared severity thresholds use current speed as a ratio of free-flow speed:
+        # LOW >= 0.80, MODERATE >= 0.50, HEAVY >= 0.25, otherwise SEVERE.
         if speed_ratio >= 0.80:
-            congestion_level = "CLEAR"
-            color = "#10B981"  # Emerald Green
+            congestion_level = CongestionLevel.LOW
+            color = "#16A34A"  # Green
         elif speed_ratio >= 0.50:
-            congestion_level = "MODERATE"
-            color = "#F59E0B"  # Amber Orange
+            congestion_level = CongestionLevel.MODERATE
+            color = "#EAB308"  # Yellow
         elif speed_ratio >= 0.25:
-            congestion_level = "HEAVY"
-            color = "#EF4444"  # Red
+            congestion_level = CongestionLevel.HEAVY
+            color = "#F97316"  # Orange
         else:
-            congestion_level = "SEVERE"
-            color = "#991B1B"  # Deep Crimson Maroon
+            congestion_level = CongestionLevel.SEVERE
+            color = "#DC2626"  # Red
 
         return {
             "location_name": location_name,
@@ -250,7 +253,7 @@ class LiveTrafficService:
             "current_speed_kmh": round(current_speed, 1),
             "freeflow_speed_kmh": round(freeflow_speed, 1),
             "density_index": round(density_index, 1),
-            "congestion_level": congestion_level,
+            "congestion_level": congestion_level.value,
             "congestion_factor": round(congestion_factor, 2),
             "color": color,
             "incident_description": incident_desc,

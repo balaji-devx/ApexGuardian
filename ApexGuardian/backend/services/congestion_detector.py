@@ -1,6 +1,7 @@
 import math
 from typing import List, Dict, Any, Tuple
 from services.traffic_service import LiveTrafficService
+from schemas.navigation import CongestionLevel
 
 class CongestionDetector:
     """Congestion Point Identification and Predictive Detection Engine (Features 1 & 3).
@@ -104,12 +105,12 @@ class CongestionDetector:
                     traffic_factors["freeflow_speed_kmh"], 
                     traffic_factors["current_speed_kmh"] * 1.5 + 10.0
                 )
-                if traffic_factors["congestion_level"] == "SEVERE":
-                    traffic_factors["congestion_level"] = "HEAVY"
-                elif traffic_factors["congestion_level"] == "HEAVY":
-                    traffic_factors["congestion_level"] = "MODERATE"
-                elif traffic_factors["congestion_level"] == "MODERATE":
-                    traffic_factors["congestion_level"] = "CLEAR"
+                if traffic_factors["congestion_level"] == CongestionLevel.SEVERE.value:
+                    traffic_factors["congestion_level"] = CongestionLevel.HEAVY.value
+                elif traffic_factors["congestion_level"] == CongestionLevel.HEAVY.value:
+                    traffic_factors["congestion_level"] = CongestionLevel.MODERATE.value
+                elif traffic_factors["congestion_level"] == CongestionLevel.MODERATE.value:
+                    traffic_factors["congestion_level"] = CongestionLevel.LOW.value
 
             current_speed_kmh = max(5.0, traffic_factors["current_speed_kmh"])
             freeflow_speed_kmh = max(20.0, traffic_factors["freeflow_speed_kmh"])
@@ -136,13 +137,13 @@ class CongestionDetector:
 
             # Accumulate distance categories
             level = traffic_factors["congestion_level"]
-            if level == "CLEAR":
+            if level == CongestionLevel.LOW.value:
                 clear_dist_m += seg_dist_m
-            elif level == "MODERATE":
+            elif level == CongestionLevel.MODERATE.value:
                 moderate_dist_m += seg_dist_m
-            elif level == "HEAVY":
+            elif level == CongestionLevel.HEAVY.value:
                 heavy_dist_m += seg_dist_m
-            elif level == "SEVERE":
+            elif level == CongestionLevel.SEVERE.value:
                 severe_dist_m += seg_dist_m
 
             total_delay_s += seg_delay_s
@@ -164,9 +165,9 @@ class CongestionDetector:
             })
 
             # Detect if this segment qualifies as a critical Bottleneck Hotspot
-            if level in ["MODERATE", "HEAVY", "SEVERE"]:
+            if level in [CongestionLevel.MODERATE.value, CongestionLevel.HEAVY.value, CongestionLevel.SEVERE.value]:
                 # Include heavy/severe bottlenecks, or moderate segments with meaningful delay or named bottlenecks
-                if level in ["HEAVY", "SEVERE"] or seg_delay_s >= 20.0 or (traffic_factors.get("location_name") and traffic_factors.get("location_name") != "Urban Arterial Corridor"):
+                if level in [CongestionLevel.HEAVY.value, CongestionLevel.SEVERE.value] or seg_delay_s >= 20.0 or (traffic_factors.get("location_name") and traffic_factors.get("location_name") != "Urban Arterial Corridor"):
                     hotspot_id = f"hotspot_{seg_idx}_{round(mid_lat, 3)}_{round(mid_lon, 3)}"
                     loc_name = traffic_factors.get("location_name") or matching_road_name
                     if loc_name == "Urban Arterial Corridor":
@@ -179,7 +180,7 @@ class CongestionDetector:
                             "location_name": loc_name,
                             "lat": round(mid_lat, 5),
                             "lon": round(mid_lon, 5),
-                            "distance_from_origin_m": round(cumulative_dist_m, 1),
+                            "distance_from_origin_m": round(cumulative_dist_m + (seg_dist_m / 2.0), 1),
                             "congestion_level": level,
                             "average_speed_kmh": round(current_speed_kmh, 1),
                             "estimated_delay_seconds": round(seg_delay_s, 1),

@@ -2,6 +2,7 @@ import { dispatchPushNotification, PushNotificationPayload } from "./api";
 
 export class PushNotificationService {
   private static permissionGranted: boolean = false;
+  private static localNotifications: Map<string, Notification> = new Map();
 
   public static isSupported(): boolean {
     return typeof window !== "undefined" && "Notification" in window;
@@ -29,6 +30,29 @@ export class PushNotificationService {
     return Notification.permission === "granted";
   }
 
+  private static async clearTaggedNotification(tag: string) {
+    if (!this.isSupported() || Notification.permission !== "granted") return;
+    try {
+      this.localNotifications.get(tag)?.close();
+      this.localNotifications.delete(tag);
+      if ("serviceWorker" in navigator) {
+        const registration = await navigator.serviceWorker.ready;
+        const notifications = await registration.getNotifications({ tag });
+        notifications.forEach((notification) => notification.close());
+      }
+    } catch (err) {
+      console.warn("Could not clear congestion notification:", err);
+    }
+  }
+
+  public static async clearCongestionAlert() {
+    await this.clearTaggedNotification("apex-congestion-alert");
+  }
+
+  public static async clearRerouteAlert() {
+    await this.clearTaggedNotification("apex-reroute-alert");
+  }
+
   /**
    * Dispatches push notification for upcoming route congestion (Feature 5a).
    */
@@ -36,10 +60,11 @@ export class PushNotificationService {
     locationName: string,
     distanceText: string,
     delayMinutes: number,
-    speedKmh: number
+    speedKmh: number,
+    severity: "LOW" | "MODERATE" | "HEAVY" | "SEVERE" = "HEAVY"
   ) {
-    const title = `⚠️ Congestion Ahead (${distanceText})`;
-    const body = `Heavy traffic near ${locationName}. Speed: ${Math.round(speedKmh)} km/h (+${Math.round(delayMinutes)}m delay).`;
+    const title = `⚠️ ${severity[0]}${severity.slice(1).toLowerCase()} traffic ahead (${distanceText})`;
+    const body = `Traffic is moving slowly near ${locationName}. Speed: ${Math.round(speedKmh)} km/h (+${Math.round(delayMinutes)}m delay).`;
 
     const payload: PushNotificationPayload = {
       title,
@@ -64,11 +89,12 @@ export class PushNotificationService {
             tag: "apex-congestion-alert",
           });
         } else {
-          new Notification(title, {
+          this.localNotifications.get("apex-congestion-alert")?.close();
+          this.localNotifications.set("apex-congestion-alert", new Notification(title, {
             body,
             icon: "/favicon.ico",
             tag: "apex-congestion-alert",
-          });
+          }));
         }
       } catch (err) {
         console.warn("Local notification error:", err);
@@ -88,10 +114,15 @@ export class PushNotificationService {
    */
   public static async sendRerouteSuggestion(
     timeSavedMinutes: number,
-    viaRoad: string
+    viaRoad: string,
+    isCongestionAvoidance = false,
   ) {
-    const title = `🚀 Faster Route Found (Save ${Math.round(timeSavedMinutes)} min)`;
-    const body = `Alternative route via ${viaRoad} available to bypass congestion.`;
+    const title = isCongestionAvoidance
+      ? "Route around congestion available"
+      : `🚀 Faster Route Found (Save ${Math.round(timeSavedMinutes)} min)`;
+    const body = isCongestionAvoidance
+      ? `A route avoiding the flagged congestion${viaRoad ? ` via ${viaRoad}` : ""} is available. Review its ETA before switching.`
+      : `Alternative route via ${viaRoad} available to bypass congestion.`;
 
     const payload: PushNotificationPayload = {
       title,
@@ -101,6 +132,7 @@ export class PushNotificationService {
         type: "REROUTE",
         timeSavedMinutes,
         viaRoad,
+        isCongestionAvoidance,
       },
     };
 
@@ -114,11 +146,12 @@ export class PushNotificationService {
             tag: "apex-reroute-alert",
           });
         } else {
-          new Notification(title, {
+          this.localNotifications.get("apex-reroute-alert")?.close();
+          this.localNotifications.set("apex-reroute-alert", new Notification(title, {
             body,
             icon: "/favicon.ico",
             tag: "apex-reroute-alert",
-          });
+          }));
         }
       } catch (err) {
         console.warn("Local notification error:", err);

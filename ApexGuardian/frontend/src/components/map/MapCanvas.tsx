@@ -3,8 +3,10 @@
 import React, { useEffect, useRef } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
+import { TRAFFIC_COLORS } from "@/lib/trafficScenario";
 import { useNavigation, BENGALURU_CENTER } from "@/context/NavigationContext";
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
+import { OVERLAY_Z } from "@/lib/layoutZones";
 
 export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
 
@@ -43,6 +45,7 @@ export const MapCanvas: React.FC = () => {
     currentLocation,
     vehicleBearing,
     activeRerouteRecommendation,
+    navigationHudHeight,
   } = useNavigation();
 
   // Initialize MapLibre GL
@@ -329,13 +332,19 @@ export const MapCanvas: React.FC = () => {
           duration: 250,
           easing: (t) => t,
           zoom: Math.max(14.5, map.getZoom()),
+          padding: {
+            top: 0,
+            bottom: isNavigating ? navigationHudHeight : 0,
+            left: 0,
+            right: 0,
+          },
         });
       }
     } else if (vehicleMarkerRef.current) {
       vehicleMarkerRef.current.remove();
       vehicleMarkerRef.current = null;
     }
-  }, [isNavigating, currentLocation, vehicleBearing]);
+  }, [isNavigating, currentLocation, vehicleBearing, navigationHudHeight]);
 
   // Render Multi-Color Congestion Segments & Congestion Drop Pins (Sections 3 & 6)
   const renderedLayersRef = useRef<string[]>([]);
@@ -400,10 +409,8 @@ export const MapCanvas: React.FC = () => {
             const casingLayerId = `seg-casing-${idx}-${sIdx}`;
             const lineLayerId = `seg-line-${idx}-${sIdx}`;
 
-            let segmentColor = seg.color;
-            if (!isAI && seg.congestion_level === "CLEAR") {
-              segmentColor = "#3B82F6";
-            }
+            const trafficColor = TRAFFIC_COLORS[seg.congestion_level] || seg.color;
+            const segmentColor = isSelected ? trafficColor : "#94A3B8";
 
             map.addSource(sourceId, {
               type: "geojson",
@@ -425,9 +432,9 @@ export const MapCanvas: React.FC = () => {
               source: sourceId,
               layout: { "line-join": "round", "line-cap": "round" },
               paint: {
-                "line-color": isSelected ? "#0F172A" : "#1E293B",
+                "line-color": isSelected ? "#2563EB" : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
-                "line-opacity": isSelected ? 0.45 : 0.2,
+                "line-opacity": isSelected ? 0.9 : 0.2,
               },
             });
             renderedLayersRef.current.push(casingLayerId);
@@ -465,7 +472,9 @@ export const MapCanvas: React.FC = () => {
               const level = hotspot.congestion_level || "HEAVY";
               const isSevere = level === "SEVERE";
               const isModerate = level === "MODERATE";
-              const delayM = Math.max(1, Math.round((hotspot.estimated_delay_seconds || 120) / 60));
+              const levelColor = TRAFFIC_COLORS[level];
+              const isHeavy = level === "HEAVY";
+              const accessibleLabel = `${level[0]}${level.slice(1).toLowerCase()} traffic ahead at ${hotspot.location_name}`;
 
               let pinFill = "#DC2626"; // Red (Heavy)
               let pinStroke = "#F87171";
@@ -514,26 +523,20 @@ export const MapCanvas: React.FC = () => {
               }
 
               el.className = "relative cursor-pointer group";
-              el.style.width = "36px";
-              el.style.height = "48px";
+              el.setAttribute("role", "img");
+              el.setAttribute("aria-label", accessibleLabel);
+              el.setAttribute("title", accessibleLabel);
+              el.style.width = "44px";
+              el.style.height = "44px";
               el.innerHTML = `
-                <div class="relative flex flex-col items-center transform -translate-x-1/2 -translate-y-full hover:scale-110 active:scale-95 transition duration-200" style="filter: drop-shadow(0 4px 10px ${shadowColor});">
-                  ${isSevere && isSelected ? '<span class="absolute -bottom-1 w-6 h-6 rounded-full bg-rose-500/40 animate-ping pointer-events-none"></span>' : ''}
-
-                  <!-- Teardrop Pin SVG (36x48) -->
-                  <svg width="36" height="48" viewBox="0 0 36 48" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <!-- Outer Pin Teardrop Shape -->
-                    <path d="M18 0C8.06 0 0 8.06 0 18C0 31.5 18 48 18 48C18 48 36 31.5 36 18C36 8.06 27.94 0 18 0Z" fill="${pinFill}" stroke="${pinStroke}" stroke-width="1.5"/>
-                    <!-- Inner White Emblem Circle -->
-                    <circle cx="18" cy="18" r="11.5" fill="#FFFFFF"/>
-                    <!-- Severity Icon Glyphs -->
-                    ${iconSvg}
+                <div class="relative flex items-center justify-center hover:scale-110 active:scale-95 transition duration-200" style="filter: drop-shadow(0 3px 8px ${levelColor}99);">
+                  ${isSevere && isSelected ? `<span class="absolute w-10 h-10 rounded-full animate-ping pointer-events-none" style="background:${levelColor}55"></span>` : ""}
+                  <svg width="44" height="44" viewBox="0 0 36 36" role="presentation" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+                    <circle cx="18" cy="18" r="16" fill="${levelColor}" stroke="white" stroke-width="2"/>
+                    <path d="M18 8.5 28 26H8L18 8.5Z" fill="white" stroke="#1F2937" stroke-width="1.2" stroke-linejoin="round"/>
+                    <path d="M18 14v5" stroke="#111827" stroke-width="2.4" stroke-linecap="round"/>
+                    <circle cx="18" cy="22.2" r="1.2" fill="#111827"/>
                   </svg>
-
-                  <!-- Delay Badge Mini Tag -->
-                  <div class="absolute -top-1.5 -right-2 px-1.5 py-0.5 rounded-full text-[10px] font-black shadow-md border border-white/40 ${badgeBg}">
-                    +${delayM}m
-                  </div>
                 </div>
               `;
 
@@ -541,12 +544,8 @@ export const MapCanvas: React.FC = () => {
               if (isSelected) {
                 const popupContent = `
                   <div class="p-2.5 rounded-xl bg-slate-900/95 text-white text-xs space-y-1 shadow-2xl border border-slate-700 min-w-[170px] backdrop-blur-md">
-                    <div class="font-extrabold text-xs flex items-center gap-1.5 ${titleColor}">
-                      <span>${hotspot.location_name}</span>
-                    </div>
-                    <div class="flex items-center justify-between text-slate-300 font-semibold pt-1 border-t border-slate-800 text-[11px]">
-                      <span>Estimated Delay:</span>
-                      <span class="font-black text-rose-400">+${delayM} min</span>
+                    <div class="font-extrabold text-xs flex items-center gap-1.5" style="color:${levelColor}">
+                      <span>${accessibleLabel}</span>
                     </div>
                     <div class="flex items-center justify-between text-slate-300 text-[11px]">
                       <span>Average Speed:</span>
@@ -559,7 +558,7 @@ export const MapCanvas: React.FC = () => {
                 `;
 
                 const popup = new maplibregl.Popup({
-                  offset: [0, -42],
+                  offset: [0, -46],
                   closeButton: false,
                   className: "custom-hotspot-popup",
                 }).setHTML(popupContent);
@@ -600,9 +599,9 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-              "line-color": isSelected ? "#0F172A" : "#1E293B",
-              "line-width": isSelected ? 12 : 8,
-              "line-opacity": isSelected ? 0.45 : 0.2,
+                "line-color": isSelected ? "#2563EB" : "#1E293B",
+                "line-width": isSelected ? 12 : 8,
+                "line-opacity": isSelected ? 0.9 : 0.2,
             },
           });
           renderedLayersRef.current.push(casingLayerId);
@@ -734,7 +733,7 @@ export const MapCanvas: React.FC = () => {
         style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0 }}
       />
       {pinDropMode !== "none" && (
-        <div className="absolute top-6 left-1/2 transform -translate-x-1/2 z-50 bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse">
+        <div className="absolute top-6 left-3 right-3 mx-auto w-fit max-w-[calc(100%-1.5rem)] bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse" style={{ zIndex: OVERLAY_Z.mapPrompt }}>
           <p className="text-sm font-bold tracking-wide text-center">
             Tap the map to set your <span className="text-blue-400">{pinDropMode === "source" ? "starting" : "destination"}</span> point
           </p>
