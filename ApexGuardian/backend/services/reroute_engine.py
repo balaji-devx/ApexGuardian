@@ -7,7 +7,6 @@ from ml.recommender import RouteScorer
 from schemas.navigation import CandidateRoute, RerouteRecommendation, TrafficTestMode
 from services.congestion_detector import CongestionDetector
 from services.osrm import OSRMService
-from services.traffic_scenario import apply_traffic_test_scenario
 
 logger = logging.getLogger("apexguardian.reroute")
 
@@ -312,8 +311,28 @@ class DynamicRerouteEngine:
             base_duration_s=base_dur_s,
             is_emergency_mode=is_emergency_mode,
         )
-        if not is_emergency_mode:
-            analysis = apply_traffic_test_scenario(analysis, traffic_test_mode, traffic_progress, synthetic_traffic_active)
+        # Deliberately do NOT re-apply the controlled traffic-test scenario here.
+        #
+        # Every candidate this method processes has source == "reroute" (both
+        # the native-OSRM alternatives and the waypoint-bypass geometry below).
+        # The previous behaviour called apply_traffic_test_scenario() on each of
+        # these too, using the same fixed ~42%-68%-of-route-length window the
+        # original route used. That stamped a brand-new synthetic HEAVY/SEVERE
+        # hotspot onto whatever bypass had just been computed, at the
+        # equivalent relative position along *its own* geometry.
+        #
+        # Accepting that bypass then meant the driver immediately approached a
+        # fresh synthetic hotspot on the "new" route, which re-triggered another
+        # proactive alert, which triggered another reroute evaluation, which
+        # stamped yet another hotspot on the next bypass — an unbounded loop of
+        # "severe congestion ahead" that never resolved into a clear run to the
+        # destination, no matter how many times the driver rerouted.
+        #
+        # A rerouted candidate should only ever reflect the same real-traffic
+        # model used for any other live route lookup, never a fresh synthetic
+        # event. (traffic_test_mode / traffic_progress / synthetic_traffic_active
+        # remain in this method's signature for parity with _score_and_process
+        # and are intentionally unused below.)
 
         candidate["segments"] = analysis["segments"]
         candidate["hotspots"] = analysis["hotspots"]

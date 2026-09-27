@@ -634,7 +634,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     const switched = activateRoute(recommendation.recommended_route, true);
     setIsApplyingReroute(false);
     if (switched) {
-      if (trafficTestModeRef.current !== "real" && recommendation.is_congestion_avoidance) {
+      // Any accepted reroute during a controlled traffic test ends that
+      // test's synthetic congestion for the rest of the trip — not only an
+      // accepted congestion-avoidance suggestion. Gating this solely on
+      // is_congestion_avoidance meant the "faster route" branch (surfaced by
+      // the periodic, non-avoidance check) never marked the scenario
+      // consumed, so a later dynamic-mode phase change — or any fresh
+      // /route call — could still inject another synthetic HEAVY/SEVERE
+      // hotspot even though the driver had already rerouted once.
+      if (trafficTestModeRef.current !== "real") {
         testCongestionConsumedRef.current = true;
       }
       if (recommendation.is_congestion_avoidance) {

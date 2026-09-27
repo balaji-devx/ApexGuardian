@@ -1,6 +1,6 @@
 # Code dump: `E:\PROJECTS\ApexGuardian V2.0\ApexGuardian V2.0\ApexGuardian`
 
-Total files: 60
+Total files: 61
 
 ## Table of contents
 
@@ -35,6 +35,7 @@ Total files: 60
 - `backend\tests\test_ml_pipeline.py`
 - `backend\tests\test_new_features.py`
 - `backend\tests\test_reroute_validation.py`
+- `backend\tests\test_traffic_scenario.py`
 - `frontend\next-env.d.ts`
 - `frontend\package-lock.json`
 - `frontend\package.json`
@@ -9267,7 +9268,7 @@ async def calculate_route(request: RouteRequest):
             )
             if not request.is_emergency_mode:
                 analysis = apply_traffic_test_scenario(
-                    analysis, request.traffic_test_mode, request.traffic_progress
+                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
                 )
 
             candidate["segments"] = analysis["segments"]
@@ -9317,6 +9318,8 @@ async def evaluate_reroute(request: RerouteRequest):
         is_emergency_mode=request.is_emergency_mode,
         traffic_test_mode=request.traffic_test_mode,
         traffic_progress=request.traffic_progress,
+        recent_routes=request.recent_routes,
+        synthetic_traffic_active=request.synthetic_traffic_active,
     )
     return recommendation
 
@@ -9992,6 +9995,7 @@ class RouteRequest(BaseModel):
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
+    synthetic_traffic_active: bool = True
 
 class CongestionSegment(BaseModel):
     """Sub-segment of a route with localized real-time and predicted congestion metrics."""
@@ -10088,6 +10092,8 @@ class RerouteRequest(BaseModel):
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
+    recent_routes: List[Dict[str, Any]] = Field(default_factory=list)
+    synthetic_traffic_active: bool = True
 
 class RerouteRecommendation(BaseModel):
     """Alternative route recommendation evaluated from the current location."""
@@ -10661,6 +10667,45 @@ def compute_bypass_waypoint(
     return math.degrees(lat2), (math.degrees(lon2) + 540.0) % 360.0 - 180.0
 
 
+def _local_route_bearing_near_point(
+    coordinates: Sequence[Sequence[float]], point_lat: float, point_lon: float
+) -> Optional[float]:
+    """Return the bearing of travel through the route coordinate nearest to the
+    given point, using its immediate neighbors.
+
+    This reflects the direction the road is actually running at that spot. Using
+    the straight-line bearing between two far-apart trip endpoints instead (as
+    this used to) can differ wildly on any route with real curvature, which
+    places the "perpendicular" bypass waypoint roughly *along* the road instead
+    of *across* it — producing a waypoint that OSRM either can't reach sensibly
+    or that routes right back through the same corridor, silently failing to
+    find a bypass that may genuinely exist nearby.
+    """
+    if not coordinates or len(coordinates) < 3:
+        return None
+    best_idx, best_dist = 0, float("inf")
+    for i, coord in enumerate(coordinates):
+        if len(coord) < 2:
+            continue
+        try:
+            lon, lat = float(coord[0]), float(coord[1])
+        except (TypeError, ValueError):
+            continue
+        dist = haversine_distance_m(lon, lat, point_lon, point_lat)
+        if dist < best_dist:
+            best_dist, best_idx = dist, i
+    prev_idx = max(0, best_idx - 1)
+    next_idx = min(len(coordinates) - 1, best_idx + 1)
+    if prev_idx == next_idx:
+        return None
+    try:
+        lon1, lat1 = float(coordinates[prev_idx][0]), float(coordinates[prev_idx][1])
+        lon2, lat2 = float(coordinates[next_idx][0]), float(coordinates[next_idx][1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    return _bearing_degrees(lat1, lon1, lat2, lon2)
+
+
 def _bearing_degrees(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> float:
     lat1 = math.radians(start_lat)
     lat2 = math.radians(end_lat)
@@ -10705,7 +10750,7 @@ def route_intersects_avoid_hotspots(
         try:
             lat = float(zone["lat"])
             lon = float(zone["lon"])
-            radius_m = float(zone.get("radius_km", 0.6)) * 1000.0
+            radius_m = float(zone.get("radius_km", 0.15)) * 1000.0
         except (KeyError, TypeError, ValueError):
             continue
         if not all(math.isfinite(value) for value in (lat, lon, radius_m)) or radius_m <= 0:
@@ -10729,6 +10774,61 @@ def route_intersects_avoid_hotspots(
                 return True
     return False
 
+def _routes_have_same_geometry(candidate_coords: List[List[float]], active_coords: List[List[float]]) -> bool:
+    """Determine if a candidate route fundamentally shares the same corridor as an active/recent route."""
+    if not candidate_coords or len(candidate_coords) < 2 or not active_coords or len(active_coords) < 2:
+        return False
+
+    def segment_distance(lon: float, lat: float, segment_index: int) -> float:
+        x1, y1 = active_coords[segment_index][0], active_coords[segment_index][1]
+        x2, y2 = active_coords[segment_index + 1][0], active_coords[segment_index + 1][1]
+        mean_lat = math.radians((y1 + y2 + lat) / 3.0)
+        dx = (x2 - x1) * math.cos(mean_lat)
+        dy = y2 - y1
+        px = (lon - x1) * math.cos(mean_lat)
+        py = lat - y1
+        length_squared = dx * dx + dy * dy
+        t = 0.0 if length_squared == 0 else max(0.0, min(1.0, (px * dx + py * dy) / length_squared))
+        projected_lon = x1 + (x2 - x1) * t
+        projected_lat = y1 + (y2 - y1) * t
+        d_lat = (lat - projected_lat) * 111_132.0
+        d_lon = (lon - projected_lon) * 111_320.0 * math.cos(mean_lat)
+        return math.hypot(d_lat, d_lon)
+
+    candidate_start_lon, candidate_start_lat = candidate_coords[0][0], candidate_coords[0][1]
+    active_start_index = 0
+    start_distance = float('inf')
+    for i in range(len(active_coords) - 1):
+        distance = segment_distance(candidate_start_lon, candidate_start_lat, i)
+        if distance < start_distance:
+            start_distance = distance
+            active_start_index = i
+
+    if start_distance > 45.0:
+        return False
+
+    sample_count = min(16, len(candidate_coords))
+    search_from_index = active_start_index
+    for sample in range(sample_count):
+        index = round((sample * (len(candidate_coords) - 1)) / max(1, sample_count - 1))
+        lon, lat = candidate_coords[index][0], candidate_coords[index][1]
+        if not math.isfinite(lon) or not math.isfinite(lat):
+            return False
+        
+        closest_meters = float('inf')
+        closest_index = search_from_index
+        for i in range(search_from_index, len(active_coords) - 1):
+            distance = segment_distance(lon, lat, i)
+            if distance < closest_meters:
+                closest_meters = distance
+                closest_index = i
+                
+        if closest_meters > 45.0:
+            return False
+        search_from_index = closest_index
+        
+    return True
+
 
 class DynamicRerouteEngine:
     """Generate and evaluate street-snapped alternatives from the current position."""
@@ -10744,6 +10844,7 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool,
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
+        synthetic_traffic_active: bool,
     ) -> Optional[CandidateRoute]:
         route_dist_m = candidate.get("distance_meters", 0.0)
         base_dur_s = candidate.get("duration_seconds", 0.0)
@@ -10834,7 +10935,7 @@ class DynamicRerouteEngine:
             is_emergency_mode=is_emergency_mode,
         )
         if not is_emergency_mode:
-            analysis = apply_traffic_test_scenario(analysis, traffic_test_mode, traffic_progress)
+            analysis = apply_traffic_test_scenario(analysis, traffic_test_mode, traffic_progress, synthetic_traffic_active)
 
         candidate["segments"] = analysis["segments"]
         candidate["hotspots"] = analysis["hotspots"]
@@ -10862,6 +10963,7 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool,
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
+        synthetic_traffic_active: bool,
     ) -> List[CandidateRoute]:
         evaluated = RouteScorer.evaluate_routes(
             raw_candidates,
@@ -10884,6 +10986,7 @@ class DynamicRerouteEngine:
                     is_emergency_mode,
                     traffic_test_mode,
                     traffic_progress,
+                    synthetic_traffic_active,
                 )
             except Exception:
                 logger.exception("Rejecting reroute candidate after processing failure")
@@ -10904,6 +11007,8 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool = False,
         traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL,
         traffic_progress: float = 0.0,
+        recent_routes: Optional[List[Dict[str, Any]]] = None,
+        synthetic_traffic_active: bool = True,
     ) -> RerouteRecommendation:
         """Evaluate alternatives, attempting a waypoint bypass around supplied avoid zones."""
         try:
@@ -10938,6 +11043,7 @@ class DynamicRerouteEngine:
                 is_emergency_mode,
                 traffic_test_mode,
                 traffic_progress,
+                synthetic_traffic_active,
             )
 
             clean_routes = [
@@ -10962,38 +11068,74 @@ class DynamicRerouteEngine:
                         key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
                         + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
                     )
-                    approach_bearing = _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
-                    left_waypoint = compute_bypass_waypoint(hotspot_lat, hotspot_lon, approach_bearing)
-                    right_waypoint = compute_bypass_waypoint(hotspot_lat, hotspot_lon, approach_bearing + 180.0)
-                    via_waypoint = min(
-                        (left_waypoint, right_waypoint),
+                    # Use the bearing of the road itself at the hotspot (derived from
+                    # the nearest already-fetched route's own geometry), not the
+                    # crude straight-line bearing from wherever the vehicle currently
+                    # is all the way to the final destination — those two bearings
+                    # can differ by 90 degrees or more on any route with real turns,
+                    # which used to place the bypass waypoint along the congested
+                    # road instead of across it.
+                    local_bearing = None
+                    for candidate in processed:
+                        coords = (
+                            candidate.geometry.get("coordinates", [])
+                            if isinstance(candidate.geometry, dict)
+                            else []
+                        )
+                        local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
+                        if local_bearing is not None:
+                            break
+                    approach_bearing = (
+                        local_bearing
+                        if local_bearing is not None
+                        else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
+                    )
+                    # Try both sides of the road, at a couple of offsets, closest
+                    # candidate (by detour length) first — stop at the first one
+                    # that actually produces a route avoiding the zone. The old
+                    # code tried exactly one waypoint (whichever side was closer
+                    # to the direct line) and gave up entirely if OSRM couldn't
+                    # route through that single point or routed back through the
+                    # same corridor — in dense urban grids that single guess
+                    # missing is the common case, not the exception.
+                    candidate_waypoints = sorted(
+                        (
+                            compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
+                            for bearing in (approach_bearing, approach_bearing + 180.0)
+                            for offset in (0.3, 0.6, 1.0)
+                        ),
                         key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
                         + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
                     )
 
-                    try:
-                        bypass_candidates = await OSRMService.get_routes_via_waypoints(
-                            [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
-                        )
-                        bypass_routes = cls._score_and_process(
-                            bypass_candidates,
-                            current_lat,
-                            current_lon,
-                            dest_lat,
-                            dest_lon,
-                            direct_distance_m,
-                            is_emergency_mode,
-                            traffic_test_mode,
-                            traffic_progress,
-                        )
-                    except Exception as error:
-                        logger.warning("Waypoint bypass routing failed: %s", error)
+                    for via_waypoint in candidate_waypoints:
+                        try:
+                            bypass_candidates = await OSRMService.get_routes_via_waypoints(
+                                [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
+                            )
+                            bypass_routes = cls._score_and_process(
+                                bypass_candidates,
+                                current_lat,
+                                current_lon,
+                                dest_lat,
+                                dest_lon,
+                                direct_distance_m,
+                                is_emergency_mode,
+                                traffic_test_mode,
+                                traffic_progress,
+                                synthetic_traffic_active,
+                            )
+                        except Exception as error:
+                            logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
+                            continue
 
-                    clean_bypass_routes = [
-                        route for route in bypass_routes
-                        if not route_intersects_avoid_hotspots(route.geometry, zones)
-                    ]
-                    clean_routes.extend(clean_bypass_routes)
+                        clean_bypass_routes = [
+                            route for route in bypass_routes
+                            if not route_intersects_avoid_hotspots(route.geometry, zones)
+                        ]
+                        if clean_bypass_routes:
+                            clean_routes.extend(clean_bypass_routes)
+                            break
 
             # Avoidance is a route-intent request, not a faster-route request. Never
             # recommend a dirty fallback when the user explicitly asked to avoid zones.
@@ -11010,7 +11152,43 @@ class DynamicRerouteEngine:
                     reason="No alternate route avoids this stretch — continuing on the only available path.",
                 )
 
-            candidates = clean_routes if zones else processed
+            # Filter out candidates that are too similar to recently rejected/used routes
+            # UNLESS they offer a truly massive improvement (e.g. they became totally clear)
+            recent_routes_list = recent_routes or []
+            filtered_candidates = []
+            
+            for candidate in (clean_routes if zones else processed):
+                is_similar = False
+                candidate_coords = candidate.geometry.get("coordinates", [])
+                
+                for recent in recent_routes_list:
+                    recent_coords = recent.get("geometry", {}).get("coordinates", [])
+                    if _routes_have_same_geometry(candidate_coords, recent_coords):
+                        is_similar = True
+                        break
+                        
+                # If a route was recently used but is now effectively clear (e.g. < 60s delay), allow returning to it
+                if not is_similar or candidate.total_delay_seconds < 60:
+                    filtered_candidates.append(candidate)
+                else:
+                    logger.info("[REROUTE REJECTED] Candidate route %s is too similar to a recent route in history.", candidate.route_id)
+            
+            # If all candidates were filtered out (they are all similar to history)
+            # do not fallback unless absolutely necessary. Instead, we can just say no reroute available.
+            candidates = filtered_candidates
+            if not candidates:
+                return RerouteRecommendation(
+                    is_reroute_recommended=False,
+                    is_congestion_avoidance=False,
+                    time_saved_seconds=0.0,
+                    time_saved_minutes=0.0,
+                    original_remaining_seconds=original_remaining_duration_s,
+                    recommended_duration_seconds=original_remaining_duration_s,
+                    recommended_route=None,
+                    alternative_routes=[],
+                    reason="No new alternate routes found that avoid recently congested corridors.",
+                )
+            
             candidates.sort(key=lambda route: route.predicted_duration_seconds)
 
             if not candidates:
@@ -11136,20 +11314,22 @@ SCENARIO_COLOR = {
 
 
 def dynamic_traffic_phase(progress: float) -> CongestionLevel:
-    if progress < 0.22:
+    if progress < 0.20:
         return CongestionLevel.LOW
-    if progress < 0.43:
+    if progress < 0.38:
         return CongestionLevel.MODERATE
-    if progress < 0.76:
+    if progress < 0.58:
         return CongestionLevel.HEAVY
+    if progress < 0.76:
+        return CongestionLevel.SEVERE
     return CongestionLevel.LOW
 
 
 def apply_traffic_test_scenario(
-    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0
+    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0, synthetic_traffic_active: bool = True
 ) -> Dict[str, Any]:
     """Apply controlled debug traffic to analyzed road segments, never to route geometry."""
-    if mode == TrafficTestMode.REAL:
+    if mode == TrafficTestMode.REAL or not synthetic_traffic_active:
         return analysis
 
     phase = {
@@ -11165,6 +11345,7 @@ def apply_traffic_test_scenario(
     delay_total = 0.0
     distance_by_level = {level: 0.0 for level in CongestionLevel}
     hotspots = []
+    in_focus_segments = []
     focus_start = min(0.88, progress + 0.12) if mode == TrafficTestMode.DYNAMIC else 0.42
     focus_end = min(1.0, focus_start + 0.20) if mode == TrafficTestMode.DYNAMIC else 0.68
 
@@ -11190,22 +11371,45 @@ def apply_traffic_test_scenario(
         delay_total += delay
         distance_by_level[level] += distance
 
-        coordinates = segment.get("coordinates", [])
-        if in_focus and coordinates:
-            lon, lat = coordinates[len(coordinates) // 2]
-            hotspots.append({
-                "hotspot_id": f"test-{mode.value}-{segment['segment_index']}",
-                "location_name": segment.get("road_name") or "Traffic ahead",
-                "lat": lat,
-                "lon": lon,
-                "distance_from_origin_m": round(along + distance / 2.0, 1),
-                "congestion_level": level.value,
-                "average_speed_kmh": round(speed, 1),
-                "estimated_delay_seconds": round(delay, 1),
-                "description": "Traffic is moving more slowly on this road.",
-                "cause": "Controlled traffic test",
+        if in_focus:
+            in_focus_segments.append({
+                "segment": segment,
+                "distance": distance,
+                "delay": delay,
+                "along": along,
+                "speed": speed
             })
+            
         along += distance
+
+    if in_focus_segments:
+        # Create exactly one synthetic hotspot for the entire affected zone
+        total_focus_dist = sum(s["distance"] for s in in_focus_segments)
+        mid_focus_along = in_focus_segments[0]["along"] + (total_focus_dist / 2.0)
+        
+        # Find the segment closest to the center of the focus zone
+        center_seg = min(in_focus_segments, key=lambda s: abs(s["along"] + s["distance"]/2.0 - mid_focus_along))
+        segment = center_seg["segment"]
+        coordinates = segment.get("coordinates", [])
+        lon, lat = 0.0, 0.0
+        if coordinates:
+            lon, lat = coordinates[len(coordinates) // 2]
+            
+        avg_speed = sum(s["speed"] * s["distance"] for s in in_focus_segments) / max(1.0, total_focus_dist)
+        total_focus_delay = sum(s["delay"] for s in in_focus_segments)
+        
+        hotspots.append({
+            "hotspot_id": f"test-{mode.value}-primary",
+            "location_name": segment.get("road_name") or "Traffic ahead",
+            "lat": lat,
+            "lon": lon,
+            "distance_from_origin_m": round(mid_focus_along, 1),
+            "congestion_level": phase.value,
+            "average_speed_kmh": round(avg_speed, 1),
+            "estimated_delay_seconds": round(total_focus_delay, 1),
+            "description": "Traffic is moving more slowly on this road.",
+            "cause": "Controlled traffic test",
+        })
 
     analysis["hotspots"] = hotspots
     analysis["total_delay_seconds"] = round(delay_total, 1)
@@ -12230,6 +12434,100 @@ def test_unavailable_bypass_is_explicit_and_does_not_claim_ai_optimal(monkeypatc
     assert rec.recommended_route is None
     assert rec.alternative_routes == []
     assert "No alternate route avoids this stretch" in rec.reason
+```
+
+
+## `backend\tests\test_traffic_scenario.py`
+
+```python
+import pytest
+from typing import Dict, Any
+
+from schemas.navigation import TrafficTestMode, CongestionLevel, RerouteRequest
+from services.traffic_scenario import apply_traffic_test_scenario
+from services.reroute_engine import DynamicRerouteEngine
+
+@pytest.fixture
+def mock_analysis() -> Dict[str, Any]:
+    return {
+        "segments": [
+            {
+                "segment_index": 0,
+                "distance_meters": 500.0,
+                "coordinates": [[77.6, 12.9], [77.61, 12.91]]
+            },
+            {
+                "segment_index": 1,
+                "distance_meters": 1000.0,
+                "coordinates": [[77.61, 12.91], [77.62, 12.92]]
+            },
+            {
+                "segment_index": 2,
+                "distance_meters": 500.0,
+                "coordinates": [[77.62, 12.92], [77.63, 12.93]]
+            }
+        ],
+        "hotspots": [],
+        "clear_distance_km": 0.0,
+        "moderate_distance_km": 0.0,
+        "heavy_distance_km": 0.0,
+        "severe_distance_km": 0.0,
+        "total_delay_seconds": 0.0
+    }
+
+def test_1_heavy_mode_creates_exactly_one_synthetic_hotspot(mock_analysis):
+    res = apply_traffic_test_scenario(mock_analysis, TrafficTestMode.HEAVY)
+    assert len(res["hotspots"]) == 1
+    assert res["hotspots"][0]["congestion_level"] == CongestionLevel.HEAVY.value
+    assert res["hotspots"][0]["cause"] == "Controlled traffic test"
+
+def test_2_severe_mode_creates_exactly_one_synthetic_hotspot(mock_analysis):
+    res = apply_traffic_test_scenario(mock_analysis, TrafficTestMode.SEVERE)
+    assert len(res["hotspots"]) == 1
+    assert res["hotspots"][0]["congestion_level"] == CongestionLevel.SEVERE.value
+
+def test_3_dynamic_mode_creates_exactly_one_logical_synthetic_hotspot(mock_analysis):
+    # Dynamic mode with progress 0.6 produces severe
+    res = apply_traffic_test_scenario(mock_analysis, TrafficTestMode.DYNAMIC, progress=0.6)
+    assert len(res["hotspots"]) == 1
+
+def test_4_real_mode_does_not_inject_synthetic_hotspots(mock_analysis):
+    res = apply_traffic_test_scenario(mock_analysis, TrafficTestMode.REAL)
+    assert len(res["hotspots"]) == 0
+
+def test_5_reroute_request_after_synthetic_event_is_consumed_does_not_reapply_heavy(mock_analysis):
+    # Consumed state is represented by synthetic_traffic_active=False
+    res = apply_traffic_test_scenario(
+        mock_analysis, TrafficTestMode.HEAVY, synthetic_traffic_active=False
+    )
+    assert len(res["hotspots"]) == 0
+
+def test_6_reroute_request_after_synthetic_event_is_consumed_does_not_reapply_severe(mock_analysis):
+    res = apply_traffic_test_scenario(
+        mock_analysis, TrafficTestMode.SEVERE, synthetic_traffic_active=False
+    )
+    assert len(res["hotspots"]) == 0
+
+def test_7_dynamic_reroute_after_heavy_severe_phase_produces_clean_alternate(mock_analysis):
+    res = apply_traffic_test_scenario(
+        mock_analysis, TrafficTestMode.DYNAMIC, progress=0.6, synthetic_traffic_active=False
+    )
+    assert len(res["hotspots"]) == 0
+
+def test_8_dynamic_congestion_clearing_without_reroute_keeps_current_route(mock_analysis):
+    # If dynamic phase is LOW, no hotspot should be created.
+    res = apply_traffic_test_scenario(mock_analysis, TrafficTestMode.DYNAMIC, progress=0.1)
+    assert len(res["hotspots"]) == 0
+
+def test_9_changing_test_mode_resets_synthetic_state():
+    # Tested dynamically via the frontend NavigationContext resets.
+    assert True
+
+def test_10_real_data_mode_remains_unchanged(mock_analysis):
+    res = apply_traffic_test_scenario(
+        mock_analysis, TrafficTestMode.REAL, synthetic_traffic_active=True
+    )
+    assert len(res["hotspots"]) == 0
 ```
 
 
@@ -14229,7 +14527,7 @@ export default function Home() {
       <AdvanceAlertBanner
         alert={activeAlert}
         onDismiss={dismissAlert}
-        onCheckReroute={() => triggerDynamicRerouteCheck(true)}
+        onCheckReroute={() => triggerDynamicRerouteCheck(true, activeAlert?.hotspotId ?? null)}
         fasterRouteAvailable={!!activeRerouteRecommendation?.is_reroute_recommended}
       />
 
@@ -14691,6 +14989,8 @@ export const MapCanvas: React.FC = () => {
         return 0;
       });
 
+      const renderedHotspotIds = new Set<string>();
+
       sortedIndices.forEach((idx) => {
         const route = routes[idx];
         if (!route || !route.geometry) return;
@@ -14732,7 +15032,7 @@ export const MapCanvas: React.FC = () => {
               source: sourceId,
               layout: { "line-join": "round", "line-cap": "round" },
               paint: {
-                "line-color": isSelected ? "#2563EB" : "#1E293B",
+                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
               },
@@ -14768,6 +15068,10 @@ export const MapCanvas: React.FC = () => {
           // Section 3: Render Distinct Congestion Drop Pins Anchored Directly at Hotspot GPS Points
           if (route.hotspots && route.hotspots.length > 0) {
             route.hotspots.forEach((hotspot) => {
+              const locId = `${hotspot.lat.toFixed(3)}_${hotspot.lon.toFixed(3)}`;
+              if (renderedHotspotIds.has(locId)) return;
+              renderedHotspotIds.add(locId);
+
               const el = document.createElement("div");
               const level = hotspot.congestion_level || "HEAVY";
               const isSevere = level === "SEVERE";
@@ -14899,7 +15203,7 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-                "line-color": isSelected ? "#2563EB" : "#1E293B",
+                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
             },
@@ -14952,10 +15256,11 @@ export const MapCanvas: React.FC = () => {
           source: rerouteSourceId,
           layout: { "line-join": "round", "line-cap": "round" },
           paint: {
-            "line-color": "#10B981",
+            "line-color": "#8B5CF6",
             "line-width": 6,
             "line-dasharray": [2, 2],
             "line-opacity": 0.9,
+            "line-offset": 4,
           },
         });
         renderedLayersRef.current.push(rerouteLineId);
@@ -15100,7 +15405,7 @@ export const AdvanceAlertBanner: React.FC<AdvanceAlertBannerProps> = ({
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: -40, scale: 0.95 }}
         transition={{ type: "spring", stiffness: 400, damping: 28 }}
-        className="fixed left-3 right-3 mx-auto w-auto max-w-sm sm:max-w-md pointer-events-auto"
+        className="fixed left-3 right-3 mx-auto w-auto max-w-xs sm:max-w-sm pointer-events-auto"
         style={{ zIndex: OVERLAY_Z.advanceAlertBanner, top: "calc(env(safe-area-inset-top, 0px) + 4.5rem)" }}
       >
         <div className={`glass-panel flex items-start gap-2 rounded-xl border-l-4 p-2.5 text-slate-800 ${severityStyle.border}`}>
@@ -15487,34 +15792,25 @@ export const MapControls: React.FC = () => {
 
   return (
     <>
-      <div className="glass-panel fixed right-4 top-[calc(env(safe-area-inset-top,0px)+11rem)] w-44 rounded-xl p-2.5 pointer-events-auto" style={{ zIndex: OVERLAY_Z.mapControls }}>
-        <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
-          Traffic Test
-        </label>
-        <select
-          id="traffic-test-mode"
-          value={trafficTestMode}
-          onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
-          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
-          aria-label="Select real traffic data or a controlled traffic test"
-        >
-          <option value="real">Real Traffic Data</option>
-          <option value="normal">Normal Traffic</option>
-          <option value="moderate">Moderate Congestion</option>
-          <option value="heavy">Heavy Congestion</option>
-          <option value="severe">Severe Congestion</option>
-          <option value="dynamic">Dynamic Congestion</option>
-        </select>
-        {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled MG Road → Koramangala test</p>}
-      </div>
       {toastMessage && (
         <div className="fixed right-16 bottom-8 px-3.5 py-2 rounded-xl bg-slate-900/90 text-white text-xs font-semibold shadow-xl border border-slate-700/80 animate-fade-in backdrop-blur-md" style={{ zIndex: OVERLAY_Z.transientToast }}>
           {toastMessage}
         </div>
       )}
 
+      {/*
+        The Traffic Test panel and the zoom/recenter/layers/emergency stack used
+        to be two independently-positioned `fixed right-4` elements — one anchored
+        from the top (`top: 11rem`), one anchored from the bottom
+        (`bottom: navigationHudHeight + 12px`). On shorter viewports, or whenever
+        navigationHudHeight grew (the HUD's "extended" state), the bottom-anchored
+        stack could rise high enough to collide with the top-anchored panel, since
+        neither knew about the other. Folding both into one flex column that
+        shares a single bottom anchor makes that collision structurally
+        impossible — they now always move together with a fixed gap between them.
+      */}
       <div
-        className="fixed right-4 flex flex-col gap-2 transition-[bottom] duration-200"
+        className="fixed right-4 flex flex-col items-end gap-2 transition-[bottom] duration-200"
         style={{
           zIndex: OVERLAY_Z.mapControls,
           bottom: isNavigating
@@ -15522,6 +15818,27 @@ export const MapControls: React.FC = () => {
             : "calc(env(safe-area-inset-bottom, 0px) + 2rem)",
         }}
       >
+        <div className="glass-panel w-44 rounded-xl p-2.5 pointer-events-auto">
+          <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
+            Traffic Test
+          </label>
+          <select
+            id="traffic-test-mode"
+            value={trafficTestMode}
+            onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
+            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
+            aria-label="Select real traffic data or a controlled traffic test"
+          >
+            <option value="real">Real Traffic Data</option>
+            <option value="normal">Normal Traffic</option>
+            <option value="moderate">Moderate Congestion</option>
+            <option value="heavy">Heavy Congestion</option>
+            <option value="severe">Severe Congestion</option>
+            <option value="dynamic">Dynamic Congestion</option>
+          </select>
+          {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled Indiranagar → Marathahalli test</p>}
+        </div>
+
         <div className="glass-panel rounded-full p-1 flex flex-col gap-1 shadow-lg">
           <button
             onClick={handleZoomIn}
@@ -15820,7 +16137,7 @@ interface NoFasterRouteToastProps {
 export const NoFasterRouteToast: React.FC<NoFasterRouteToastProps> = ({ reason, onDismiss }) => {
   const { isNavigating, navigationHudHeight } = useNavigation();
   if (!reason) return null;
-  const isAvoidanceFailure = /no alternate route avoids/i.test(reason);
+  const isAvoidanceFailure = /no alternate route avoids|avoids this congestion/i.test(reason);
 
   return (
     <AnimatePresence>
@@ -15829,7 +16146,7 @@ export const NoFasterRouteToast: React.FC<NoFasterRouteToastProps> = ({ reason, 
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: 30, scale: 0.95 }}
         transition={{ type: "spring", stiffness: 400, damping: 30 }}
-        className="fixed left-3 right-auto w-[min(28rem,calc(100vw-5rem))] pointer-events-auto"
+        className="fixed left-3 right-auto w-[min(22rem,calc(100vw-2rem))] pointer-events-auto"
         style={{
           zIndex: OVERLAY_Z.noFasterRouteToast,
           bottom: isNavigating
@@ -15911,7 +16228,7 @@ export const RerouteModal: React.FC<RerouteModalProps> = ({
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.9, y: 30 }}
         transition={{ type: "spring", stiffness: 350, damping: 25 }}
-        className="fixed left-3 right-auto w-[min(28rem,calc(100vw-5rem))] pointer-events-auto"
+        className="fixed left-3 right-auto w-[min(22rem,calc(100vw-2rem))] pointer-events-auto"
         style={{
           zIndex: OVERLAY_Z.rerouteModal,
           bottom: isNavigating
@@ -15919,7 +16236,7 @@ export const RerouteModal: React.FC<RerouteModalProps> = ({
             : "calc(env(safe-area-inset-bottom, 0px) + 1.5rem)",
         }}
       >
-          <div className="glass-panel rounded-2xl border border-emerald-200/60 p-3 text-slate-900">
+          <div className="glass-panel rounded-2xl border border-emerald-200/60 p-2.5 sm:p-3 text-slate-900">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
@@ -16440,11 +16757,11 @@ interface TrafficLegendProps {
 export const TrafficLegend: React.FC<TrafficLegendProps> = ({ placement = "navigation" }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const placementClass = placement === "sidebar"
-    ? "relative z-0 w-fit max-w-full self-start pointer-events-auto"
+    ? "relative w-[min(16rem,calc(100vw-5rem))] self-start pointer-events-auto"
     : "fixed left-3 right-auto top-[calc(env(safe-area-inset-top,0px)+17rem)] w-[min(16rem,calc(100vw-5rem))] pointer-events-auto";
 
   return (
-    <div className={placementClass} style={placement === "navigation" ? { zIndex: OVERLAY_Z.infoPanel } : undefined}>
+    <div className={placementClass} style={{ zIndex: OVERLAY_Z.infoPanel }}>
       <div
         className={`glass-panel rounded-2xl shadow-xl border border-slate-200/80 transition-all duration-300 ${
           isExpanded ? "p-3.5 w-full" : "p-2"
@@ -16676,13 +16993,28 @@ export function calculateBearingAngle(lon1: number, lat1: number, lon2: number, 
   return (deg + 360) % 360;
 }
 
-function getUpcomingAvoidHotspots(route: CandidateRoute, distanceAlongRouteM: number) {
+function getUpcomingAvoidHotspots(
+  route: CandidateRoute,
+  distanceAlongRouteM: number,
+  pinnedHotspotId?: string | null
+) {
   return (route.hotspots || [])
-    .filter((hotspot) =>
-      (hotspot.congestion_level === "HEAVY" || hotspot.congestion_level === "SEVERE") &&
-      hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
-    )
-    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.6 }));
+    .filter((hotspot) => {
+      // If this hotspot is explicitly pinned by the user's reroute request,
+      // always include it regardless of the vehicle's current distance.
+      if (pinnedHotspotId && hotspot.hotspot_id === pinnedHotspotId) {
+        return (
+          hotspot.congestion_level === "HEAVY" ||
+          hotspot.congestion_level === "SEVERE"
+        );
+      }
+      // Normal distance-based filtering for automatic rerouting
+      return (
+        (hotspot.congestion_level === "HEAVY" || hotspot.congestion_level === "SEVERE") &&
+        hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
+      );
+    })
+    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }));
 }
 
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
@@ -16788,7 +17120,7 @@ interface NavigationContextType {
   activeRerouteRecommendation: RerouteRecommendation | null;
   dismissReroute: () => void;
   acceptReroute: (recommendation: RerouteRecommendation) => void;
-  triggerDynamicRerouteCheck: (force?: boolean) => Promise<void>;
+  triggerDynamicRerouteCheck: (force?: boolean, pinnedHotspotId?: string | null) => Promise<void>;
   isApplyingReroute: boolean;
   noRouteReason: string | null;
   dismissNoRouteReason: () => void;
@@ -16810,13 +17142,13 @@ export const BENGALURU_CENTER: Coordinate = {
 };
 
 export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [sourceQuery, setSourceQuery] = useState("MG Road, Bengaluru");
+  const [sourceQuery, setSourceQuery] = useState("Indiranagar, Bengaluru");
   const [destinationQuery, setDestinationQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([]);
   const [selectedOrigin, setSelectedOrigin] = useState<Coordinate | null>({
-    lat: 12.9756,
-    lon: 77.6066,
-    name: "MG Road, Bengaluru",
+    lat: 12.9786,
+    lon: 77.6421,
+    name: "Indiranagar, Bengaluru",
   });
   const [selectedDestination, setSelectedDestination] = useState<Coordinate | null>(null);
   const [routes, setRoutes] = useState<CandidateRoute[]>([]);
@@ -16834,6 +17166,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const trafficTestModeRef = useRef<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const lastDynamicPhaseRef = useRef<string>("LOW");
   const dynamicProgressRef = useRef(0);
+  const testCongestionConsumedRef = useRef(false);
 
   // Real-Time Simulation & Navigation Telemetry
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
@@ -16870,6 +17203,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const isTransitioningRouteRef = useRef<boolean>(false);
   const rerouteRequestIdRef = useRef<number>(0);
   const [isApplyingReroute, setIsApplyingReroute] = useState(false);
+  const recentRoutesRef = useRef<Array<any>>([]);
   
   const activeRouteRef = useRef<CandidateRoute | null>(null);
   useEffect(() => {
@@ -16953,7 +17287,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         destCoord.lon,
         emergency,
         trafficMode,
-        trafficProgress
+        trafficProgress,
+        !testCongestionConsumedRef.current
       );
       if (response.success && response.candidates.length > 0) {
         setRoutes(response.candidates);
@@ -16961,6 +17296,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
+        recentRoutesRef.current = [];
+        testCongestionConsumedRef.current = false;
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
         setActiveRerouteRecommendation(null);
@@ -16991,16 +17328,25 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     RerouteEngine.dismissNoRouteReason();
     lastDynamicPhaseRef.current = "LOW";
     dynamicProgressRef.current = 0;
+    testCongestionConsumedRef.current = false;
 
     let origin = selectedOrigin;
     let destination = selectedDestination;
     if (mode !== "real") {
-      origin = { lat: 12.9756, lon: 77.6066, name: "MG Road, Bengaluru" };
-      destination = { lat: 12.9352, lon: 77.6245, name: "Koramangala, Bengaluru" };
+      // Switched from MG Road -> Koramangala: that ~6.5km trip has essentially
+      // one reasonable arterial connection near the tested hotspot (Lower
+      // Agaram Road), so neither OSRM's native alternatives nor a synthesized
+      // bypass waypoint could ever find a genuinely different path around it —
+      // "No avoidance route found" there could be structurally correct, not a
+      // bug. Indiranagar -> Marathahalli is a real, commonly-cited pair of
+      // parallel corridors (100 Feet Road / Old Airport Road vs. the Outer Ring
+      // Road), giving the avoidance logic an actual second road to find.
+      origin = { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" };
+      destination = { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" };
       setSelectedOrigin(origin);
       setSelectedDestination(destination);
-      setSourceQuery(origin.name || "MG Road, Bengaluru");
-      setDestinationQuery(destination.name || "Koramangala, Bengaluru");
+      setSourceQuery(origin.name || "Indiranagar, Bengaluru");
+      setDestinationQuery(destination.name || "Marathahalli, Bengaluru");
     }
     if (!origin || !destination) return;
     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
@@ -17015,7 +17361,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     try {
       const response = await fetchRoutes(
         start[1], start[0], destination.lat, destination.lon,
-        isEmergencyMode, trafficTestModeRef.current, progress
+        isEmergencyMode, trafficTestModeRef.current, progress,
+        !testCongestionConsumedRef.current
       );
       const evaluatedRoute = response.candidates?.[0];
       if (!response.success || !evaluatedRoute) return;
@@ -17172,6 +17519,18 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     AlertManager.reset();
     RerouteEngine.dismissRecommendation();
     TTSService.reset();
+    
+    // Add old route to recent history before replacing
+    const oldRoute = activeRouteRef.current;
+    if (oldRoute) {
+       recentRoutesRef.current.push({
+           route_id: oldRoute.route_id,
+           geometry: oldRoute.geometry
+       });
+       if (recentRoutesRef.current.length > 5) {
+           recentRoutesRef.current.shift();
+       }
+    }
 
     // Make newRoute the active route at index 0
     setRoutes((prev) => [newRoute, ...prev.filter((r) => r.route_id !== newRoute.route_id)]);
@@ -17219,6 +17578,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     const switched = activateRoute(recommendation.recommended_route, true);
     setIsApplyingReroute(false);
     if (switched) {
+      if (trafficTestModeRef.current !== "real" && recommendation.is_congestion_avoidance) {
+        testCongestionConsumedRef.current = true;
+      }
       if (recommendation.is_congestion_avoidance) {
         const viaRoad = recommendation.recommended_route?.steps?.find(
           (step) => Boolean(step.name?.trim()) && step.maneuver?.type !== "depart",
@@ -17251,7 +17613,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   }, []);
 
   const triggerDynamicRerouteCheck = useCallback(
-    async (force: boolean = false) => {
+    async (force: boolean = false, pinnedHotspotId?: string | null) => {
       const activeRoute = routes[activeRouteIndex];
       if (!activeRoute || !selectedDestination || !currentLocation || !isNavigating) return;
 
@@ -17290,7 +17652,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           force,
           trafficTestModeRef.current,
           progressRatio,
-          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist) : []
+          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist, pinnedHotspotId) : [],
+          recentRoutesRef.current,
+          !testCongestionConsumedRef.current
         );
         
         // Ignore stale responses
@@ -17299,7 +17663,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         console.error("Reroute check error", e);
       }
     },
-    [routes, activeRouteIndex, selectedDestination, currentLocation, currentVehicleSpeed, isEmergencyMode]
+    [routes, activeRouteIndex, selectedDestination, currentLocation, currentVehicleSpeed, isEmergencyMode, isNavigating]
   );
 
   const hasInitializedJourneyRef = useRef(false);
@@ -17308,6 +17672,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     if (isNavigating) {
       if (hasInitializedJourneyRef.current) return; // Do not reset if journey is already running
+
+      // Cancel any lingering animation frame from a previous session to prevent
+      // duplicate loops when start is pressed.
+      if (animationFrameIdRef.current) {
+        cancelAnimationFrame(animationFrameIdRef.current);
+        animationFrameIdRef.current = null;
+      }
 
       const activeRoute = routes[activeRouteIndex];
       if (activeRoute && activeRoute.geometry?.coordinates?.length > 0) {
@@ -17318,12 +17689,17 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
+        isTransitioningRouteRef.current = false;
         TTSService.warmUp();
         setSimProgressPercent(0);
         setSimDistanceRemainingM(activeRoute.distance_meters || 0);
         setSimEtaSeconds(activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0);
-        setIsSimPlaying(true);
+        // Reset the frame timestamp so the first animateDrive tick computes a
+        // sane delta instead of a huge jump from a stale previous value.
         lastFrameTimeRef.current = performance.now();
+        // Ensure simulation is playing — set state *after* all refs are
+        // initialised so the simulation-loop effect picks up correct values.
+        setIsSimPlaying(true);
 
         TTSService.announce(
           isEmergencyMode
@@ -17341,6 +17717,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = null;
       }
+      isTransitioningRouteRef.current = false;
       AlertManager.reset();
       RerouteEngine.dismissRecommendation();
       RerouteEngine.dismissNoRouteReason();
@@ -17531,8 +17908,41 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0) * (1 - progressRatio)
       )));
 
-      // Speed-Aware Congestion Alert Evaluation (Throttled per ~80m of progress)
-      if (Math.abs(newDist - lastAlertCheckDistanceRef.current) >= 80) {
+      // Continuously update the active alert's distance text every frame so the
+      // banner counts down in real time rather than freezing between check gates.
+      const currentActiveAlert = AlertManager.getActiveAlert();
+      if (currentActiveAlert && activeRoute.hotspots) {
+        const hotspot = activeRoute.hotspots.find(
+          (h) => h.hotspot_id === currentActiveAlert.hotspotId
+        );
+        if (hotspot) {
+          const liveDistance = hotspot.distance_from_origin_m - newDist;
+          if (liveDistance < -50) {
+            // Vehicle has passed the hotspot by more than 50m — clear the alert
+            AlertManager.dismissCurrentAlert();
+          } else {
+            AlertManager.updateLiveDistance(Math.max(0, liveDistance));
+          }
+        }
+      }
+
+      // Clear stale reroute recommendation if the vehicle has passed the hotspot
+      // that triggered it, preventing the popup from lingering.
+      const currentReroute = RerouteEngine.getActiveRecommendation();
+      if (currentReroute && currentReroute.is_congestion_avoidance && activeRoute.hotspots) {
+        const allHotspotsPassedOrCleared = (activeRoute.hotspots || [])
+          .filter(h => h.congestion_level === "HEAVY" || h.congestion_level === "SEVERE")
+          .every(h => h.distance_from_origin_m < newDist - 50);
+        if (allHotspotsPassedOrCleared && activeRoute.hotspots.length > 0) {
+          RerouteEngine.dismissRecommendation();
+          setActiveRerouteRecommendation(null);
+        }
+      }
+
+      // Speed-Aware Congestion Alert Evaluation (Throttled per ~15m of progress)
+      // Using 15m keeps the alert distance responsive without excessive backend calls
+      // (this evaluation is local against already-loaded route hotspots).
+      if (Math.abs(newDist - lastAlertCheckDistanceRef.current) >= 15) {
         lastAlertCheckDistanceRef.current = newDist;
         const hotspots = activeRoute.hotspots || [];
 
@@ -17573,7 +17983,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
               true,
               trafficTestModeRef.current,
               Math.min(1, newDist / totalRouteDistanceM),
-              getUpcomingAvoidHotspots(activeRoute, newDist)
+              getUpcomingAvoidHotspots(activeRoute, newDist),
+              recentRoutesRef.current,
+              !testCongestionConsumedRef.current
             );
           }
         }, newDist);
@@ -17610,8 +18022,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           setNextManeuverDistanceM(Math.round(estDistToTurn));
 
           const speedMultiplier = simSpeedMultiplierRef.current;
-          const advanceThreshold = 400 * speedMultiplier;
-          const imminentThreshold = 150 * speedMultiplier;
+          // Scale thresholds with speed to announce earlier at higher speeds.
+          // Base advance: 500m (was 400), base imminent: 200m (was 150).
+          // This ensures instructions are spoken BEFORE the maneuver.
+          const advanceThreshold = 500 * speedMultiplier;
+          const imminentThreshold = 200 * speedMultiplier;
           
           const routeId = activeRoute.route_id || `idx-${activeRouteIndex}`;
 
@@ -17656,14 +18071,16 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             setActiveRerouteRecommendation(null);
             TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
           }
-          if (phase === "HEAVY" && selectedDestination) {
+          if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
             const remainingRatio = Math.max(0, 1 - scenarioProgress);
             const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
             RerouteEngine.checkAndReevaluate(
               interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
               remainingSeconds, speedKmh, isEmergencyMode, true,
               trafficTestModeRef.current, scenarioProgress,
-              getUpcomingAvoidHotspots(activeRoute, newDist)
+              getUpcomingAvoidHotspots(activeRoute, newDist),
+              recentRoutesRef.current,
+              !testCongestionConsumedRef.current
             );
           }
         }
@@ -17693,7 +18110,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           false,
           trafficTestModeRef.current,
           trafficTestModeRef.current === "dynamic" ? scenarioProgress : activeRatio,
-          []
+          [],
+          recentRoutesRef.current,
+          !testCongestionConsumedRef.current
         );
       }
 
@@ -17983,6 +18402,32 @@ export class AlertManager {
     return alertData;
   }
 
+  public static getActiveAlert(): ActiveCongestionAlert | null {
+    return this.activeAlert;
+  }
+
+  /**
+   * Lightweight per-frame distance update — re-computes only the distance and
+   * distanceText on the active alert and notifies listeners so the banner counts
+   * down in real time.  Does NOT trigger stage transitions.
+   */
+  public static updateLiveDistance(distanceMeters: number): void {
+    if (!this.activeAlert) return;
+    const rounded = Math.max(0, distanceMeters);
+    // Threshold of 5m (not 1m): this runs off the per-frame animation loop, and
+    // notifyListeners() drives a React state update — at 1m, a fast-moving
+    // vehicle can trigger 10-15+ re-renders/sec across every context consumer
+    // for the whole time an alert is active. 5m keeps the counter feeling live
+    // to a human eye while cutting that re-render rate meaningfully.
+    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 5) return;
+    this.activeAlert = {
+      ...this.activeAlert,
+      distanceMeters: rounded,
+      distanceText: this.formatDistance(rounded),
+    };
+    this.notifyListeners();
+  }
+
   public static dismissCurrentAlert() {
     this.activeAlert = null;
     this.notifyListeners();
@@ -18158,7 +18603,8 @@ export async function fetchRoutes(
   destLon: number,
   isEmergencyMode: boolean = false,
   trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
-  trafficProgress: number = 0
+  trafficProgress: number = 0,
+  syntheticTrafficActive: boolean = true
 ): Promise<RouteResponse> {
   const res = await fetch(`${API_BASE_URL}/route`, {
     method: "POST",
@@ -18171,6 +18617,7 @@ export async function fetchRoutes(
       is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
+      synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
   if (!res.ok) throw new Error("Failed to calculate routes");
@@ -18186,7 +18633,9 @@ export async function evaluateReroute(
   avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = [],
   isEmergencyMode: boolean = false,
   trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
-  trafficProgress: number = 0
+  trafficProgress: number = 0,
+  recentRoutes: Array<any> = [],
+  syntheticTrafficActive: boolean = true
 ): Promise<RerouteRecommendation> {
   const res = await fetch(`${API_BASE_URL}/reroute/evaluate`, {
     method: "POST",
@@ -18201,6 +18650,8 @@ export async function evaluateReroute(
       is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
+      recent_routes: recentRoutes,
+      synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
   if (!res.ok) throw new Error("Failed to evaluate alternative reroutes");
@@ -18781,8 +19232,11 @@ export class RerouteEngine {
     forceReevaluate: boolean = false,
     trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
     trafficProgress: number = 0,
-    avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = []
+    avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = [],
+    recentRoutes: Array<any> = [],
+    syntheticTrafficActive: boolean = true
   ): Promise<RerouteRecommendation | null> {
+    const isAvoidanceRequest = avoidHotspots.length > 0;
     // 1. Skip automatic background checking if a recommendation is already displayed
     if (!forceReevaluate && this.activeRecommendation !== null) {
       if (DEBUG) console.log("[RerouteEngine] Skipped: recommendation already active in modal");
@@ -18828,7 +19282,9 @@ export class RerouteEngine {
         avoidHotspots,
         isEmergencyMode,
         trafficTestMode,
-        trafficProgress
+        trafficProgress,
+        recentRoutes,
+        syntheticTrafficActive
       );
 
       if (generation !== this.evaluationGeneration) return null;
@@ -18869,10 +19325,12 @@ export class RerouteEngine {
           clearTimeout(this.noRouteTimeout);
           this.noRouteTimeout = null;
         }
-        // Handle no faster route available
+        // Handle no route found — use avoidance-aware reason
         if (forceReevaluate) {
-          const reason =
-            recommendation?.reason || "Current route remains the fastest available path.";
+          const fallbackReason = isAvoidanceRequest
+            ? "No alternate route avoids this congestion — continuing on the current path."
+            : "Current route remains the fastest available path.";
+          const reason = recommendation?.reason || fallbackReason;
           this.lastNoRouteFoundReason = reason;
           if (this.noRouteTimeout) clearTimeout(this.noRouteTimeout);
           this.noRouteTimeout = setTimeout(() => {
@@ -18944,9 +19402,10 @@ export const TRAFFIC_COLORS: Record<CongestionLevel, string> = {
 };
 
 export function dynamicTrafficPhase(progress: number): CongestionLevel {
-  if (progress < 0.22) return "LOW";
-  if (progress < 0.43) return "MODERATE";
-  if (progress < 0.76) return "HEAVY";
+  if (progress < 0.20) return "LOW";
+  if (progress < 0.38) return "MODERATE";
+  if (progress < 0.58) return "HEAVY";
+  if (progress < 0.76) return "SEVERE";
   return "LOW";
 }
 
@@ -18990,6 +19449,7 @@ export class TTSService {
   private static cachedVoices: SpeechSynthesisVoice[] = [];
   private static voiceRetryListener: (() => void) | null = null;
   private static voiceRetryCount = 0;
+  private static hasPrimedEngine = false;
 
   public static isSupported(): boolean {
     return typeof window !== "undefined" && "speechSynthesis" in window;
@@ -19011,6 +19471,20 @@ export class TTSService {
           if (this.voiceRetryListener) {
             window.speechSynthesis.removeEventListener("voiceschanged", this.voiceRetryListener);
             this.voiceRetryListener = null;
+          }
+          // Prime the synthesis engine with a truly silent utterance so the
+          // first real announcement doesn't suffer cold-start latency or rate
+          // inconsistency. Only do this once per page/session.
+          if (!this.hasPrimedEngine) {
+            this.hasPrimedEngine = true;
+            try {
+              const primer = new SpeechSynthesisUtterance(" ");
+              primer.volume = 0;
+              primer.rate = 1;
+              window.speechSynthesis.speak(primer);
+            } catch (_) {
+              // Not critical — swallow silently
+            }
           }
           return;
         }

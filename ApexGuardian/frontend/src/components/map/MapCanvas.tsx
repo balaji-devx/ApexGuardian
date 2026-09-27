@@ -4,7 +4,7 @@ import React, { useEffect, useRef } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { TRAFFIC_COLORS } from "@/lib/trafficScenario";
-import { useNavigation, BENGALURU_CENTER } from "@/context/NavigationContext";
+import { useNavigation, BENGALURU_CENTER, haversineMeters } from "@/context/NavigationContext";
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
@@ -474,6 +474,20 @@ export const MapCanvas: React.FC = () => {
               if (renderedHotspotIds.has(locId)) return;
               renderedHotspotIds.add(locId);
 
+              // Skip a pin that is essentially co-located with the vehicle.
+              // At this proximity the AdvanceAlertBanner already carries the
+              // warning, and drawing a second marker here just stacks a
+              // hazard pin directly on top of the vehicle marker — most
+              // visible right at trip start, or right after a reroute
+              // activates near a hotspot that sits close to the new route's
+              // beginning.
+              if (isSelected && isNavigating && currentLocation) {
+                const distToVehicleM = haversineMeters(
+                  currentLocation.lon, currentLocation.lat, hotspot.lon, hotspot.lat
+                );
+                if (distToVehicleM < 120) return;
+              }
+
               const el = document.createElement("div");
               const level = hotspot.congestion_level || "HEAVY";
               const isSevere = level === "SEVERE";
@@ -658,9 +672,8 @@ export const MapCanvas: React.FC = () => {
           source: rerouteSourceId,
           layout: { "line-join": "round", "line-cap": "round" },
           paint: {
-            "line-color": "#8B5CF6",
+            "line-color": "#EC4899",
             "line-width": 6,
-            "line-dasharray": [2, 2],
             "line-opacity": 0.9,
             "line-offset": 4,
           },
