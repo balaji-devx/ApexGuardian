@@ -156,7 +156,8 @@ export async function fetchRoutes(
   destLon: number,
   isEmergencyMode: boolean = false,
   trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
-  trafficProgress: number = 0
+  trafficProgress: number = 0,
+  syntheticTrafficActive: boolean = true
 ): Promise<RouteResponse> {
   const res = await fetch(`${API_BASE_URL}/route`, {
     method: "POST",
@@ -169,6 +170,7 @@ export async function fetchRoutes(
       is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
+      synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
   if (!res.ok) throw new Error("Failed to calculate routes");
@@ -184,7 +186,9 @@ export async function evaluateReroute(
   avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = [],
   isEmergencyMode: boolean = false,
   trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
-  trafficProgress: number = 0
+  trafficProgress: number = 0,
+  recentRoutes: Array<any> = [],
+  syntheticTrafficActive: boolean = true
 ): Promise<RerouteRecommendation> {
   const res = await fetch(`${API_BASE_URL}/reroute/evaluate`, {
     method: "POST",
@@ -199,6 +203,8 @@ export async function evaluateReroute(
       is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
+      recent_routes: recentRoutes,
+      synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
   if (!res.ok) throw new Error("Failed to evaluate alternative reroutes");

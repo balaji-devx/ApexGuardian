@@ -31,10 +31,10 @@ def dynamic_traffic_phase(progress: float) -> CongestionLevel:
 
 
 def apply_traffic_test_scenario(
-    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0
+    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0, synthetic_traffic_active: bool = True
 ) -> Dict[str, Any]:
     """Apply controlled debug traffic to analyzed road segments, never to route geometry."""
-    if mode == TrafficTestMode.REAL:
+    if mode == TrafficTestMode.REAL or not synthetic_traffic_active:
         return analysis
 
     phase = {
@@ -50,6 +50,7 @@ def apply_traffic_test_scenario(
     delay_total = 0.0
     distance_by_level = {level: 0.0 for level in CongestionLevel}
     hotspots = []
+    in_focus_segments = []
     focus_start = min(0.88, progress + 0.12) if mode == TrafficTestMode.DYNAMIC else 0.42
     focus_end = min(1.0, focus_start + 0.20) if mode == TrafficTestMode.DYNAMIC else 0.68
 
@@ -75,22 +76,45 @@ def apply_traffic_test_scenario(
         delay_total += delay
         distance_by_level[level] += distance
 
-        coordinates = segment.get("coordinates", [])
-        if in_focus and coordinates:
-            lon, lat = coordinates[len(coordinates) // 2]
-            hotspots.append({
-                "hotspot_id": f"test-{mode.value}-{segment['segment_index']}",
-                "location_name": segment.get("road_name") or "Traffic ahead",
-                "lat": lat,
-                "lon": lon,
-                "distance_from_origin_m": round(along + distance / 2.0, 1),
-                "congestion_level": level.value,
-                "average_speed_kmh": round(speed, 1),
-                "estimated_delay_seconds": round(delay, 1),
-                "description": "Traffic is moving more slowly on this road.",
-                "cause": "Controlled traffic test",
+        if in_focus:
+            in_focus_segments.append({
+                "segment": segment,
+                "distance": distance,
+                "delay": delay,
+                "along": along,
+                "speed": speed
             })
+            
         along += distance
+
+    if in_focus_segments:
+        # Create exactly one synthetic hotspot for the entire affected zone
+        total_focus_dist = sum(s["distance"] for s in in_focus_segments)
+        mid_focus_along = in_focus_segments[0]["along"] + (total_focus_dist / 2.0)
+        
+        # Find the segment closest to the center of the focus zone
+        center_seg = min(in_focus_segments, key=lambda s: abs(s["along"] + s["distance"]/2.0 - mid_focus_along))
+        segment = center_seg["segment"]
+        coordinates = segment.get("coordinates", [])
+        lon, lat = 0.0, 0.0
+        if coordinates:
+            lon, lat = coordinates[len(coordinates) // 2]
+            
+        avg_speed = sum(s["speed"] * s["distance"] for s in in_focus_segments) / max(1.0, total_focus_dist)
+        total_focus_delay = sum(s["delay"] for s in in_focus_segments)
+        
+        hotspots.append({
+            "hotspot_id": f"test-{mode.value}-primary",
+            "location_name": segment.get("road_name") or "Traffic ahead",
+            "lat": lat,
+            "lon": lon,
+            "distance_from_origin_m": round(mid_focus_along, 1),
+            "congestion_level": phase.value,
+            "average_speed_kmh": round(avg_speed, 1),
+            "estimated_delay_seconds": round(total_focus_delay, 1),
+            "description": "Traffic is moving more slowly on this road.",
+            "cause": "Controlled traffic test",
+        })
 
     analysis["hotspots"] = hotspots
     analysis["total_delay_seconds"] = round(delay_total, 1)

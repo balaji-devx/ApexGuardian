@@ -222,6 +222,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const trafficTestModeRef = useRef<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const lastDynamicPhaseRef = useRef<string>("LOW");
   const dynamicProgressRef = useRef(0);
+  const testCongestionConsumedRef = useRef(false);
 
   // Real-Time Simulation & Navigation Telemetry
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
@@ -258,6 +259,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const isTransitioningRouteRef = useRef<boolean>(false);
   const rerouteRequestIdRef = useRef<number>(0);
   const [isApplyingReroute, setIsApplyingReroute] = useState(false);
+  const recentRoutesRef = useRef<Array<any>>([]);
   
   const activeRouteRef = useRef<CandidateRoute | null>(null);
   useEffect(() => {
@@ -341,7 +343,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         destCoord.lon,
         emergency,
         trafficMode,
-        trafficProgress
+        trafficProgress,
+        !testCongestionConsumedRef.current
       );
       if (response.success && response.candidates.length > 0) {
         setRoutes(response.candidates);
@@ -349,6 +352,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
+        recentRoutesRef.current = [];
+        testCongestionConsumedRef.current = false;
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
         setActiveRerouteRecommendation(null);
@@ -379,6 +384,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     RerouteEngine.dismissNoRouteReason();
     lastDynamicPhaseRef.current = "LOW";
     dynamicProgressRef.current = 0;
+    testCongestionConsumedRef.current = false;
 
     let origin = selectedOrigin;
     let destination = selectedDestination;
@@ -411,7 +417,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     try {
       const response = await fetchRoutes(
         start[1], start[0], destination.lat, destination.lon,
-        isEmergencyMode, trafficTestModeRef.current, progress
+        isEmergencyMode, trafficTestModeRef.current, progress,
+        !testCongestionConsumedRef.current
       );
       const evaluatedRoute = response.candidates?.[0];
       if (!response.success || !evaluatedRoute) return;
@@ -568,6 +575,18 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     AlertManager.reset();
     RerouteEngine.dismissRecommendation();
     TTSService.reset();
+    
+    // Add old route to recent history before replacing
+    const oldRoute = activeRouteRef.current;
+    if (oldRoute) {
+       recentRoutesRef.current.push({
+           route_id: oldRoute.route_id,
+           geometry: oldRoute.geometry
+       });
+       if (recentRoutesRef.current.length > 5) {
+           recentRoutesRef.current.shift();
+       }
+    }
 
     // Make newRoute the active route at index 0
     setRoutes((prev) => [newRoute, ...prev.filter((r) => r.route_id !== newRoute.route_id)]);
@@ -615,6 +634,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     const switched = activateRoute(recommendation.recommended_route, true);
     setIsApplyingReroute(false);
     if (switched) {
+      if (trafficTestModeRef.current !== "real" && recommendation.is_congestion_avoidance) {
+        testCongestionConsumedRef.current = true;
+      }
       if (recommendation.is_congestion_avoidance) {
         const viaRoad = recommendation.recommended_route?.steps?.find(
           (step) => Boolean(step.name?.trim()) && step.maneuver?.type !== "depart",
@@ -686,7 +708,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           force,
           trafficTestModeRef.current,
           progressRatio,
-          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist, pinnedHotspotId) : []
+          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist, pinnedHotspotId) : [],
+          recentRoutesRef.current,
+          !testCongestionConsumedRef.current
         );
         
         // Ignore stale responses
@@ -1015,7 +1039,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
               true,
               trafficTestModeRef.current,
               Math.min(1, newDist / totalRouteDistanceM),
-              getUpcomingAvoidHotspots(activeRoute, newDist)
+              getUpcomingAvoidHotspots(activeRoute, newDist),
+              recentRoutesRef.current,
+              !testCongestionConsumedRef.current
             );
           }
         }, newDist);
@@ -1108,7 +1134,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
               interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
               remainingSeconds, speedKmh, isEmergencyMode, true,
               trafficTestModeRef.current, scenarioProgress,
-              getUpcomingAvoidHotspots(activeRoute, newDist)
+              getUpcomingAvoidHotspots(activeRoute, newDist),
+              recentRoutesRef.current,
+              !testCongestionConsumedRef.current
             );
           }
         }
@@ -1138,7 +1166,9 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           false,
           trafficTestModeRef.current,
           trafficTestModeRef.current === "dynamic" ? scenarioProgress : activeRatio,
-          []
+          [],
+          recentRoutesRef.current,
+          !testCongestionConsumedRef.current
         );
       }
 

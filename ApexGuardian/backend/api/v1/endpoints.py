@@ -143,7 +143,7 @@ async def calculate_route(request: RouteRequest):
             )
             if not request.is_emergency_mode:
                 analysis = apply_traffic_test_scenario(
-                    analysis, request.traffic_test_mode, request.traffic_progress
+                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
                 )
 
             candidate["segments"] = analysis["segments"]
@@ -193,6 +193,8 @@ async def evaluate_reroute(request: RerouteRequest):
         is_emergency_mode=request.is_emergency_mode,
         traffic_test_mode=request.traffic_test_mode,
         traffic_progress=request.traffic_progress,
+        recent_routes=request.recent_routes,
+        synthetic_traffic_active=request.synthetic_traffic_active,
     )
     return recommendation
 

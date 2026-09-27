@@ -110,7 +110,9 @@ export class RerouteEngine {
     forceReevaluate: boolean = false,
     trafficTestMode: TrafficTestMode = DEFAULT_TRAFFIC_MODE,
     trafficProgress: number = 0,
-    avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = []
+    avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = [],
+    recentRoutes: Array<any> = [],
+    syntheticTrafficActive: boolean = true
   ): Promise<RerouteRecommendation | null> {
     const isAvoidanceRequest = avoidHotspots.length > 0;
     // 1. Skip automatic background checking if a recommendation is already displayed
@@ -158,7 +160,9 @@ export class RerouteEngine {
         avoidHotspots,
         isEmergencyMode,
         trafficTestMode,
-        trafficProgress
+        trafficProgress,
+        recentRoutes,
+        syntheticTrafficActive
       );
 
       if (generation !== this.evaluationGeneration) return null;

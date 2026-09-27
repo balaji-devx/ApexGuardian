@@ -34,6 +34,7 @@ class RouteRequest(BaseModel):
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
+    synthetic_traffic_active: bool = True
 
 class CongestionSegment(BaseModel):
     """Sub-segment of a route with localized real-time and predicted congestion metrics."""
@@ -130,6 +131,8 @@ class RerouteRequest(BaseModel):
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
+    recent_routes: List[Dict[str, Any]] = Field(default_factory=list)
+    synthetic_traffic_active: bool = True
 
 class RerouteRecommendation(BaseModel):
     """Alternative route recommendation evaluated from the current location."""

@@ -152,6 +152,61 @@ def route_intersects_avoid_hotspots(
                 return True
     return False
 
+def _routes_have_same_geometry(candidate_coords: List[List[float]], active_coords: List[List[float]]) -> bool:
+    """Determine if a candidate route fundamentally shares the same corridor as an active/recent route."""
+    if not candidate_coords or len(candidate_coords) < 2 or not active_coords or len(active_coords) < 2:
+        return False
+
+    def segment_distance(lon: float, lat: float, segment_index: int) -> float:
+        x1, y1 = active_coords[segment_index][0], active_coords[segment_index][1]
+        x2, y2 = active_coords[segment_index + 1][0], active_coords[segment_index + 1][1]
+        mean_lat = math.radians((y1 + y2 + lat) / 3.0)
+        dx = (x2 - x1) * math.cos(mean_lat)
+        dy = y2 - y1
+        px = (lon - x1) * math.cos(mean_lat)
+        py = lat - y1
+        length_squared = dx * dx + dy * dy
+        t = 0.0 if length_squared == 0 else max(0.0, min(1.0, (px * dx + py * dy) / length_squared))
+        projected_lon = x1 + (x2 - x1) * t
+        projected_lat = y1 + (y2 - y1) * t
+        d_lat = (lat - projected_lat) * 111_132.0
+        d_lon = (lon - projected_lon) * 111_320.0 * math.cos(mean_lat)
+        return math.hypot(d_lat, d_lon)
+
+    candidate_start_lon, candidate_start_lat = candidate_coords[0][0], candidate_coords[0][1]
+    active_start_index = 0
+    start_distance = float('inf')
+    for i in range(len(active_coords) - 1):
+        distance = segment_distance(candidate_start_lon, candidate_start_lat, i)
+        if distance < start_distance:
+            start_distance = distance
+            active_start_index = i
+
+    if start_distance > 45.0:
+        return False
+
+    sample_count = min(16, len(candidate_coords))
+    search_from_index = active_start_index
+    for sample in range(sample_count):
+        index = round((sample * (len(candidate_coords) - 1)) / max(1, sample_count - 1))
+        lon, lat = candidate_coords[index][0], candidate_coords[index][1]
+        if not math.isfinite(lon) or not math.isfinite(lat):
+            return False
+        
+        closest_meters = float('inf')
+        closest_index = search_from_index
+        for i in range(search_from_index, len(active_coords) - 1):
+            distance = segment_distance(lon, lat, i)
+            if distance < closest_meters:
+                closest_meters = distance
+                closest_index = i
+                
+        if closest_meters > 45.0:
+            return False
+        search_from_index = closest_index
+        
+    return True
+
 
 class DynamicRerouteEngine:
     """Generate and evaluate street-snapped alternatives from the current position."""
@@ -167,6 +222,7 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool,
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
+        synthetic_traffic_active: bool,
     ) -> Optional[CandidateRoute]:
         route_dist_m = candidate.get("distance_meters", 0.0)
         base_dur_s = candidate.get("duration_seconds", 0.0)
@@ -257,7 +313,7 @@ class DynamicRerouteEngine:
             is_emergency_mode=is_emergency_mode,
         )
         if not is_emergency_mode:
-            analysis = apply_traffic_test_scenario(analysis, traffic_test_mode, traffic_progress)
+            analysis = apply_traffic_test_scenario(analysis, traffic_test_mode, traffic_progress, synthetic_traffic_active)
 
         candidate["segments"] = analysis["segments"]
         candidate["hotspots"] = analysis["hotspots"]
@@ -285,6 +341,7 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool,
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
+        synthetic_traffic_active: bool,
     ) -> List[CandidateRoute]:
         evaluated = RouteScorer.evaluate_routes(
             raw_candidates,
@@ -307,6 +364,7 @@ class DynamicRerouteEngine:
                     is_emergency_mode,
                     traffic_test_mode,
                     traffic_progress,
+                    synthetic_traffic_active,
                 )
             except Exception:
                 logger.exception("Rejecting reroute candidate after processing failure")
@@ -327,6 +385,8 @@ class DynamicRerouteEngine:
         is_emergency_mode: bool = False,
         traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL,
         traffic_progress: float = 0.0,
+        recent_routes: Optional[List[Dict[str, Any]]] = None,
+        synthetic_traffic_active: bool = True,
     ) -> RerouteRecommendation:
         """Evaluate alternatives, attempting a waypoint bypass around supplied avoid zones."""
         try:
@@ -361,6 +421,7 @@ class DynamicRerouteEngine:
                 is_emergency_mode,
                 traffic_test_mode,
                 traffic_progress,
+                synthetic_traffic_active,
             )
 
             clean_routes = [
@@ -440,6 +501,7 @@ class DynamicRerouteEngine:
                                 is_emergency_mode,
                                 traffic_test_mode,
                                 traffic_progress,
+                                synthetic_traffic_active,
                             )
                         except Exception as error:
                             logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
@@ -468,7 +530,43 @@ class DynamicRerouteEngine:
                     reason="No alternate route avoids this stretch — continuing on the only available path.",
                 )
 
-            candidates = clean_routes if zones else processed
+            # Filter out candidates that are too similar to recently rejected/used routes
+            # UNLESS they offer a truly massive improvement (e.g. they became totally clear)
+            recent_routes_list = recent_routes or []
+            filtered_candidates = []
+            
+            for candidate in (clean_routes if zones else processed):
+                is_similar = False
+                candidate_coords = candidate.geometry.get("coordinates", [])
+                
+                for recent in recent_routes_list:
+                    recent_coords = recent.get("geometry", {}).get("coordinates", [])
+                    if _routes_have_same_geometry(candidate_coords, recent_coords):
+                        is_similar = True
+                        break
+                        
+                # If a route was recently used but is now effectively clear (e.g. < 60s delay), allow returning to it
+                if not is_similar or candidate.total_delay_seconds < 60:
+                    filtered_candidates.append(candidate)
+                else:
+                    logger.info("[REROUTE REJECTED] Candidate route %s is too similar to a recent route in history.", candidate.route_id)
+            
+            # If all candidates were filtered out (they are all similar to history)
+            # do not fallback unless absolutely necessary. Instead, we can just say no reroute available.
+            candidates = filtered_candidates
+            if not candidates:
+                return RerouteRecommendation(
+                    is_reroute_recommended=False,
+                    is_congestion_avoidance=False,
+                    time_saved_seconds=0.0,
+                    time_saved_minutes=0.0,
+                    original_remaining_seconds=original_remaining_duration_s,
+                    recommended_duration_seconds=original_remaining_duration_s,
+                    recommended_route=None,
+                    alternative_routes=[],
+                    reason="No new alternate routes found that avoid recently congested corridors.",
+                )
+            
             candidates.sort(key=lambda route: route.predicted_duration_seconds)
 
             if not candidates:
