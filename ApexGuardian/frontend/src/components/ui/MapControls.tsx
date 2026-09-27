@@ -47,34 +47,25 @@ export const MapControls: React.FC = () => {
 
   return (
     <>
-      <div className="glass-panel fixed right-4 top-[calc(env(safe-area-inset-top,0px)+11rem)] w-44 rounded-xl p-2.5 pointer-events-auto" style={{ zIndex: OVERLAY_Z.mapControls }}>
-        <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
-          Traffic Test
-        </label>
-        <select
-          id="traffic-test-mode"
-          value={trafficTestMode}
-          onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
-          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
-          aria-label="Select real traffic data or a controlled traffic test"
-        >
-          <option value="real">Real Traffic Data</option>
-          <option value="normal">Normal Traffic</option>
-          <option value="moderate">Moderate Congestion</option>
-          <option value="heavy">Heavy Congestion</option>
-          <option value="severe">Severe Congestion</option>
-          <option value="dynamic">Dynamic Congestion</option>
-        </select>
-        {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled MG Road → Koramangala test</p>}
-      </div>
       {toastMessage && (
         <div className="fixed right-16 bottom-8 px-3.5 py-2 rounded-xl bg-slate-900/90 text-white text-xs font-semibold shadow-xl border border-slate-700/80 animate-fade-in backdrop-blur-md" style={{ zIndex: OVERLAY_Z.transientToast }}>
           {toastMessage}
         </div>
       )}
 
+      {/*
+        The Traffic Test panel and the zoom/recenter/layers/emergency stack used
+        to be two independently-positioned `fixed right-4` elements — one anchored
+        from the top (`top: 11rem`), one anchored from the bottom
+        (`bottom: navigationHudHeight + 12px`). On shorter viewports, or whenever
+        navigationHudHeight grew (the HUD's "extended" state), the bottom-anchored
+        stack could rise high enough to collide with the top-anchored panel, since
+        neither knew about the other. Folding both into one flex column that
+        shares a single bottom anchor makes that collision structurally
+        impossible — they now always move together with a fixed gap between them.
+      */}
       <div
-        className="fixed right-4 flex flex-col gap-2 transition-[bottom] duration-200"
+        className="fixed right-4 flex flex-col items-end gap-2 transition-[bottom] duration-200"
         style={{
           zIndex: OVERLAY_Z.mapControls,
           bottom: isNavigating
@@ -82,6 +73,27 @@ export const MapControls: React.FC = () => {
             : "calc(env(safe-area-inset-bottom, 0px) + 2rem)",
         }}
       >
+        <div className="glass-panel w-44 rounded-xl p-2.5 pointer-events-auto">
+          <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
+            Traffic Test
+          </label>
+          <select
+            id="traffic-test-mode"
+            value={trafficTestMode}
+            onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
+            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
+            aria-label="Select real traffic data or a controlled traffic test"
+          >
+            <option value="real">Real Traffic Data</option>
+            <option value="normal">Normal Traffic</option>
+            <option value="moderate">Moderate Congestion</option>
+            <option value="heavy">Heavy Congestion</option>
+            <option value="severe">Severe Congestion</option>
+            <option value="dynamic">Dynamic Congestion</option>
+          </select>
+          {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled Indiranagar → Marathahalli test</p>}
+        </div>
+
         <div className="glass-panel rounded-full p-1 flex flex-col gap-1 shadow-lg">
           <button
             onClick={handleZoomIn}

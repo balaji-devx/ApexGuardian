@@ -391,6 +391,8 @@ export const MapCanvas: React.FC = () => {
         return 0;
       });
 
+      const renderedHotspotIds = new Set<string>();
+
       sortedIndices.forEach((idx) => {
         const route = routes[idx];
         if (!route || !route.geometry) return;
@@ -432,7 +434,7 @@ export const MapCanvas: React.FC = () => {
               source: sourceId,
               layout: { "line-join": "round", "line-cap": "round" },
               paint: {
-                "line-color": isSelected ? "#2563EB" : "#1E293B",
+                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
               },
@@ -468,6 +470,10 @@ export const MapCanvas: React.FC = () => {
           // Section 3: Render Distinct Congestion Drop Pins Anchored Directly at Hotspot GPS Points
           if (route.hotspots && route.hotspots.length > 0) {
             route.hotspots.forEach((hotspot) => {
+              const locId = `${hotspot.lat.toFixed(3)}_${hotspot.lon.toFixed(3)}`;
+              if (renderedHotspotIds.has(locId)) return;
+              renderedHotspotIds.add(locId);
+
               const el = document.createElement("div");
               const level = hotspot.congestion_level || "HEAVY";
               const isSevere = level === "SEVERE";
@@ -599,7 +605,7 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-                "line-color": isSelected ? "#2563EB" : "#1E293B",
+                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
             },
@@ -652,10 +658,11 @@ export const MapCanvas: React.FC = () => {
           source: rerouteSourceId,
           layout: { "line-join": "round", "line-cap": "round" },
           paint: {
-            "line-color": "#10B981",
+            "line-color": "#8B5CF6",
             "line-width": 6,
             "line-dasharray": [2, 2],
             "line-opacity": 0.9,
+            "line-offset": 4,
           },
         });
         renderedLayersRef.current.push(rerouteLineId);

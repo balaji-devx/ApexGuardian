@@ -174,7 +174,12 @@ export class AlertManager {
   public static updateLiveDistance(distanceMeters: number): void {
     if (!this.activeAlert) return;
     const rounded = Math.max(0, distanceMeters);
-    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 1) return; // skip sub-meter jitter
+    // Threshold of 5m (not 1m): this runs off the per-frame animation loop, and
+    // notifyListeners() drives a React state update — at 1m, a fast-moving
+    // vehicle can trigger 10-15+ re-renders/sec across every context consumer
+    // for the whole time an alert is active. 5m keeps the counter feeling live
+    // to a human eye while cutting that re-render rate meaningfully.
+    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 5) return;
     this.activeAlert = {
       ...this.activeAlert,
       distanceMeters: rounded,

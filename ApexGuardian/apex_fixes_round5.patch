@@ -1,0 +1,296 @@
+diff --git a/ApexGuardian/backend/services/reroute_engine.py b/ApexGuardian/backend/services/reroute_engine.py
+index efc06f6..3ea667d 100644
+--- a/ApexGuardian/backend/services/reroute_engine.py
++++ b/ApexGuardian/backend/services/reroute_engine.py
+@@ -45,6 +45,45 @@ def compute_bypass_waypoint(
+     return math.degrees(lat2), (math.degrees(lon2) + 540.0) % 360.0 - 180.0
+ 
+ 
++def _local_route_bearing_near_point(
++    coordinates: Sequence[Sequence[float]], point_lat: float, point_lon: float
++) -> Optional[float]:
++    """Return the bearing of travel through the route coordinate nearest to the
++    given point, using its immediate neighbors.
++
++    This reflects the direction the road is actually running at that spot. Using
++    the straight-line bearing between two far-apart trip endpoints instead (as
++    this used to) can differ wildly on any route with real curvature, which
++    places the "perpendicular" bypass waypoint roughly *along* the road instead
++    of *across* it — producing a waypoint that OSRM either can't reach sensibly
++    or that routes right back through the same corridor, silently failing to
++    find a bypass that may genuinely exist nearby.
++    """
++    if not coordinates or len(coordinates) < 3:
++        return None
++    best_idx, best_dist = 0, float("inf")
++    for i, coord in enumerate(coordinates):
++        if len(coord) < 2:
++            continue
++        try:
++            lon, lat = float(coord[0]), float(coord[1])
++        except (TypeError, ValueError):
++            continue
++        dist = haversine_distance_m(lon, lat, point_lon, point_lat)
++        if dist < best_dist:
++            best_dist, best_idx = dist, i
++    prev_idx = max(0, best_idx - 1)
++    next_idx = min(len(coordinates) - 1, best_idx + 1)
++    if prev_idx == next_idx:
++        return None
++    try:
++        lon1, lat1 = float(coordinates[prev_idx][0]), float(coordinates[prev_idx][1])
++        lon2, lat2 = float(coordinates[next_idx][0]), float(coordinates[next_idx][1])
++    except (TypeError, ValueError, IndexError):
++        return None
++    return _bearing_degrees(lat1, lon1, lat2, lon2)
++
++
+ def _bearing_degrees(start_lat: float, start_lon: float, end_lat: float, end_lon: float) -> float:
+     lat1 = math.radians(start_lat)
+     lat2 = math.radians(end_lat)
+@@ -346,38 +385,73 @@ class DynamicRerouteEngine:
+                         key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
+                         + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
+                     )
+-                    approach_bearing = _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
+-                    left_waypoint = compute_bypass_waypoint(hotspot_lat, hotspot_lon, approach_bearing)
+-                    right_waypoint = compute_bypass_waypoint(hotspot_lat, hotspot_lon, approach_bearing + 180.0)
+-                    via_waypoint = min(
+-                        (left_waypoint, right_waypoint),
++                    # Use the bearing of the road itself at the hotspot (derived from
++                    # the nearest already-fetched route's own geometry), not the
++                    # crude straight-line bearing from wherever the vehicle currently
++                    # is all the way to the final destination — those two bearings
++                    # can differ by 90 degrees or more on any route with real turns,
++                    # which used to place the bypass waypoint along the congested
++                    # road instead of across it.
++                    local_bearing = None
++                    for candidate in processed:
++                        coords = (
++                            candidate.geometry.get("coordinates", [])
++                            if isinstance(candidate.geometry, dict)
++                            else []
++                        )
++                        local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
++                        if local_bearing is not None:
++                            break
++                    approach_bearing = (
++                        local_bearing
++                        if local_bearing is not None
++                        else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
++                    )
++                    # Try both sides of the road, at a couple of offsets, closest
++                    # candidate (by detour length) first — stop at the first one
++                    # that actually produces a route avoiding the zone. The old
++                    # code tried exactly one waypoint (whichever side was closer
++                    # to the direct line) and gave up entirely if OSRM couldn't
++                    # route through that single point or routed back through the
++                    # same corridor — in dense urban grids that single guess
++                    # missing is the common case, not the exception.
++                    candidate_waypoints = sorted(
++                        (
++                            compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
++                            for bearing in (approach_bearing, approach_bearing + 180.0)
++                            for offset in (0.6, 1.0, 1.5)
++                        ),
+                         key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
+                         + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
+                     )
+ 
+-                    try:
+-                        bypass_candidates = await OSRMService.get_routes_via_waypoints(
+-                            [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
+-                        )
+-                        bypass_routes = cls._score_and_process(
+-                            bypass_candidates,
+-                            current_lat,
+-                            current_lon,
+-                            dest_lat,
+-                            dest_lon,
+-                            direct_distance_m,
+-                            is_emergency_mode,
+-                            traffic_test_mode,
+-                            traffic_progress,
+-                        )
+-                    except Exception as error:
+-                        logger.warning("Waypoint bypass routing failed: %s", error)
+-
+-                    clean_bypass_routes = [
+-                        route for route in bypass_routes
+-                        if not route_intersects_avoid_hotspots(route.geometry, zones)
+-                    ]
+-                    clean_routes.extend(clean_bypass_routes)
++                    for via_waypoint in candidate_waypoints:
++                        try:
++                            bypass_candidates = await OSRMService.get_routes_via_waypoints(
++                                [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
++                            )
++                            bypass_routes = cls._score_and_process(
++                                bypass_candidates,
++                                current_lat,
++                                current_lon,
++                                dest_lat,
++                                dest_lon,
++                                direct_distance_m,
++                                is_emergency_mode,
++                                traffic_test_mode,
++                                traffic_progress,
++                            )
++                        except Exception as error:
++                            logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
++                            continue
++
++                        clean_bypass_routes = [
++                            route for route in bypass_routes
++                            if not route_intersects_avoid_hotspots(route.geometry, zones)
++                        ]
++                        if clean_bypass_routes:
++                            clean_routes.extend(clean_bypass_routes)
++                            break
+ 
+             # Avoidance is a route-intent request, not a faster-route request. Never
+             # recommend a dirty fallback when the user explicitly asked to avoid zones.
+diff --git a/ApexGuardian/frontend/src/components/ui/MapControls.tsx b/ApexGuardian/frontend/src/components/ui/MapControls.tsx
+index 3b7547f..3bbee3b 100644
+--- a/ApexGuardian/frontend/src/components/ui/MapControls.tsx
++++ b/ApexGuardian/frontend/src/components/ui/MapControls.tsx
+@@ -47,34 +47,25 @@ export const MapControls: React.FC = () => {
+ 
+   return (
+     <>
+-      <div className="glass-panel fixed right-4 top-[calc(env(safe-area-inset-top,0px)+11rem)] w-44 rounded-xl p-2.5 pointer-events-auto" style={{ zIndex: OVERLAY_Z.mapControls }}>
+-        <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
+-          Traffic Test
+-        </label>
+-        <select
+-          id="traffic-test-mode"
+-          value={trafficTestMode}
+-          onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
+-          className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
+-          aria-label="Select real traffic data or a controlled traffic test"
+-        >
+-          <option value="real">Real Traffic Data</option>
+-          <option value="normal">Normal Traffic</option>
+-          <option value="moderate">Moderate Congestion</option>
+-          <option value="heavy">Heavy Congestion</option>
+-          <option value="severe">Severe Congestion</option>
+-          <option value="dynamic">Dynamic Congestion</option>
+-        </select>
+-        {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled MG Road → Koramangala test</p>}
+-      </div>
+       {toastMessage && (
+         <div className="fixed right-16 bottom-8 px-3.5 py-2 rounded-xl bg-slate-900/90 text-white text-xs font-semibold shadow-xl border border-slate-700/80 animate-fade-in backdrop-blur-md" style={{ zIndex: OVERLAY_Z.transientToast }}>
+           {toastMessage}
+         </div>
+       )}
+ 
++      {/*
++        The Traffic Test panel and the zoom/recenter/layers/emergency stack used
++        to be two independently-positioned `fixed right-4` elements — one anchored
++        from the top (`top: 11rem`), one anchored from the bottom
++        (`bottom: navigationHudHeight + 12px`). On shorter viewports, or whenever
++        navigationHudHeight grew (the HUD's "extended" state), the bottom-anchored
++        stack could rise high enough to collide with the top-anchored panel, since
++        neither knew about the other. Folding both into one flex column that
++        shares a single bottom anchor makes that collision structurally
++        impossible — they now always move together with a fixed gap between them.
++      */}
+       <div
+-        className="fixed right-4 flex flex-col gap-2 transition-[bottom] duration-200"
++        className="fixed right-4 flex flex-col items-end gap-2 transition-[bottom] duration-200"
+         style={{
+           zIndex: OVERLAY_Z.mapControls,
+           bottom: isNavigating
+@@ -82,6 +73,27 @@ export const MapControls: React.FC = () => {
+             : "calc(env(safe-area-inset-bottom, 0px) + 2rem)",
+         }}
+       >
++        <div className="glass-panel w-44 rounded-xl p-2.5 pointer-events-auto">
++          <label htmlFor="traffic-test-mode" className="mb-1 block text-[10px] font-black uppercase tracking-wider text-slate-500">
++            Traffic Test
++          </label>
++          <select
++            id="traffic-test-mode"
++            value={trafficTestMode}
++            onChange={(event) => void runTrafficTest(event.target.value as TrafficTestMode)}
++            className="w-full rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-xs font-bold text-slate-800 outline-none focus:border-blue-500"
++            aria-label="Select real traffic data or a controlled traffic test"
++          >
++            <option value="real">Real Traffic Data</option>
++            <option value="normal">Normal Traffic</option>
++            <option value="moderate">Moderate Congestion</option>
++            <option value="heavy">Heavy Congestion</option>
++            <option value="severe">Severe Congestion</option>
++            <option value="dynamic">Dynamic Congestion</option>
++          </select>
++          {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled Indiranagar → Marathahalli test</p>}
++        </div>
++
+         <div className="glass-panel rounded-full p-1 flex flex-col gap-1 shadow-lg">
+           <button
+             onClick={handleZoomIn}
+diff --git a/ApexGuardian/frontend/src/context/NavigationContext.tsx b/ApexGuardian/frontend/src/context/NavigationContext.tsx
+index 3e70acd..86a8cef 100644
+--- a/ApexGuardian/frontend/src/context/NavigationContext.tsx
++++ b/ApexGuardian/frontend/src/context/NavigationContext.tsx
+@@ -198,13 +198,13 @@ export const BENGALURU_CENTER: Coordinate = {
+ };
+ 
+ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+-  const [sourceQuery, setSourceQuery] = useState("MG Road, Bengaluru");
++  const [sourceQuery, setSourceQuery] = useState("Indiranagar, Bengaluru");
+   const [destinationQuery, setDestinationQuery] = useState("");
+   const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([]);
+   const [selectedOrigin, setSelectedOrigin] = useState<Coordinate | null>({
+-    lat: 12.9756,
+-    lon: 77.6066,
+-    name: "MG Road, Bengaluru",
++    lat: 12.9786,
++    lon: 77.6421,
++    name: "Indiranagar, Bengaluru",
+   });
+   const [selectedDestination, setSelectedDestination] = useState<Coordinate | null>(null);
+   const [routes, setRoutes] = useState<CandidateRoute[]>([]);
+@@ -383,12 +383,20 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
+     let origin = selectedOrigin;
+     let destination = selectedDestination;
+     if (mode !== "real") {
+-      origin = { lat: 12.9756, lon: 77.6066, name: "MG Road, Bengaluru" };
+-      destination = { lat: 12.9352, lon: 77.6245, name: "Koramangala, Bengaluru" };
++      // Switched from MG Road -> Koramangala: that ~6.5km trip has essentially
++      // one reasonable arterial connection near the tested hotspot (Lower
++      // Agaram Road), so neither OSRM's native alternatives nor a synthesized
++      // bypass waypoint could ever find a genuinely different path around it —
++      // "No avoidance route found" there could be structurally correct, not a
++      // bug. Indiranagar -> Marathahalli is a real, commonly-cited pair of
++      // parallel corridors (100 Feet Road / Old Airport Road vs. the Outer Ring
++      // Road), giving the avoidance logic an actual second road to find.
++      origin = { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" };
++      destination = { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" };
+       setSelectedOrigin(origin);
+       setSelectedDestination(destination);
+-      setSourceQuery(origin.name || "MG Road, Bengaluru");
+-      setDestinationQuery(destination.name || "Koramangala, Bengaluru");
++      setSourceQuery(origin.name || "Indiranagar, Bengaluru");
++      setDestinationQuery(destination.name || "Marathahalli, Bengaluru");
+     }
+     if (!origin || !destination) return;
+     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
+diff --git a/ApexGuardian/frontend/src/lib/alertManager.ts b/ApexGuardian/frontend/src/lib/alertManager.ts
+index 4b477b5..94e1d46 100644
+--- a/ApexGuardian/frontend/src/lib/alertManager.ts
++++ b/ApexGuardian/frontend/src/lib/alertManager.ts
+@@ -174,7 +174,12 @@ export class AlertManager {
+   public static updateLiveDistance(distanceMeters: number): void {
+     if (!this.activeAlert) return;
+     const rounded = Math.max(0, distanceMeters);
+-    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 1) return; // skip sub-meter jitter
++    // Threshold of 5m (not 1m): this runs off the per-frame animation loop, and
++    // notifyListeners() drives a React state update — at 1m, a fast-moving
++    // vehicle can trigger 10-15+ re-renders/sec across every context consumer
++    // for the whole time an alert is active. 5m keeps the counter feeling live
++    // to a human eye while cutting that re-render rate meaningfully.
++    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 5) return;
+     this.activeAlert = {
+       ...this.activeAlert,
+       distanceMeters: rounded,

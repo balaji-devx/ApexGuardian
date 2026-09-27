@@ -70,7 +70,7 @@ function getUpcomingAvoidHotspots(
         hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
       );
     })
-    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.6 }));
+    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }));
 }
 
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
@@ -198,13 +198,13 @@ export const BENGALURU_CENTER: Coordinate = {
 };
 
 export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [sourceQuery, setSourceQuery] = useState("MG Road, Bengaluru");
+  const [sourceQuery, setSourceQuery] = useState("Indiranagar, Bengaluru");
   const [destinationQuery, setDestinationQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([]);
   const [selectedOrigin, setSelectedOrigin] = useState<Coordinate | null>({
-    lat: 12.9756,
-    lon: 77.6066,
-    name: "MG Road, Bengaluru",
+    lat: 12.9786,
+    lon: 77.6421,
+    name: "Indiranagar, Bengaluru",
   });
   const [selectedDestination, setSelectedDestination] = useState<Coordinate | null>(null);
   const [routes, setRoutes] = useState<CandidateRoute[]>([]);
@@ -383,12 +383,20 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     let origin = selectedOrigin;
     let destination = selectedDestination;
     if (mode !== "real") {
-      origin = { lat: 12.9756, lon: 77.6066, name: "MG Road, Bengaluru" };
-      destination = { lat: 12.9352, lon: 77.6245, name: "Koramangala, Bengaluru" };
+      // Switched from MG Road -> Koramangala: that ~6.5km trip has essentially
+      // one reasonable arterial connection near the tested hotspot (Lower
+      // Agaram Road), so neither OSRM's native alternatives nor a synthesized
+      // bypass waypoint could ever find a genuinely different path around it —
+      // "No avoidance route found" there could be structurally correct, not a
+      // bug. Indiranagar -> Marathahalli is a real, commonly-cited pair of
+      // parallel corridors (100 Feet Road / Old Airport Road vs. the Outer Ring
+      // Road), giving the avoidance logic an actual second road to find.
+      origin = { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" };
+      destination = { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" };
       setSelectedOrigin(origin);
       setSelectedDestination(destination);
-      setSourceQuery(origin.name || "MG Road, Bengaluru");
-      setDestinationQuery(destination.name || "Koramangala, Bengaluru");
+      setSourceQuery(origin.name || "Indiranagar, Bengaluru");
+      setDestinationQuery(destination.name || "Marathahalli, Bengaluru");
     }
     if (!origin || !destination) return;
     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
