@@ -409,10 +409,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     if (loaded) setIsNavigating(true);
   };
 
-  const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number) => {
+  const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number): Promise<CandidateRoute | null> => {
     const destination = selectedDestination;
     const start = route.geometry?.coordinates?.[0];
-    if (!destination || !start || trafficTestModeRef.current === "real") return;
+    if (!destination || !start || trafficTestModeRef.current === "real") return null;
 
     try {
       const response = await fetchRoutes(
@@ -421,26 +421,29 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         !testCongestionConsumedRef.current
       );
       const evaluatedRoute = response.candidates?.[0];
-      if (!response.success || !evaluatedRoute) return;
+      if (!response.success || !evaluatedRoute) return null;
+
+      const updatedRoute: CandidateRoute = {
+        ...route,
+        segments: evaluatedRoute.segments,
+        hotspots: evaluatedRoute.hotspots,
+        clear_distance_km: evaluatedRoute.clear_distance_km,
+        moderate_distance_km: evaluatedRoute.moderate_distance_km,
+        heavy_distance_km: evaluatedRoute.heavy_distance_km,
+        severe_distance_km: evaluatedRoute.severe_distance_km,
+        total_delay_seconds: evaluatedRoute.total_delay_seconds,
+        predicted_duration_seconds: evaluatedRoute.predicted_duration_seconds,
+        predicted_duration_minutes: evaluatedRoute.predicted_duration_minutes,
+      };
 
       setRoutes((currentRoutes) => currentRoutes.map((currentRoute) =>
-        currentRoute.route_id === route.route_id
-          ? {
-              ...currentRoute,
-              segments: evaluatedRoute.segments,
-              hotspots: evaluatedRoute.hotspots,
-              clear_distance_km: evaluatedRoute.clear_distance_km,
-              moderate_distance_km: evaluatedRoute.moderate_distance_km,
-              heavy_distance_km: evaluatedRoute.heavy_distance_km,
-              severe_distance_km: evaluatedRoute.severe_distance_km,
-              total_delay_seconds: evaluatedRoute.total_delay_seconds,
-              predicted_duration_seconds: evaluatedRoute.predicted_duration_seconds,
-              predicted_duration_minutes: evaluatedRoute.predicted_duration_minutes,
-            }
-          : currentRoute
+        currentRoute.route_id === route.route_id ? updatedRoute : currentRoute
       ));
+
+      return updatedRoute;
     } catch (error) {
       console.warn("[NavigationContext] Could not refresh test traffic conditions:", error);
+      return null;
     }
   }, [selectedDestination, isEmergencyMode]);
 
@@ -1128,24 +1131,30 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         const phase = dynamicTrafficPhase(scenarioProgress);
         if (phase !== lastDynamicPhaseRef.current) {
           lastDynamicPhaseRef.current = phase;
-          void refreshTrafficScenario(activeRoute, scenarioProgress);
           if (phase === "LOW") {
+            void refreshTrafficScenario(activeRoute, scenarioProgress);
             AlertManager.reset();
             RerouteEngine.dismissRecommendation();
             setActiveRerouteRecommendation(null);
             TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
-          }
-          if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
-            const remainingRatio = Math.max(0, 1 - scenarioProgress);
-            const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
-            RerouteEngine.checkAndReevaluate(
-              interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
-              remainingSeconds, speedKmh, isEmergencyMode, true,
-              trafficTestModeRef.current, scenarioProgress,
-              getUpcomingAvoidHotspots(activeRoute, newDist),
-              recentRoutesRef.current,
-              !testCongestionConsumedRef.current
-            );
+          } else if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
+            // Wait for the refreshed hotspots before deciding what to avoid — the
+            // just-appeared HEAVY/SEVERE zone must be in the list passed below,
+            // not whatever activeRoute.hotspots held before this refresh.
+            void (async () => {
+              const updatedRoute = await refreshTrafficScenario(activeRoute, scenarioProgress);
+              const routeForAvoidance = updatedRoute || activeRoute;
+              const remainingRatio = Math.max(0, 1 - scenarioProgress);
+              const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
+              RerouteEngine.checkAndReevaluate(
+                interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
+                remainingSeconds, speedKmh, isEmergencyMode, true,
+                trafficTestModeRef.current, scenarioProgress,
+                getUpcomingAvoidHotspots(routeForAvoidance, newDist),
+                recentRoutesRef.current,
+                !testCongestionConsumedRef.current
+              );
+            })();
           }
         }
       }
