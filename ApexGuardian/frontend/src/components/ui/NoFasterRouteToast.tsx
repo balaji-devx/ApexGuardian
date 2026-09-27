@@ -14,7 +14,7 @@ interface NoFasterRouteToastProps {
 export const NoFasterRouteToast: React.FC<NoFasterRouteToastProps> = ({ reason, onDismiss }) => {
   const { isNavigating, navigationHudHeight } = useNavigation();
   if (!reason) return null;
-  const isAvoidanceFailure = /no alternate route avoids/i.test(reason);
+  const isAvoidanceFailure = /no alternate route avoids|avoids this congestion/i.test(reason);
 
   return (
     <AnimatePresence>
@@ -23,7 +23,7 @@ export const NoFasterRouteToast: React.FC<NoFasterRouteToastProps> = ({ reason, 
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: 30, scale: 0.95 }}
         transition={{ type: "spring", stiffness: 400, damping: 30 }}
-        className="fixed left-3 right-auto w-[min(28rem,calc(100vw-5rem))] pointer-events-auto"
+        className="fixed left-3 right-auto w-[min(22rem,calc(100vw-2rem))] pointer-events-auto"
         style={{
           zIndex: OVERLAY_Z.noFasterRouteToast,
           bottom: isNavigating

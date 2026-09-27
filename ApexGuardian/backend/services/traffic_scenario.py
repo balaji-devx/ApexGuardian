@@ -19,12 +19,14 @@ SCENARIO_COLOR = {
 
 
 def dynamic_traffic_phase(progress: float) -> CongestionLevel:
-    if progress < 0.22:
+    if progress < 0.20:
         return CongestionLevel.LOW
-    if progress < 0.43:
+    if progress < 0.38:
         return CongestionLevel.MODERATE
-    if progress < 0.76:
+    if progress < 0.58:
         return CongestionLevel.HEAVY
+    if progress < 0.76:
+        return CongestionLevel.SEVERE
     return CongestionLevel.LOW
 
 

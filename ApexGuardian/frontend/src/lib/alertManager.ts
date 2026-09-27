@@ -162,6 +162,27 @@ export class AlertManager {
     return alertData;
   }
 
+  public static getActiveAlert(): ActiveCongestionAlert | null {
+    return this.activeAlert;
+  }
+
+  /**
+   * Lightweight per-frame distance update — re-computes only the distance and
+   * distanceText on the active alert and notifies listeners so the banner counts
+   * down in real time.  Does NOT trigger stage transitions.
+   */
+  public static updateLiveDistance(distanceMeters: number): void {
+    if (!this.activeAlert) return;
+    const rounded = Math.max(0, distanceMeters);
+    if (Math.abs(this.activeAlert.distanceMeters - rounded) < 1) return; // skip sub-meter jitter
+    this.activeAlert = {
+      ...this.activeAlert,
+      distanceMeters: rounded,
+      distanceText: this.formatDistance(rounded),
+    };
+    this.notifyListeners();
+  }
+
   public static dismissCurrentAlert() {
     this.activeAlert = null;
     this.notifyListeners();

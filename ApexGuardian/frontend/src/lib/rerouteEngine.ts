@@ -112,6 +112,7 @@ export class RerouteEngine {
     trafficProgress: number = 0,
     avoidHotspots: Array<{ lat: number; lon: number; radius_km?: number }> = []
   ): Promise<RerouteRecommendation | null> {
+    const isAvoidanceRequest = avoidHotspots.length > 0;
     // 1. Skip automatic background checking if a recommendation is already displayed
     if (!forceReevaluate && this.activeRecommendation !== null) {
       if (DEBUG) console.log("[RerouteEngine] Skipped: recommendation already active in modal");
@@ -198,10 +199,12 @@ export class RerouteEngine {
           clearTimeout(this.noRouteTimeout);
           this.noRouteTimeout = null;
         }
-        // Handle no faster route available
+        // Handle no route found — use avoidance-aware reason
         if (forceReevaluate) {
-          const reason =
-            recommendation?.reason || "Current route remains the fastest available path.";
+          const fallbackReason = isAvoidanceRequest
+            ? "No alternate route avoids this congestion — continuing on the current path."
+            : "Current route remains the fastest available path.";
+          const reason = recommendation?.reason || fallbackReason;
           this.lastNoRouteFoundReason = reason;
           if (this.noRouteTimeout) clearTimeout(this.noRouteTimeout);
           this.noRouteTimeout = setTimeout(() => {

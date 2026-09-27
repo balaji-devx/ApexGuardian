@@ -29,6 +29,7 @@ export class TTSService {
   private static cachedVoices: SpeechSynthesisVoice[] = [];
   private static voiceRetryListener: (() => void) | null = null;
   private static voiceRetryCount = 0;
+  private static hasPrimedEngine = false;
 
   public static isSupported(): boolean {
     return typeof window !== "undefined" && "speechSynthesis" in window;
@@ -50,6 +51,20 @@ export class TTSService {
           if (this.voiceRetryListener) {
             window.speechSynthesis.removeEventListener("voiceschanged", this.voiceRetryListener);
             this.voiceRetryListener = null;
+          }
+          // Prime the synthesis engine with a truly silent utterance so the
+          // first real announcement doesn't suffer cold-start latency or rate
+          // inconsistency. Only do this once per page/session.
+          if (!this.hasPrimedEngine) {
+            this.hasPrimedEngine = true;
+            try {
+              const primer = new SpeechSynthesisUtterance(" ");
+              primer.volume = 0;
+              primer.rate = 1;
+              window.speechSynthesis.speak(primer);
+            } catch (_) {
+              // Not critical — swallow silently
+            }
           }
           return;
         }

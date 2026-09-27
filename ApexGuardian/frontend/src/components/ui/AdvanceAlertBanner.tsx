@@ -50,7 +50,7 @@ export const AdvanceAlertBanner: React.FC<AdvanceAlertBannerProps> = ({
         animate={{ opacity: 1, y: 0, scale: 1 }}
         exit={{ opacity: 0, y: -40, scale: 0.95 }}
         transition={{ type: "spring", stiffness: 400, damping: 28 }}
-        className="fixed left-3 right-3 mx-auto w-auto max-w-sm sm:max-w-md pointer-events-auto"
+        className="fixed left-3 right-3 mx-auto w-auto max-w-xs sm:max-w-sm pointer-events-auto"
         style={{ zIndex: OVERLAY_Z.advanceAlertBanner, top: "calc(env(safe-area-inset-top, 0px) + 4.5rem)" }}
       >
         <div className={`glass-panel flex items-start gap-2 rounded-xl border-l-4 p-2.5 text-slate-800 ${severityStyle.border}`}>

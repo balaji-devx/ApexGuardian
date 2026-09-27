@@ -49,12 +49,27 @@ export function calculateBearingAngle(lon1: number, lat1: number, lon2: number, 
   return (deg + 360) % 360;
 }
 
-function getUpcomingAvoidHotspots(route: CandidateRoute, distanceAlongRouteM: number) {
+function getUpcomingAvoidHotspots(
+  route: CandidateRoute,
+  distanceAlongRouteM: number,
+  pinnedHotspotId?: string | null
+) {
   return (route.hotspots || [])
-    .filter((hotspot) =>
-      (hotspot.congestion_level === "HEAVY" || hotspot.congestion_level === "SEVERE") &&
-      hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
-    )
+    .filter((hotspot) => {
+      // If this hotspot is explicitly pinned by the user's reroute request,
+      // always include it regardless of the vehicle's current distance.
+      if (pinnedHotspotId && hotspot.hotspot_id === pinnedHotspotId) {
+        return (
+          hotspot.congestion_level === "HEAVY" ||
+          hotspot.congestion_level === "SEVERE"
+        );
+      }
+      // Normal distance-based filtering for automatic rerouting
+      return (
+        (hotspot.congestion_level === "HEAVY" || hotspot.congestion_level === "SEVERE") &&
+        hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
+      );
+    })
     .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.6 }));
 }
 
@@ -161,7 +176,7 @@ interface NavigationContextType {
   activeRerouteRecommendation: RerouteRecommendation | null;
   dismissReroute: () => void;
   acceptReroute: (recommendation: RerouteRecommendation) => void;
-  triggerDynamicRerouteCheck: (force?: boolean) => Promise<void>;
+  triggerDynamicRerouteCheck: (force?: boolean, pinnedHotspotId?: string | null) => Promise<void>;
   isApplyingReroute: boolean;
   noRouteReason: string | null;
   dismissNoRouteReason: () => void;
@@ -624,7 +639,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   }, []);
 
   const triggerDynamicRerouteCheck = useCallback(
-    async (force: boolean = false) => {
+    async (force: boolean = false, pinnedHotspotId?: string | null) => {
       const activeRoute = routes[activeRouteIndex];
       if (!activeRoute || !selectedDestination || !currentLocation || !isNavigating) return;
 
@@ -663,7 +678,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           force,
           trafficTestModeRef.current,
           progressRatio,
-          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist) : []
+          force ? getUpcomingAvoidHotspots(activeRoute, traversedDist, pinnedHotspotId) : []
         );
         
         // Ignore stale responses
@@ -672,7 +687,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         console.error("Reroute check error", e);
       }
     },
-    [routes, activeRouteIndex, selectedDestination, currentLocation, currentVehicleSpeed, isEmergencyMode]
+    [routes, activeRouteIndex, selectedDestination, currentLocation, currentVehicleSpeed, isEmergencyMode, isNavigating]
   );
 
   const hasInitializedJourneyRef = useRef(false);
@@ -681,6 +696,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     if (isNavigating) {
       if (hasInitializedJourneyRef.current) return; // Do not reset if journey is already running
+
+      // Cancel any lingering animation frame from a previous session to prevent
+      // duplicate loops when start is pressed.
+      if (animationFrameIdRef.current) {
+        cancelAnimationFrame(animationFrameIdRef.current);
+        animationFrameIdRef.current = null;
+      }
 
       const activeRoute = routes[activeRouteIndex];
       if (activeRoute && activeRoute.geometry?.coordinates?.length > 0) {
@@ -691,12 +713,17 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
+        isTransitioningRouteRef.current = false;
         TTSService.warmUp();
         setSimProgressPercent(0);
         setSimDistanceRemainingM(activeRoute.distance_meters || 0);
         setSimEtaSeconds(activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0);
-        setIsSimPlaying(true);
+        // Reset the frame timestamp so the first animateDrive tick computes a
+        // sane delta instead of a huge jump from a stale previous value.
         lastFrameTimeRef.current = performance.now();
+        // Ensure simulation is playing — set state *after* all refs are
+        // initialised so the simulation-loop effect picks up correct values.
+        setIsSimPlaying(true);
 
         TTSService.announce(
           isEmergencyMode
@@ -714,6 +741,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = null;
       }
+      isTransitioningRouteRef.current = false;
       AlertManager.reset();
       RerouteEngine.dismissRecommendation();
       RerouteEngine.dismissNoRouteReason();
@@ -904,8 +932,41 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0) * (1 - progressRatio)
       )));
 
-      // Speed-Aware Congestion Alert Evaluation (Throttled per ~80m of progress)
-      if (Math.abs(newDist - lastAlertCheckDistanceRef.current) >= 80) {
+      // Continuously update the active alert's distance text every frame so the
+      // banner counts down in real time rather than freezing between check gates.
+      const currentActiveAlert = AlertManager.getActiveAlert();
+      if (currentActiveAlert && activeRoute.hotspots) {
+        const hotspot = activeRoute.hotspots.find(
+          (h) => h.hotspot_id === currentActiveAlert.hotspotId
+        );
+        if (hotspot) {
+          const liveDistance = hotspot.distance_from_origin_m - newDist;
+          if (liveDistance < -50) {
+            // Vehicle has passed the hotspot by more than 50m — clear the alert
+            AlertManager.dismissCurrentAlert();
+          } else {
+            AlertManager.updateLiveDistance(Math.max(0, liveDistance));
+          }
+        }
+      }
+
+      // Clear stale reroute recommendation if the vehicle has passed the hotspot
+      // that triggered it, preventing the popup from lingering.
+      const currentReroute = RerouteEngine.getActiveRecommendation();
+      if (currentReroute && currentReroute.is_congestion_avoidance && activeRoute.hotspots) {
+        const allHotspotsPassedOrCleared = (activeRoute.hotspots || [])
+          .filter(h => h.congestion_level === "HEAVY" || h.congestion_level === "SEVERE")
+          .every(h => h.distance_from_origin_m < newDist - 50);
+        if (allHotspotsPassedOrCleared && activeRoute.hotspots.length > 0) {
+          RerouteEngine.dismissRecommendation();
+          setActiveRerouteRecommendation(null);
+        }
+      }
+
+      // Speed-Aware Congestion Alert Evaluation (Throttled per ~15m of progress)
+      // Using 15m keeps the alert distance responsive without excessive backend calls
+      // (this evaluation is local against already-loaded route hotspots).
+      if (Math.abs(newDist - lastAlertCheckDistanceRef.current) >= 15) {
         lastAlertCheckDistanceRef.current = newDist;
         const hotspots = activeRoute.hotspots || [];
 
@@ -983,8 +1044,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
           setNextManeuverDistanceM(Math.round(estDistToTurn));
 
           const speedMultiplier = simSpeedMultiplierRef.current;
-          const advanceThreshold = 400 * speedMultiplier;
-          const imminentThreshold = 150 * speedMultiplier;
+          // Scale thresholds with speed to announce earlier at higher speeds.
+          // Base advance: 500m (was 400), base imminent: 200m (was 150).
+          // This ensures instructions are spoken BEFORE the maneuver.
+          const advanceThreshold = 500 * speedMultiplier;
+          const imminentThreshold = 200 * speedMultiplier;
           
           const routeId = activeRoute.route_id || `idx-${activeRouteIndex}`;
 
@@ -1029,7 +1093,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             setActiveRerouteRecommendation(null);
             TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
           }
-          if (phase === "HEAVY" && selectedDestination) {
+          if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
             const remainingRatio = Math.max(0, 1 - scenarioProgress);
             const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
             RerouteEngine.checkAndReevaluate(

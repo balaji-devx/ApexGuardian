@@ -12,9 +12,10 @@ export const TRAFFIC_COLORS: Record<CongestionLevel, string> = {
 };
 
 export function dynamicTrafficPhase(progress: number): CongestionLevel {
-  if (progress < 0.22) return "LOW";
-  if (progress < 0.43) return "MODERATE";
-  if (progress < 0.76) return "HEAVY";
+  if (progress < 0.20) return "LOW";
+  if (progress < 0.38) return "MODERATE";
+  if (progress < 0.58) return "HEAVY";
+  if (progress < 0.76) return "SEVERE";
   return "LOW";
 }
 

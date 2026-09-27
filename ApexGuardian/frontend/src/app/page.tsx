@@ -40,7 +40,7 @@ export default function Home() {
       <AdvanceAlertBanner
         alert={activeAlert}
         onDismiss={dismissAlert}
-        onCheckReroute={() => triggerDynamicRerouteCheck(true)}
+        onCheckReroute={() => triggerDynamicRerouteCheck(true, activeAlert?.hotspotId ?? null)}
         fasterRouteAvailable={!!activeRerouteRecommendation?.is_reroute_recommended}
       />
 

@@ -39,7 +39,7 @@ export const RerouteModal: React.FC<RerouteModalProps> = ({
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.9, y: 30 }}
         transition={{ type: "spring", stiffness: 350, damping: 25 }}
-        className="fixed left-3 right-auto w-[min(28rem,calc(100vw-5rem))] pointer-events-auto"
+        className="fixed left-3 right-auto w-[min(22rem,calc(100vw-2rem))] pointer-events-auto"
         style={{
           zIndex: OVERLAY_Z.rerouteModal,
           bottom: isNavigating
@@ -47,7 +47,7 @@ export const RerouteModal: React.FC<RerouteModalProps> = ({
             : "calc(env(safe-area-inset-bottom, 0px) + 1.5rem)",
         }}
       >
-          <div className="glass-panel rounded-2xl border border-emerald-200/60 p-3 text-slate-900">
+          <div className="glass-panel rounded-2xl border border-emerald-200/60 p-2.5 sm:p-3 text-slate-900">
           <div className="flex items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">

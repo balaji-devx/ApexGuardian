@@ -11,11 +11,11 @@ interface TrafficLegendProps {
 export const TrafficLegend: React.FC<TrafficLegendProps> = ({ placement = "navigation" }) => {
   const [isExpanded, setIsExpanded] = useState(false);
   const placementClass = placement === "sidebar"
-    ? "relative z-0 w-fit max-w-full self-start pointer-events-auto"
+    ? "relative w-[min(16rem,calc(100vw-5rem))] self-start pointer-events-auto"
     : "fixed left-3 right-auto top-[calc(env(safe-area-inset-top,0px)+17rem)] w-[min(16rem,calc(100vw-5rem))] pointer-events-auto";
 
   return (
-    <div className={placementClass} style={placement === "navigation" ? { zIndex: OVERLAY_Z.infoPanel } : undefined}>
+    <div className={placementClass} style={{ zIndex: OVERLAY_Z.infoPanel }}>
       <div
         className={`glass-panel rounded-2xl shadow-xl border border-slate-200/80 transition-all duration-300 ${
           isExpanded ? "p-3.5 w-full" : "p-2"
