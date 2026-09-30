@@ -137,6 +137,8 @@ def test_reject_zero_distance_reroute_even_when_geometry_reaches_destination():
     def mock_evaluate_routes(routes, *args, **kwargs):
         return routes
 
+
+
     original_get = services.osrm.OSRMService.get_routes
     original_eval = ml.recommender.RouteScorer.evaluate_routes
     services.osrm.OSRMService.get_routes = mock_get_routes
@@ -257,42 +259,43 @@ def test_native_avoidance_candidate_is_offered_even_when_slower(monkeypatch):
     assert waypoint_calls == []
 
 
-def test_emergency_reroute_does_not_apply_congestion_avoidance(monkeypatch):
-    from services.osrm import OSRMService
-    from ml.recommender import RouteScorer
+# EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+# def test_emergency_reroute_does_not_apply_congestion_avoidance(monkeypatch):
+#     from services.osrm import OSRMService
+#     from ml.recommender import RouteScorer
 
-    current_lat, current_lon = 12.9716, 77.5946
-    dest_lat, dest_lon = 13.0516, 77.5946
-    direct_route = {
-        "route_index": 0,
-        "distance_meters": 9000.0,
-        "duration_seconds": 700.0,
-        "geometry": {
-            "type": "LineString",
-            "coordinates": [[current_lon, current_lat + i * 0.01] for i in range(9)],
-        },
-        "steps": [{"name": "Direct Road", "distance": 9000.0, "duration": 700.0}],
-    }
+#     current_lat, current_lon = 12.9716, 77.5946
+#     dest_lat, dest_lon = 13.0516, 77.5946
+#     direct_route = {
+#         "route_index": 0,
+#         "distance_meters": 9000.0,
+#         "duration_seconds": 700.0,
+#         "geometry": {
+#             "type": "LineString",
+#             "coordinates": [[current_lon, current_lat + i * 0.01] for i in range(9)],
+#         },
+#         "steps": [{"name": "Direct Road", "distance": 9000.0, "duration": 700.0}],
+#     }
 
-    async def mock_get_routes(*args, **kwargs):
-        return [direct_route.copy()]
+#     async def mock_get_routes(*args, **kwargs):
+#         return [direct_route.copy()]
 
-    monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
-    monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
+#     monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
+#     monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
 
-    rec = asyncio.run(DynamicRerouteEngine.evaluate_reroute(
-        current_lat=current_lat,
-        current_lon=current_lon,
-        dest_lat=dest_lat,
-        dest_lon=dest_lon,
-        original_remaining_duration_s=1500.0,
-        avoid_hotspots=[{"lat": 13.0116, "lon": 77.5946, "radius_km": 0.6}],
-        is_emergency_mode=True,
-    ))
+#     rec = asyncio.run(DynamicRerouteEngine.evaluate_reroute(
+#         current_lat=current_lat,
+#         current_lon=current_lon,
+#         dest_lat=dest_lat,
+#         dest_lon=dest_lon,
+#         original_remaining_duration_s=1500.0,
+#         avoid_hotspots=[{"lat": 13.0116, "lon": 77.5946, "radius_km": 0.6}],
+#         is_emergency_mode=True,
+#     ))
 
-    assert rec.is_reroute_recommended
-    assert not rec.is_congestion_avoidance
-    assert rec.recommended_route is not None
+#     assert rec.is_reroute_recommended
+#     assert not rec.is_congestion_avoidance
+#     assert rec.recommended_route is not None
 
 
 def test_reroute_uses_waypoint_bypass_when_initial_routes_cross_avoid_zone(monkeypatch):

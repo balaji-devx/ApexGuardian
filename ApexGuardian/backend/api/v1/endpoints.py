@@ -104,7 +104,7 @@ async def calculate_route(request: RouteRequest):
             request.origin_lon,
             request.dest_lat,
             request.dest_lon,
-            is_emergency_mode=request.is_emergency_mode
+            # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
         )
 
         # 3. Analyze each candidate for Segmented Congestion & Predictive Hotspots (Features 1 & 3)
@@ -139,12 +139,12 @@ async def calculate_route(request: RouteRequest):
                 steps=steps,
                 total_distance_m=route_dist_m,
                 base_duration_s=base_dur_s,
-                is_emergency_mode=request.is_emergency_mode
+                # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
             )
-            if not request.is_emergency_mode:
-                analysis = apply_traffic_test_scenario(
-                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
-                )
+            # EMERGENCY FEATURE DISABLED: was `if not request.is_emergency_mode:`
+            analysis = apply_traffic_test_scenario(
+                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
+            )
 
             candidate["segments"] = analysis["segments"]
             candidate["hotspots"] = analysis["hotspots"]
@@ -190,7 +190,7 @@ async def evaluate_reroute(request: RerouteRequest):
         dest_lon=request.dest_lon,
         original_remaining_duration_s=request.original_remaining_duration_seconds,
         avoid_hotspots=request.avoid_hotspots,
-        is_emergency_mode=request.is_emergency_mode,
+        # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode,
         traffic_test_mode=request.traffic_test_mode,
         traffic_progress=request.traffic_progress,
         recent_routes=request.recent_routes,

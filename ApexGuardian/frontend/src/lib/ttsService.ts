@@ -284,10 +284,12 @@ export class TTSService {
     let message = `Traffic alert: ${severityText} ahead in ${distanceText} near ${locationName}.`;
     if (speedKmh > 0) message += ` Flow speed is ${Math.round(speedKmh)} kilometers per hour.`;
     if (delayMinutes && delayMinutes >= 2) message += ` Expected delay is ${Math.round(delayMinutes)} minutes.`;
-    if (suggestRerouteOption && (severity === "HEAVY" || severity === "SEVERE")) {
-      message += " A route around this congestion may be available.";
-    }
-    this.announce(message, "normal", `congestion_${severity}_${locationName}`, 20_000);
+    // PATCH: the old suffix ("a route around this may be available") was followed a moment later by
+    // the real reroute announcement, which sounded like the same alert twice. The reroute engine
+    // announces the outcome itself, so the suffix is dropped (param kept for API compatibility).
+    void suggestRerouteOption;
+    // PATCH: key is per location only (not per severity/stage) so escalations cannot re-trigger it.
+    this.announce(message, "normal", `congestion_${locationName}`, 120_000);
   }
 
   public static speakRerouteSuggestion(

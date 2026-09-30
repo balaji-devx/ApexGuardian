@@ -75,21 +75,22 @@ class RouteScorer:
             osrm_dur_min = dur_sec / 60.0 if dur_sec > 0 else 1.0
             
             # Congestion Factor prediction
-            if is_emergency_mode:
-                cf = 1.0
-            else:
-                cf = congestion_predictor.predict_congestion_factor(
-                    osrm_dist=dist_km,
-                    osrm_dur_min=osrm_dur_min,
-                    steps_count=num_steps,
-                    turns=turns,
-                    roundabouts=roundabouts,
-                    avg_step_len=avg_step_len,
-                    hour=hour,
-                    day_of_week=day_of_week,
-                    is_weekend=is_weekend,
-                    month=month
-                )
+            # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+            # if is_emergency_mode:
+            #     cf = 1.0
+            # else:
+            cf = congestion_predictor.predict_congestion_factor(
+                osrm_dist=dist_km,
+                osrm_dur_min=osrm_dur_min,
+                steps_count=num_steps,
+                turns=turns,
+                roundabouts=roundabouts,
+                avg_step_len=avg_step_len,
+                hour=hour,
+                day_of_week=day_of_week,
+                is_weekend=is_weekend,
+                month=month
+            )
             
             predicted_dur_sec = dur_sec * cf
             predicted_dur_min = predicted_dur_sec / 60.0

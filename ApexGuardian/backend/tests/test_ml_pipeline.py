@@ -5,23 +5,27 @@ from services.route_selection import rank_processed_routes
 from services.traffic_scenario import apply_traffic_test_scenario
 from schemas.navigation import TrafficTestMode
 
-def test_emergency_mode_bypass():
-    mock_routes = [{
-        "distance_meters": 10000.0,
-        "duration_seconds": 1200.0,
-        "steps": []
-    }]
+# EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+# def test_emergency_mode_bypass():
+#     mock_routes = [{
+#         "distance_meters": 10000.0,
+#         "duration_seconds": 1200.0,
+#         "steps": []
+#     }]
     
-    # Run in emergency mode
-    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51, is_emergency_mode=True)
+#     # Run in emergency mode
+#     evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51)
     
-    assert len(evaluated) == 1
-    # Congestion factor must be exactly 1.0
-    assert evaluated[0]["congestion_factor"] == 1.0
-    # Predicted duration should match standard duration
-    assert evaluated[0]["predicted_duration_seconds"] == 1200.0
+#     assert len(evaluated) == 1
+#     # Congestion factor must be exactly 1.0
+#     assert evaluated[0]["congestion_factor"] == 1.0
+#     # Predicted duration should match standard duration
+#     assert evaluated[0]["predicted_duration_seconds"] == 1200.0
 
-def test_computed_fields():
+
+def test_computed_fields(monkeypatch):
+    # Emergency mode used to pin the congestion factor to 1.0 for this test; pin it directly instead.
+    monkeypatch.setattr("ml.recommender.congestion_predictor.predict_congestion_factor", lambda **kwargs: 1.0)
     mock_routes = [
         {
             "distance_meters": 10000.0, # 10km
@@ -35,7 +39,7 @@ def test_computed_fields():
         }
     ]
     
-    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51, is_emergency_mode=True)
+    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51)
     
     assert len(evaluated) == 2
     

@@ -13,7 +13,7 @@ import { TTSService, SpeechPriority } from "@/lib/ttsService";
 import { PushNotificationService } from "@/lib/pushNotificationService";
 import { RerouteEngine, routesHaveSameGeometry } from "@/lib/rerouteEngine";
 import { getManeuverInstruction, getManeuverAnnouncement } from "@/lib/maneuverInstructions";
-import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode } from "@/lib/trafficScenario";
+import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode, TRAFFIC_TEST_SCENARIOS } from "@/lib/trafficScenario";
 
 export interface Coordinate {
   lat: number;
@@ -70,7 +70,16 @@ function getUpcomingAvoidHotspots(
         hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
       );
     })
-    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }));
+    .flatMap((hotspot) => {
+      // PATCH: when the hotspot carries the exact congested stretch, avoid THAT stretch
+      // (small circles along it) instead of one 150 m circle at its first point. Otherwise
+      // routes that drove straight through the jam were treated as "clean".
+      const path = hotspot.zone_path;
+      if (path && path.length > 0) {
+        return path.map(([lon, lat]) => ({ lat, lon, radius_km: 0.06 }));
+      }
+      return [{ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }];
+    });
 }
 
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
@@ -217,11 +226,16 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
   const [currentZoom, setCurrentZoom] = useState(12.5);
   const [pinDropMode, setPinDropMode] = useState<PinDropMode>("none");
-  const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+  // EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+  // const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+  // Hard-wired off so every downstream emergency branch (styles, API flag, voice line) stays inert.
+  const isEmergencyMode = false;
+  const setIsEmergencyMode: React.Dispatch<React.SetStateAction<boolean>> = () => {};
   const [trafficTestMode, setTrafficTestMode] = useState<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const trafficTestModeRef = useRef<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const lastDynamicPhaseRef = useRef<string>("LOW");
   const dynamicProgressRef = useRef(0);
+  const dynamicClearingRef = useRef(false); // PATCH: guards the one-shot "zone passed" clear
   const testCongestionConsumedRef = useRef(false);
 
   // Real-Time Simulation & Navigation Telemetry
@@ -354,6 +368,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         lastAutoRerouteCheckTimeRef.current = 0;
         recentRoutesRef.current = [];
         testCongestionConsumedRef.current = false;
+        dynamicClearingRef.current = false;
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
         setActiveRerouteRecommendation(null);
@@ -384,25 +399,20 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     RerouteEngine.dismissNoRouteReason();
     lastDynamicPhaseRef.current = "LOW";
     dynamicProgressRef.current = 0;
+    dynamicClearingRef.current = false;
     testCongestionConsumedRef.current = false;
 
     let origin = selectedOrigin;
     let destination = selectedDestination;
     if (mode !== "real") {
-      // Switched from MG Road -> Koramangala: that ~6.5km trip has essentially
-      // one reasonable arterial connection near the tested hotspot (Lower
-      // Agaram Road), so neither OSRM's native alternatives nor a synthesized
-      // bypass waypoint could ever find a genuinely different path around it —
-      // "No avoidance route found" there could be structurally correct, not a
-      // bug. Indiranagar -> Marathahalli is a real, commonly-cited pair of
-      // parallel corridors (100 Feet Road / Old Airport Road vs. the Outer Ring
-      // Road), giving the avoidance logic an actual second road to find.
-      origin = { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" };
-      destination = { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" };
+      const scenario = TRAFFIC_TEST_SCENARIOS[mode];
+      if (!scenario) return;
+      origin = scenario.origin;
+      destination = scenario.destination;
       setSelectedOrigin(origin);
       setSelectedDestination(destination);
-      setSourceQuery(origin.name || "Indiranagar, Bengaluru");
-      setDestinationQuery(destination.name || "Marathahalli, Bengaluru");
+      setSourceQuery(origin.name);
+      setDestinationQuery(destination.name);
     }
     if (!origin || !destination) return;
     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
@@ -412,7 +422,14 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number): Promise<CandidateRoute | null> => {
     const destination = selectedDestination;
     const start = route.geometry?.coordinates?.[0];
-    if (!destination || !start || trafficTestModeRef.current === "real") return null;
+    if (
+      !destination ||
+      !start ||
+      trafficTestModeRef.current === "real" ||
+      testCongestionConsumedRef.current
+    ) {
+      return null;
+    }
 
     try {
       const response = await fetchRoutes(
@@ -420,8 +437,23 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isEmergencyMode, trafficTestModeRef.current, progress,
         !testCongestionConsumedRef.current
       );
-      const evaluatedRoute = response.candidates?.[0];
-      if (!response.success || !evaluatedRoute) return null;
+      // PATCH: candidates come back re-ranked by ETA, so [0] can be a DIFFERENT road than `route`.
+      // Copying its segments onto this geometry is what made red stretches jump or vanish.
+      // Pick the candidate that is actually this route (same length, same start/end corridor).
+      const evaluatedRoute = (response.candidates || [])
+        .map((candidate) => ({
+          candidate,
+          diff: Math.abs((candidate.distance_meters || 0) - (route.distance_meters || 0)),
+        }))
+        .sort((a, b) => a.diff - b.diff)[0]?.candidate;
+      if (
+        !response.success ||
+        !evaluatedRoute ||
+        Math.abs((evaluatedRoute.distance_meters || 0) - (route.distance_meters || 0)) >
+          Math.max(150, 0.02 * (route.distance_meters || 0))
+      ) {
+        return null;
+      }
 
       const updatedRoute: CandidateRoute = {
         ...route,
@@ -447,13 +479,16 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   }, [selectedDestination, isEmergencyMode]);
 
-  const toggleEmergencyMode = () => {
-    const newEmergency = !isEmergencyMode;
-    setIsEmergencyMode(newEmergency);
-    if (selectedOrigin && selectedDestination) {
-      calculateRoutes(selectedOrigin, selectedDestination, newEmergency);
-    }
-  };
+  // EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+  // const toggleEmergencyMode = () => {
+  //   const newEmergency = !isEmergencyMode;
+  //   setIsEmergencyMode(newEmergency);
+  //   if (selectedOrigin && selectedDestination) {
+  //     calculateRoutes(selectedOrigin, selectedDestination, newEmergency);
+  //   }
+  // };
+  const toggleEmergencyMode = () => {};
+
 
   const swapSourceAndDestination = async () => {
     const oldOrigin = selectedOrigin;
@@ -682,6 +717,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const triggerDynamicRerouteCheck = useCallback(
     async (force: boolean = false, pinnedHotspotId?: string | null) => {
       const activeRoute = routes[activeRouteIndex];
+
+
       if (!activeRoute || !selectedDestination || !currentLocation || !isNavigating) return;
 
       const currentReqId = ++rerouteRequestIdRef.current;
@@ -916,10 +953,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // Determine current segment speed
       let speedKmh = 40.0;
       if (activeRoute.segments && activeRoute.segments.length > 0) {
-        const segIdx = Math.min(
-          activeRoute.segments.length - 1,
-          Math.floor(progressRatio * activeRoute.segments.length)
-        );
+        // PATCH: locate the segment by DISTANCE travelled. The old uniform index
+        // (progress * segmentCount) drifted away from the real segment as soon as segments had
+        // unequal lengths (e.g. when a congestion zone is cut out of a longer chunk).
+        let acc = 0;
+        let segIdx = activeRoute.segments.length - 1;
+        for (let i = 0; i < activeRoute.segments.length; i++) {
+          acc += activeRoute.segments[i].distance_meters || 0;
+          if (currentDist <= acc) { segIdx = i; break; }
+        }
         const seg = activeRoute.segments[segIdx];
         if (seg && seg.current_speed_kmh) {
           speedKmh = seg.current_speed_kmh;
@@ -1014,22 +1056,26 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         const hotspots = activeRoute.hotspots || [];
 
         AlertManager.evaluatePosition(interpLat, interpLon, hotspots, speedKmh, (alert) => {
-          TTSService.speakCongestionAlert(
-            alert.locationName,
-            alert.distanceText,
-            alert.averageSpeedKmh,
-            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
-            true,
-            alert.congestionLevel
-          );
+          // PATCH: speak / push ONCE per hotspot. Stage 2 / stage 3 (500 m / 200 m) and severity
+          // escalations only refresh the banner; they used to re-announce the same jam 2-3 times.
+          if (alert.firstAnnouncement) {
+            TTSService.speakCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.averageSpeedKmh,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
+              true,
+              alert.congestionLevel
+            );
 
-          PushNotificationService.sendCongestionAlert(
-            alert.locationName,
-            alert.distanceText,
-            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
-            alert.averageSpeedKmh,
-            alert.congestionLevel
-          );
+            PushNotificationService.sendCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
+              alert.averageSpeedKmh,
+              alert.congestionLevel
+            );
+          }
 
           // Proactively check for reroute when a new congestion alert stage triggers
           // Only check if no recommendation is already pending
@@ -1126,36 +1172,51 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         }
       }
 
-      // Dynamic demo phases are tied to route progress, so the conditions change with the journey.
-      if (trafficTestModeRef.current === "dynamic") {
+      // Dynamic demo. PATCH: the congestion zone is anchored (it never moves); only its severity
+      // escalates while the vehicle approaches (moderate -> heavy -> severe), and it is cleared once
+      // the vehicle has driven past the end of the zone. The old code re-stamped a new window
+      // ahead of the vehicle on every phase change, so red stretches jumped ahead or vanished
+      // while the car was still inside them, and "moderate" was never refreshed at all.
+      if (trafficTestModeRef.current === "dynamic" && !testCongestionConsumedRef.current) {
         const phase = dynamicTrafficPhase(scenarioProgress);
         if (phase !== lastDynamicPhaseRef.current) {
           lastDynamicPhaseRef.current = phase;
           if (phase === "LOW") {
+            // nothing to do: the route was loaded clear
+          } else if (!selectedDestination) {
             void refreshTrafficScenario(activeRoute, scenarioProgress);
-            AlertManager.reset();
-            RerouteEngine.dismissRecommendation();
-            setActiveRerouteRecommendation(null);
-            TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
-          } else if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
-            // Wait for the refreshed hotspots before deciding what to avoid — the
-            // just-appeared HEAVY/SEVERE zone must be in the list passed below,
-            // not whatever activeRoute.hotspots held before this refresh.
+          } else {
+            // Wait for the refreshed hotspots before deciding what to avoid.
             void (async () => {
               const updatedRoute = await refreshTrafficScenario(activeRoute, scenarioProgress);
-              const routeForAvoidance = updatedRoute || activeRoute;
+              if (!updatedRoute || phase === "MODERATE") return;
               const remainingRatio = Math.max(0, 1 - scenarioProgress);
               const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
               RerouteEngine.checkAndReevaluate(
                 interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
-                remainingSeconds, speedKmh, isEmergencyMode, true,
+                remainingSeconds, speedKmh, false /* emergency disabled */, true,
                 trafficTestModeRef.current, scenarioProgress,
-                getUpcomingAvoidHotspots(routeForAvoidance, newDist),
+                getUpcomingAvoidHotspots(updatedRoute, newDist),
                 recentRoutesRef.current,
                 !testCongestionConsumedRef.current
               );
             })();
           }
+        }
+
+        // Clear the scenario after the vehicle has passed the end of the congested stretch.
+        const zoneHotspot = (activeRoute.hotspots || []).find(
+          (h) => h.cause === "Controlled traffic test" && typeof h.zone_end_distance_m === "number"
+        );
+        if (zoneHotspot && !dynamicClearingRef.current && newDist > (zoneHotspot.zone_end_distance_m as number) + 30) {
+          dynamicClearingRef.current = true;
+          void refreshTrafficScenario(activeRoute, 1.0).then(() => {
+            testCongestionConsumedRef.current = true; // no further synthetic traffic this trip
+          });
+          AlertManager.reset();
+          RerouteEngine.dismissRecommendation();
+          setActiveRerouteRecommendation(null);
+          TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
         }
       }
 

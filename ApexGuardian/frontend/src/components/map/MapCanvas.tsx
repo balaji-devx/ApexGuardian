@@ -8,6 +8,12 @@ import { useNavigation, BENGALURU_CENTER, haversineMeters } from "@/context/Navi
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
+// Route identity colours (used only where traffic is clear; congestion keeps its own colours).
+const AI_ROUTE_GREEN = "#16A34A";      // AI recommended route
+const AI_ROUTE_GREEN_DARK = "#15803D";
+const OSRM_ROUTE_BLUE = "#2563EB";     // OSRM preferred / second-best route
+const OSRM_ROUTE_BLUE_DARK = "#1D4ED8";
+
 export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
 
 export const BENGALURU_MAX_BOUNDS: maplibregl.LngLatBoundsLike = [
@@ -41,6 +47,7 @@ export const MapCanvas: React.FC = () => {
     calculateRoutes,
     activeLayerMode,
     isEmergencyMode,
+    trafficTestMode,
     isNavigating,
     currentLocation,
     vehicleBearing,
@@ -399,6 +406,10 @@ export const MapCanvas: React.FC = () => {
 
         const isSelected = idx === activeRouteIndex;
         const isAI = Boolean(route.is_ai_recommended);
+        // PATCH: identity colour. AI recommended = green, every other route (the OSRM preferred /
+        // second-best one) = blue. Clicking a route no longer changes its identity colour.
+        const clearColor = isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
+        const clearCasing = isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
 
         // Layer Mode Filtering
         if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;
@@ -411,8 +422,17 @@ export const MapCanvas: React.FC = () => {
             const casingLayerId = `seg-casing-${idx}-${sIdx}`;
             const lineLayerId = `seg-line-${idx}-${sIdx}`;
 
-            const trafficColor = TRAFFIC_COLORS[seg.congestion_level] || seg.color;
+            // PATCH: clear stretches take the route's identity colour (AI = green, OSRM = blue);
+            // congested stretches always keep their own yellow / orange / red. Unselected = grey.
+            const level = seg.congestion_level;
+            const isCongested = Boolean(level) && level !== "LOW";
+            const trafficColor = isCongested
+              ? (TRAFFIC_COLORS[level] || seg.color)
+              : clearColor;
             const segmentColor = isSelected ? trafficColor : "#94A3B8";
+            const segmentCasing = isSelected
+              ? (isCongested ? trafficColor : clearCasing)
+              : "#1E293B";
 
             map.addSource(sourceId, {
               type: "geojson",
@@ -434,7 +454,7 @@ export const MapCanvas: React.FC = () => {
               source: sourceId,
               layout: { "line-join": "round", "line-cap": "round" },
               paint: {
-                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
+                "line-color": segmentCasing,
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
               },
@@ -619,7 +639,7 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
+                "line-color": isSelected ? clearCasing : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
             },
@@ -632,7 +652,8 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-              "line-color": isSelected ? (isEmergencyMode ? "#EF4444" : "#3B82F6") : "#64748B",
+              // EMERGENCY FEATURE DISABLED: "line-color": isSelected ? (isEmergencyMode ? "#EF4444" : "#3B82F6") : "#64748B",
+              "line-color": isSelected ? clearColor : "#64748B",
               "line-width": isSelected ? 7 : 5,
               "line-opacity": isSelected ? 1.0 : 0.65,
             },
@@ -715,6 +736,7 @@ export const MapCanvas: React.FC = () => {
     setActiveRouteIndex,
     activeLayerMode,
     isEmergencyMode,
+    trafficTestMode,
     isNavigating,
     activeRerouteRecommendation,
   ]);

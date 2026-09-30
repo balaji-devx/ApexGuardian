@@ -1,6 +1,6 @@
-# Code dump: `E:\PROJECTS\ApexGuardian V2.0\ApexGuardian V2.0\ApexGuardian`
+# Code dump: `E:\PROJECTS\ApexGuardian V2.0\ApexGuardian`
 
-Total files: 61
+Total files: 62
 
 ## Table of contents
 
@@ -34,6 +34,7 @@ Total files: 61
 - `backend\tests\test_api.py`
 - `backend\tests\test_ml_pipeline.py`
 - `backend\tests\test_new_features.py`
+- `backend\tests\test_patch_regressions.py`
 - `backend\tests\test_reroute_validation.py`
 - `backend\tests\test_traffic_scenario.py`
 - `frontend\next-env.d.ts`
@@ -9229,7 +9230,7 @@ async def calculate_route(request: RouteRequest):
             request.origin_lon,
             request.dest_lat,
             request.dest_lon,
-            is_emergency_mode=request.is_emergency_mode
+            # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
         )
 
         # 3. Analyze each candidate for Segmented Congestion & Predictive Hotspots (Features 1 & 3)
@@ -9264,12 +9265,12 @@ async def calculate_route(request: RouteRequest):
                 steps=steps,
                 total_distance_m=route_dist_m,
                 base_duration_s=base_dur_s,
-                is_emergency_mode=request.is_emergency_mode
+                # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
             )
-            if not request.is_emergency_mode:
-                analysis = apply_traffic_test_scenario(
-                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
-                )
+            # EMERGENCY FEATURE DISABLED: was `if not request.is_emergency_mode:`
+            analysis = apply_traffic_test_scenario(
+                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
+            )
 
             candidate["segments"] = analysis["segments"]
             candidate["hotspots"] = analysis["hotspots"]
@@ -9315,7 +9316,7 @@ async def evaluate_reroute(request: RerouteRequest):
         dest_lon=request.dest_lon,
         original_remaining_duration_s=request.original_remaining_duration_seconds,
         avoid_hotspots=request.avoid_hotspots,
-        is_emergency_mode=request.is_emergency_mode,
+        # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode,
         traffic_test_mode=request.traffic_test_mode,
         traffic_progress=request.traffic_progress,
         recent_routes=request.recent_routes,
@@ -9748,21 +9749,22 @@ class RouteScorer:
             osrm_dur_min = dur_sec / 60.0 if dur_sec > 0 else 1.0
             
             # Congestion Factor prediction
-            if is_emergency_mode:
-                cf = 1.0
-            else:
-                cf = congestion_predictor.predict_congestion_factor(
-                    osrm_dist=dist_km,
-                    osrm_dur_min=osrm_dur_min,
-                    steps_count=num_steps,
-                    turns=turns,
-                    roundabouts=roundabouts,
-                    avg_step_len=avg_step_len,
-                    hour=hour,
-                    day_of_week=day_of_week,
-                    is_weekend=is_weekend,
-                    month=month
-                )
+            # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+            # if is_emergency_mode:
+            #     cf = 1.0
+            # else:
+            cf = congestion_predictor.predict_congestion_factor(
+                osrm_dist=dist_km,
+                osrm_dur_min=osrm_dur_min,
+                steps_count=num_steps,
+                turns=turns,
+                roundabouts=roundabouts,
+                avg_step_len=avg_step_len,
+                hour=hour,
+                day_of_week=day_of_week,
+                is_weekend=is_weekend,
+                month=month
+            )
             
             predicted_dur_sec = dur_sec * cf
             predicted_dur_min = predicted_dur_sec / 60.0
@@ -9991,7 +9993,8 @@ class RouteRequest(BaseModel):
     origin_lon: float
     dest_lat: float
     dest_lon: float
-    is_emergency_mode: bool = False
+    # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+    # is_emergency_mode: bool = False
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -10025,6 +10028,9 @@ class CongestionHotspot(BaseModel):
     estimated_delay_seconds: float = 0.0
     description: str = ""
     cause: str = "High Vehicle Volume / Choke Point"
+    # Optional extent of the congested stretch (populated by the traffic test scenarios).
+    zone_end_distance_m: Optional[float] = None
+    zone_path: Optional[List[List[float]]] = None  # [[lon, lat], ...] along the affected stretch
 
 class CandidateRoute(BaseModel):
     """Complete candidate route with ML scoring and segmented traffic breakdown."""
@@ -10088,7 +10094,8 @@ class RerouteRequest(BaseModel):
     original_route_index: int = 0
     original_remaining_duration_seconds: float = 0.0
     avoid_hotspots: List[Dict[str, float]] = Field(default_factory=list)
-    is_emergency_mode: bool = False
+    # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+    # is_emergency_mode: bool = False
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -10229,18 +10236,19 @@ class CongestionDetector:
                 prediction_offset_min=prediction_offset_min
             )
 
-            # In emergency mode, emergency vehicles experience lower baseline congestion
-            if is_emergency_mode:
-                traffic_factors["current_speed_kmh"] = min(
-                    traffic_factors["freeflow_speed_kmh"], 
-                    traffic_factors["current_speed_kmh"] * 1.5 + 10.0
-                )
-                if traffic_factors["congestion_level"] == CongestionLevel.SEVERE.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.HEAVY.value
-                elif traffic_factors["congestion_level"] == CongestionLevel.HEAVY.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.MODERATE.value
-                elif traffic_factors["congestion_level"] == CongestionLevel.MODERATE.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.LOW.value
+            # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+            #             # In emergency mode, emergency vehicles experience lower baseline congestion
+            #             if is_emergency_mode:
+            #                 traffic_factors["current_speed_kmh"] = min(
+            #                     traffic_factors["freeflow_speed_kmh"], 
+            #                     traffic_factors["current_speed_kmh"] * 1.5 + 10.0
+            #                 )
+            #                 if traffic_factors["congestion_level"] == CongestionLevel.SEVERE.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.HEAVY.value
+            #                 elif traffic_factors["congestion_level"] == CongestionLevel.HEAVY.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.MODERATE.value
+            #                 elif traffic_factors["congestion_level"] == CongestionLevel.MODERATE.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.LOW.value
 
             current_speed_kmh = max(5.0, traffic_factors["current_speed_kmh"])
             freeflow_speed_kmh = max(20.0, traffic_factors["freeflow_speed_kmh"])
@@ -10518,16 +10526,142 @@ class PushNotificationService:
 ## `backend\services\osrm.py`
 
 ```python
-from typing import Any, Dict, List, Sequence, Tuple
+"""Street-snapped driving route service (OSRM-compatible public APIs).
+
+PATCH NOTES (why this file changed)
+-----------------------------------
+The old ``_fetch_candidates`` returned as soon as ONE endpoint produced ONE
+route.  The public OSRM demo server usually returns a single route even with
+``alternatives=true``, and the second endpoint (routing.openstreetmap.de) was
+only tried when the first one *failed outright*.  Result: most real
+origin/destination pairs showed only one route.
+
+New behaviour of ``get_routes``:
+  1. Ask every endpoint (in parallel) for native alternatives and merge them,
+     dropping routes that share (almost) the same corridor.
+  2. If that still yields < ``min_routes`` routes, probe "via" waypoints placed
+     perpendicular to the primary route (both sides, several positions along
+     it) and keep any *genuinely different*, *reasonably short* result.
+  3. Results are cached briefly so repeated demo clicks do not hammer the
+     public servers (which rate-limit).
+"""
+import asyncio
+import logging
+import math
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 from fastapi import HTTPException
 
 from core.config import settings
 
+logger = logging.getLogger("apexguardian.osrm")
 
+# ---- tunables ---------------------------------------------------------------
+MIN_ROUTES_TARGET = 2
+MAX_ROUTES = 3
+SAME_CORRIDOR_OVERLAP = 0.88     # >= this shared fraction => "same route"
+CORRIDOR_TOLERANCE_M = 80.0
+MAX_ALT_DISTANCE_RATIO = 1.45    # alt may be at most 45% longer than primary
+MAX_ALT_DURATION_RATIO = 1.60
+PROBE_BATCH_SIZE = 3
+CACHE_TTL_S = 600.0
+
+_route_cache: Dict[str, Tuple[float, List[Dict[str, Any]]]] = {}
+
+
+# ---- geometry helpers -------------------------------------------------------
+def _haversine_m(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    r = 6_371_000.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = p2 - p1
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _downsample(coords: Sequence[Sequence[float]], max_points: int) -> List[Tuple[float, float]]:
+    if len(coords) <= max_points:
+        return [(float(c[0]), float(c[1])) for c in coords]
+    step = (len(coords) - 1) / float(max_points - 1)
+    return [
+        (float(coords[round(i * step)][0]), float(coords[round(i * step)][1]))
+        for i in range(max_points)
+    ]
+
+
+def _point_to_polyline_m(lon: float, lat: float, poly: Sequence[Tuple[float, float]]) -> float:
+    best = float("inf")
+    m_lat = 111_132.0
+    m_lon = 111_320.0 * math.cos(math.radians(lat))
+    for (x1, y1), (x2, y2) in zip(poly, poly[1:]):
+        ax, ay = (x1 - lon) * m_lon, (y1 - lat) * m_lat
+        bx, by = (x2 - lon) * m_lon, (y2 - lat) * m_lat
+        dx, dy = bx - ax, by - ay
+        denom = dx * dx + dy * dy
+        t = 0.0 if denom == 0 else max(0.0, min(1.0, -(ax * dx + ay * dy) / denom))
+        d = math.hypot(ax + t * dx, ay + t * dy)
+        if d < best:
+            best = d
+    return best
+
+
+def _overlap_fraction(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> float:
+    """Fraction of route A's sampled points that lie within tolerance of route B."""
+    sample_a = _downsample(a, 40)
+    poly_b = _downsample(b, 500)
+    if len(poly_b) < 2 or not sample_a:
+        return 0.0
+    near = sum(
+        1 for lon, lat in sample_a
+        if _point_to_polyline_m(lon, lat, poly_b) <= CORRIDOR_TOLERANCE_M
+    )
+    return near / float(len(sample_a))
+
+
+def routes_are_same_corridor(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    ca = a["geometry"]["coordinates"]
+    cb = b["geometry"]["coordinates"]
+    return max(_overlap_fraction(ca, cb), _overlap_fraction(cb, ca)) >= SAME_CORRIDOR_OVERLAP
+
+
+def _bearing_deg(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dl = math.radians(lon2 - lon1)
+    y = math.sin(dl) * math.cos(p2)
+    x = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _offset_point(lat: float, lon: float, bearing_deg: float, dist_km: float) -> Tuple[float, float]:
+    ang = dist_km / 6371.0
+    b = math.radians(bearing_deg)
+    p1, l1 = math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(ang) + math.cos(p1) * math.sin(ang) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(ang) * math.cos(p1), math.cos(ang) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540.0) % 360.0 - 180.0
+
+
+def _has_uturn(route: Dict[str, Any]) -> bool:
+    for step in route.get("steps", []):
+        if (step.get("maneuver") or {}).get("modifier") == "uturn":
+            return True
+    return False
+
+
+# ---- service ----------------------------------------------------------------
 class OSRMService:
     """Street-snapped driving route service via public OSRM-compatible APIs."""
+
+    @staticmethod
+    def _endpoints() -> List[str]:
+        primary = settings.OSRM_BASE_URL.rstrip("/")
+        endpoints = [f"{primary}/route/v1/driving"]
+        secondary = "https://routing.openstreetmap.de/routed-car/route/v1/driving"
+        if secondary not in endpoints:
+            endpoints.append(secondary)
+        return endpoints
 
     @staticmethod
     def _parse_osrm_response(data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -10560,47 +10694,133 @@ class OSRMService:
         return candidates
 
     @classmethod
-    async def _fetch_candidates(cls, coordinate_string: str, alternatives: bool) -> List[Dict[str, Any]]:
-        endpoints = [
-            f"{settings.OSRM_BASE_URL.rstrip('/')}/route/v1/driving/{coordinate_string}",
-            f"https://routing.openstreetmap.de/routed-car/route/v1/driving/{coordinate_string}",
-        ]
-        headers = {"User-Agent": "ApexGuardian/2.0 (navigation@apexguardian.local)"}
-        params = {
-            "overview": "full",
-            "geometries": "geojson",
-            "steps": "true",
-        }
+    async def _query_endpoint(
+        cls, client: httpx.AsyncClient, endpoint: str, coordinate_string: str, alternatives: bool
+    ) -> List[Dict[str, Any]]:
+        params = {"overview": "full", "geometries": "geojson", "steps": "true"}
         if alternatives:
             params["alternatives"] = "true"
+        try:
+            response = await client.get(f"{endpoint}/{coordinate_string}", params=params)
+            if response.status_code != 200:
+                logger.warning("[OSRM] %s returned HTTP %s", endpoint, response.status_code)
+                return []
+            return cls._parse_osrm_response(response.json())
+        except Exception as err:  # network errors, bad JSON, timeouts
+            logger.warning("[OSRM] %s failed: %s", endpoint, err)
+            return []
 
-        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
-            for endpoint in endpoints:
-                try:
-                    response = await client.get(endpoint, params=params, headers=headers)
-                    if response.status_code != 200:
-                        print(f"[OSRM] Endpoint returned {response.status_code}, trying next...")
-                        continue
+    @classmethod
+    async def _fetch_candidates(cls, coordinate_string: str, alternatives: bool) -> List[Dict[str, Any]]:
+        """Query ALL endpoints in parallel and merge distinct routes."""
+        headers = {"User-Agent": "ApexGuardian/2.0 (navigation@apexguardian.local)"}
+        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
+            results = await asyncio.gather(
+                *[cls._query_endpoint(client, ep, coordinate_string, alternatives) for ep in cls._endpoints()]
+            )
+        merged: List[Dict[str, Any]] = []
+        for routes in results:
+            for route in routes:
+                if not any(routes_are_same_corridor(route, kept) for kept in merged):
+                    merged.append(route)
+        if not merged:
+            raise HTTPException(
+                status_code=503,
+                detail="Routing service temporarily unavailable. All OSRM endpoints failed.",
+            )
+        return merged
 
-                    candidates = cls._parse_osrm_response(response.json())
-                    if candidates:
-                        print(f"[OSRM] Success: {len(candidates)} route(s) returned.")
-                        return candidates
-                except Exception as err:
-                    print(f"[OSRM] Endpoint {endpoint} failed: {err}")
+    @classmethod
+    async def _probe_via_routes(
+        cls, primary: Dict[str, Any], origin: Tuple[float, float], dest: Tuple[float, float], have: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Try perpendicular via-waypoints to manufacture genuinely different alternatives."""
+        coords = primary["geometry"]["coordinates"]
+        n = len(coords)
+        if n < 6:
+            return []
+        route_km = primary["distance_meters"] / 1000.0
+        offset_km = max(0.6, min(2.5, 0.12 * route_km))
 
-        raise HTTPException(
-            status_code=503,
-            detail="Routing service temporarily unavailable. All OSRM endpoints failed.",
-        )
+        # (fraction along route, side) in priority order
+        plan = [(0.5, 90), (0.5, -90), (0.35, 90), (0.65, -90), (0.35, -90), (0.65, 90)]
+        waypoints: List[Tuple[float, float]] = []
+        for frac, side in plan:
+            i = max(1, min(n - 2, int(frac * (n - 1))))
+            lon0, lat0 = coords[i - 1][0], coords[i - 1][1]
+            lon1, lat1 = coords[i + 1][0], coords[i + 1][1]
+            bearing = (_bearing_deg(lon0, lat0, lon1, lat1) + side) % 360.0
+            waypoints.append(_offset_point(coords[i][1], coords[i][0], bearing, offset_km))
+
+        found: List[Dict[str, Any]] = []
+        for start in range(0, len(waypoints), PROBE_BATCH_SIZE):
+            if len(have) + len(found) >= MAX_ROUTES:
+                break
+            batch = waypoints[start:start + PROBE_BATCH_SIZE]
+            tasks = [
+                cls._fetch_candidates(
+                    f"{origin[1]},{origin[0]};{wp[1]},{wp[0]};{dest[1]},{dest[0]}", alternatives=False
+                )
+                for wp in batch
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    continue
+                cand = res[0]
+                if _has_uturn(cand):
+                    continue
+                if cand["distance_meters"] > primary["distance_meters"] * MAX_ALT_DISTANCE_RATIO:
+                    continue
+                if cand["duration_seconds"] > primary["duration_seconds"] * MAX_ALT_DURATION_RATIO:
+                    continue
+                if any(routes_are_same_corridor(cand, kept) for kept in have + found):
+                    continue
+                found.append(cand)
+                if len(have) + len(found) >= MAX_ROUTES:
+                    break
+            if len(have) + len(found) >= MIN_ROUTES_TARGET:
+                break
+        return found
 
     @classmethod
     async def get_routes(
-        cls, origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float
+        cls,
+        origin_lat: float,
+        origin_lon: float,
+        dest_lat: float,
+        dest_lon: float,
+        ensure_alternatives: bool = True,
     ) -> List[Dict[str, Any]]:
         """Fetch street-snapped driving alternatives between an origin and destination."""
+        cache_key = f"{origin_lat:.4f},{origin_lon:.4f};{dest_lat:.4f},{dest_lon:.4f};{int(ensure_alternatives)}"
+        cached = _route_cache.get(cache_key)
+        if cached and time.time() - cached[0] < CACHE_TTL_S:
+            return [dict(r) for r in cached[1]]
+
         coordinate_string = f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
-        return await cls._fetch_candidates(coordinate_string, alternatives=True)
+        routes = await cls._fetch_candidates(coordinate_string, alternatives=True)
+
+        # keep the primary (first) route first, cap the list
+        routes = routes[:MAX_ROUTES]
+        if ensure_alternatives and len(routes) < MIN_ROUTES_TARGET:
+            try:
+                extra = await asyncio.wait_for(
+                    cls._probe_via_routes(routes[0], (origin_lat, origin_lon), (dest_lat, dest_lon), routes),
+                    timeout=20.0,
+                )
+                routes.extend(extra)
+            except Exception as err:
+                logger.warning("[OSRM] via-waypoint alternative probing failed: %s", err)
+
+        for idx, route in enumerate(routes):
+            route["route_index"] = idx
+        logger.info("[OSRM] returning %d route(s) for %s", len(routes), cache_key)
+        _route_cache[cache_key] = (time.time(), [dict(r) for r in routes])
+        if len(_route_cache) > 200:
+            oldest = min(_route_cache, key=lambda k: _route_cache[k][0])
+            _route_cache.pop(oldest, None)
+        return routes
 
     @classmethod
     async def get_routes_via_waypoints(
@@ -10620,6 +10840,7 @@ class OSRMService:
 ## `backend\services\reroute_engine.py`
 
 ```python
+import asyncio
 import logging
 import math
 import uuid
@@ -10826,6 +11047,53 @@ def _routes_have_same_geometry(candidate_coords: List[List[float]], active_coord
             return False
         search_from_index = closest_index
         
+    return True
+
+
+# A route is considered "inside" a zone sample when it passes this close to it.
+ZONE_SAMPLE_MIN_RADIUS_KM = 0.06
+# Samples this close to the vehicle are under/behind it and cannot be avoided; ignoring them
+# is what stops "No alternate route" when the driver is already at the edge of the jam.
+ZONE_IGNORE_NEAR_VEHICLE_M = 150.0
+# Avoidance detour caps (a "bypass" that adds 20+ min is not a bypass).
+MAX_EXTRA_SECONDS_ABS = 15 * 60.0
+MAX_EXTRA_FRACTION = 0.35
+MIN_EXTRA_ALLOWANCE_S = 4 * 60.0
+MAX_DIST_RATIO_VS_DIRECT = 2.0
+MAX_DIST_EXTRA_M = 1500.0
+
+
+def _usable_avoid_zones(
+    avoid_hotspots: Optional[Sequence[Dict[str, float]]], current_lat: float, current_lon: float
+) -> List[Dict[str, float]]:
+    zones: List[Dict[str, float]] = []
+    for zone in avoid_hotspots or []:
+        try:
+            lat, lon = float(zone["lat"]), float(zone["lon"])
+            radius_km = float(zone.get("radius_km", ZONE_SAMPLE_MIN_RADIUS_KM))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(radius_km)):
+            continue
+        if haversine_distance_m(current_lon, current_lat, lon, lat) <= ZONE_IGNORE_NEAR_VEHICLE_M:
+            continue
+        zones.append({"lat": lat, "lon": lon, "radius_km": max(0.03, radius_km)})
+    return zones
+
+
+def _avoidance_detour_allowed(
+    route: "CandidateRoute", reference_duration_s: float, direct_distance_m: float
+) -> bool:
+    """Reject 'clean' routes that are absurdly longer than what the driver already has."""
+    if reference_duration_s > 0:
+        allowance = min(
+            MAX_EXTRA_SECONDS_ABS,
+            max(MIN_EXTRA_ALLOWANCE_S, MAX_EXTRA_FRACTION * reference_duration_s),
+        )
+        if route.predicted_duration_seconds > reference_duration_s + allowance:
+            return False
+    if route.distance_meters > MAX_DIST_RATIO_VS_DIRECT * direct_distance_m + MAX_DIST_EXTRA_M:
+        return False
     return True
 
 
@@ -11046,9 +11314,14 @@ class DynamicRerouteEngine:
 
             # Emergency routing is defined as the physical fastest path; congestion
             # avoidance must not divert an emergency vehicle from that path.
-            zones = [] if is_emergency_mode else list(avoid_hotspots or [])
+            # EMERGENCY FEATURE DISABLED: zones = [] if is_emergency_mode else list(avoid_hotspots or [])
+            zones = _usable_avoid_zones(avoid_hotspots, current_lat, current_lon)
             try:
-                raw_candidates = await OSRMService.get_routes(current_lat, current_lon, dest_lat, dest_lon)
+                # ensure_alternatives=False: this runs every few seconds while driving; do not
+                # spend extra OSRM probe requests here (the bypass logic below does its own).
+                raw_candidates = await OSRMService.get_routes(
+                    current_lat, current_lon, dest_lat, dest_lon, ensure_alternatives=False
+                )
             except Exception as error:
                 logger.warning("Native OSRM alternatives unavailable: %s", error)
                 raw_candidates = []
@@ -11072,89 +11345,83 @@ class DynamicRerouteEngine:
             bypass_routes: List[CandidateRoute] = []
 
             if zones and not clean_routes:
-                valid_zones = []
-                for zone in zones:
+                # Aim the bypass at the middle of the affected stretch.
+                mid = zones[len(zones) // 2]
+                hotspot_lat, hotspot_lon = mid["lat"], mid["lon"]
+                zone_radius_m = max(ZONE_SAMPLE_MIN_RADIUS_KM * 1000.0, mid["radius_km"] * 1000.0)
+
+                local_bearing = None
+                for candidate in processed:
+                    coords = (
+                        candidate.geometry.get("coordinates", [])
+                        if isinstance(candidate.geometry, dict)
+                        else []
+                    )
+                    local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
+                    if local_bearing is not None:
+                        break
+                approach_bearing = (
+                    local_bearing
+                    if local_bearing is not None
+                    else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
+                )
+                # Waypoints on BOTH sides of the road, far enough out to clear the jam
+                # (radius + margin), nearest detour first.  Probe several in parallel and keep
+                # the FASTEST clean result instead of the first one that merely avoids the zone.
+                offsets_km = [(zone_radius_m + margin) / 1000.0 for margin in (250.0, 600.0, 1100.0)]
+                candidate_waypoints = sorted(
+                    (
+                        compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
+                        for bearing in (approach_bearing, approach_bearing + 180.0)
+                        for offset in offsets_km
+                    ),
+                    key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
+                    + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
+                )
+
+                async def _probe(via_waypoint: Tuple[float, float]) -> List[CandidateRoute]:
                     try:
-                        lat, lon = float(zone["lat"]), float(zone["lon"])
-                        if math.isfinite(lat) and math.isfinite(lon):
-                            valid_zones.append((lat, lon))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-
-                if valid_zones:
-                    hotspot_lat, hotspot_lon = min(
-                        valid_zones,
-                        key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
-                        + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
-                    )
-                    # Use the bearing of the road itself at the hotspot (derived from
-                    # the nearest already-fetched route's own geometry), not the
-                    # crude straight-line bearing from wherever the vehicle currently
-                    # is all the way to the final destination — those two bearings
-                    # can differ by 90 degrees or more on any route with real turns,
-                    # which used to place the bypass waypoint along the congested
-                    # road instead of across it.
-                    local_bearing = None
-                    for candidate in processed:
-                        coords = (
-                            candidate.geometry.get("coordinates", [])
-                            if isinstance(candidate.geometry, dict)
-                            else []
+                        bypass_candidates = await OSRMService.get_routes_via_waypoints(
+                            [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
                         )
-                        local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
-                        if local_bearing is not None:
-                            break
-                    approach_bearing = (
-                        local_bearing
-                        if local_bearing is not None
-                        else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
-                    )
-                    # Try both sides of the road, at a couple of offsets, closest
-                    # candidate (by detour length) first — stop at the first one
-                    # that actually produces a route avoiding the zone. The old
-                    # code tried exactly one waypoint (whichever side was closer
-                    # to the direct line) and gave up entirely if OSRM couldn't
-                    # route through that single point or routed back through the
-                    # same corridor — in dense urban grids that single guess
-                    # missing is the common case, not the exception.
-                    candidate_waypoints = sorted(
-                        (
-                            compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
-                            for bearing in (approach_bearing, approach_bearing + 180.0)
-                            for offset in (0.3, 0.6, 1.0)
-                        ),
-                        key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
-                        + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
-                    )
+                        return cls._score_and_process(
+                            bypass_candidates,
+                            current_lat,
+                            current_lon,
+                            dest_lat,
+                            dest_lon,
+                            direct_distance_m,
+                            is_emergency_mode,
+                            traffic_test_mode,
+                            traffic_progress,
+                            synthetic_traffic_active,
+                        )
+                    except Exception as error:
+                        logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
+                        return []
 
-                    for via_waypoint in candidate_waypoints:
-                        try:
-                            bypass_candidates = await OSRMService.get_routes_via_waypoints(
-                                [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
-                            )
-                            bypass_routes = cls._score_and_process(
-                                bypass_candidates,
-                                current_lat,
-                                current_lon,
-                                dest_lat,
-                                dest_lon,
-                                direct_distance_m,
-                                is_emergency_mode,
-                                traffic_test_mode,
-                                traffic_progress,
-                                synthetic_traffic_active,
-                            )
-                        except Exception as error:
-                            logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
-                            continue
+                for batch_start in range(0, len(candidate_waypoints), 3):
+                    batch = candidate_waypoints[batch_start:batch_start + 3]
+                    results = await asyncio.gather(*[_probe(wp) for wp in batch])
+                    for probed in results:
+                        bypass_routes.extend(probed)
+                    clean_bypass_routes = [
+                        route for route in bypass_routes
+                        if not route_intersects_avoid_hotspots(route.geometry, zones)
+                        and _avoidance_detour_allowed(
+                            route, original_remaining_duration_s, direct_distance_m
+                        )
+                    ]
+                    if clean_bypass_routes:
+                        clean_routes.extend(clean_bypass_routes)
+                        break
 
-                        clean_bypass_routes = [
-                            route for route in bypass_routes
-                            if not route_intersects_avoid_hotspots(route.geometry, zones)
-                        ]
-                        if clean_bypass_routes:
-                            clean_routes.extend(clean_bypass_routes)
-                            break
+            # Native alternatives that avoid the zone must obey the same detour caps.
+            if zones:
+                clean_routes = [
+                    route for route in clean_routes
+                    if _avoidance_detour_allowed(route, original_remaining_duration_s, direct_distance_m)
+                ]
 
             # Avoidance is a route-intent request, not a faster-route request. Never
             # recommend a dirty fallback when the user explicitly asked to avoid zones.
@@ -11168,7 +11435,7 @@ class DynamicRerouteEngine:
                     recommended_duration_seconds=original_remaining_duration_s,
                     recommended_route=None,
                     alternative_routes=[],
-                    reason="No alternate route avoids this stretch — continuing on the only available path.",
+                    reason="No reasonable detour avoids this stretch (any bypass would add too much time) — staying on the current route.",
                 )
 
             # Filter out candidates that are too similar to recently rejected/used routes
@@ -11312,7 +11579,32 @@ def rank_processed_routes(routes: List[T]) -> List[T]:
 ## `backend\services\traffic_scenario.py`
 
 ```python
-from typing import Any, Dict
+"""Controlled traffic test scenarios (heavy / severe / dynamic demos).
+
+PATCH NOTES (why this file changed)
+-----------------------------------
+Old behaviour and the bugs it caused:
+  * The congested window was a fixed 26 % of the *whole route* (42 %-68 %).
+    On a 20 km demo trip that is a ~5 km "hotspot" -> "the distance is too long".
+  * In DYNAMIC mode the window moved with the vehicle (progress + 12 %).  Every
+    phase change (HEAVY -> SEVERE -> LOW) re-stamped the zone somewhere else, so
+    the label said "heavy" while the red stretch was further ahead, and the red
+    stretch vanished while the car was still inside it.
+  * Segments were coloured whole (350-800 m chunks) using their centre point, so
+    the coloured stretch never matched the hotspot distance in the alert.
+
+New behaviour:
+  * ONE anchored zone per route, 300-1000 m long (never > 25 % of the route),
+    starting at ~50 % of the route.  Segments are split exactly at the zone
+    boundaries so the colour, the pin and the "ahead in X m" distance agree.
+  * The zone never moves.  In DYNAMIC mode only its *severity* changes with
+    progress (approach: moderate -> heavy -> severe, then cleared once the
+    vehicle has passed the end of the zone).
+  * The hotspot carries ``zone_path`` / ``zone_end_distance_m`` so the client can
+    ask the reroute engine to avoid exactly the affected stretch.
+"""
+import math
+from typing import Any, Dict, List, Tuple
 
 from schemas.navigation import CongestionLevel, TrafficTestMode
 
@@ -11331,17 +11623,96 @@ SCENARIO_COLOR = {
     CongestionLevel.SEVERE: "#DC2626",
 }
 
+ZONE_START_RATIO = 0.50
+ZONE_MIN_LEN_M = 300.0
+ZONE_MAX_LEN_M = 1000.0
+ZONE_MAX_ROUTE_FRACTION = 0.25
+DYNAMIC_CLEAR_MARGIN = 0.03     # cleared once progress passes zone end + 3 %
+ZONE_PATH_SAMPLE_M = 120.0
 
-def dynamic_traffic_phase(progress: float) -> CongestionLevel:
-    if progress < 0.20:
+
+def _hav(a: List[float], b: List[float]) -> float:
+    r = 6_371_000.0
+    p1, p2 = math.radians(a[1]), math.radians(b[1])
+    dphi = p2 - p1
+    dl = math.radians(b[0] - a[0])
+    h = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(h), math.sqrt(1 - h))
+
+
+def compute_scenario_zone(total_distance_m: float) -> Tuple[float, float]:
+    """Return (zone_start_m, zone_end_m) along the route."""
+    total = max(1.0, total_distance_m)
+    length = max(ZONE_MIN_LEN_M, min(ZONE_MAX_LEN_M, 0.10 * total))
+    length = min(length, ZONE_MAX_ROUTE_FRACTION * total)
+    start = ZONE_START_RATIO * total
+    if start + length > total - 100.0:
+        start = max(0.0, total - 100.0 - length)
+    return start, start + length
+
+
+def dynamic_traffic_phase(progress: float, zone_end_ratio: float = 1.0) -> CongestionLevel:
+    """Severity as the vehicle approaches the (fixed) zone; LOW once it has passed it."""
+    if progress >= zone_end_ratio + DYNAMIC_CLEAR_MARGIN:
         return CongestionLevel.LOW
-    if progress < 0.38:
+    if progress < 0.15:
+        return CongestionLevel.LOW
+    if progress < 0.28:
         return CongestionLevel.MODERATE
-    if progress < 0.58:
+    if progress < 0.40:
         return CongestionLevel.HEAVY
-    if progress < 0.76:
-        return CongestionLevel.SEVERE
-    return CongestionLevel.LOW
+    return CongestionLevel.SEVERE
+
+
+def _split_segment(seg: Dict[str, Any], cut_m: float) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Split a segment at ``cut_m`` metres from its start (0 < cut_m < length)."""
+    coords = seg["coordinates"]
+    walked = 0.0
+    for i in range(1, len(coords)):
+        d = _hav(coords[i - 1], coords[i])
+        if walked + d >= cut_m or i == len(coords) - 1:
+            t = 0.0 if d == 0 else max(0.0, min(1.0, (cut_m - walked) / d))
+            mid = [
+                coords[i - 1][0] + t * (coords[i][0] - coords[i - 1][0]),
+                coords[i - 1][1] + t * (coords[i][1] - coords[i - 1][1]),
+            ]
+            first = {**seg, "coordinates": coords[:i] + [mid]}
+            second = {**seg, "coordinates": [mid] + coords[i:]}
+            first["distance_meters"] = round(cut_m, 1)
+            second["distance_meters"] = round(max(0.1, seg["distance_meters"] - cut_m), 1)
+            return first, second
+        walked += d
+    return seg, seg  # unreachable for valid input
+
+
+def _split_at(segments: List[Dict[str, Any]], boundary_m: float) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    along = 0.0
+    for seg in segments:
+        dist = seg["distance_meters"]
+        if along + 1.0 < boundary_m < along + dist - 1.0 and len(seg.get("coordinates", [])) >= 2:
+            a, b = _split_segment(seg, boundary_m - along)
+            out.extend([a, b])
+        else:
+            out.append(seg)
+        along += dist
+    return out
+
+
+def _sample_zone_path(zone_segments: List[Dict[str, Any]]) -> List[List[float]]:
+    """Return [[lon, lat], ...] roughly every ZONE_PATH_SAMPLE_M along the affected stretch (max 14 pts)."""
+    pts: List[List[float]] = []
+    for seg in zone_segments:
+        for c in seg.get("coordinates", []):
+            if not pts or _hav(pts[-1], c) >= ZONE_PATH_SAMPLE_M:
+                pts.append([round(c[0], 6), round(c[1], 6)])
+    last = zone_segments[-1].get("coordinates", [[0, 0]])[-1]
+    if not pts or pts[-1] != [round(last[0], 6), round(last[1], 6)]:
+        pts.append([round(last[0], 6), round(last[1], 6)])
+    if len(pts) > 14:
+        step = (len(pts) - 1) / 13.0
+        pts = [pts[round(i * step)] for i in range(14)]
+    return pts
 
 
 def apply_traffic_test_scenario(
@@ -11351,28 +11722,40 @@ def apply_traffic_test_scenario(
     if mode == TrafficTestMode.REAL or not synthetic_traffic_active:
         return analysis
 
-    phase = {
-        TrafficTestMode.NORMAL: CongestionLevel.LOW,
-        TrafficTestMode.MODERATE: CongestionLevel.MODERATE,
-        TrafficTestMode.HEAVY: CongestionLevel.HEAVY,
-        TrafficTestMode.SEVERE: CongestionLevel.SEVERE,
-    }.get(mode, dynamic_traffic_phase(progress))
-
     segments = analysis["segments"]
-    total_distance = sum(segment["distance_meters"] for segment in segments) or 1.0
+    if not segments:
+        return analysis
+    total_distance = sum(s["distance_meters"] for s in segments) or 1.0
+    zone_start, zone_end = compute_scenario_zone(total_distance)
+
+    if mode == TrafficTestMode.DYNAMIC:
+        phase = dynamic_traffic_phase(progress, zone_end / total_distance)
+    else:
+        phase = {
+            TrafficTestMode.NORMAL: CongestionLevel.LOW,
+            TrafficTestMode.MODERATE: CongestionLevel.MODERATE,
+            TrafficTestMode.HEAVY: CongestionLevel.HEAVY,
+            TrafficTestMode.SEVERE: CongestionLevel.SEVERE,
+        }.get(mode, CongestionLevel.LOW)
+
+    # Cut segments exactly at the zone boundaries so colour == hotspot extent.
+    segments = _split_at(_split_at(segments, zone_start), zone_end)
+    for i, seg in enumerate(segments):
+        seg["segment_index"] = i
+
     along = 0.0
     delay_total = 0.0
     distance_by_level = {level: 0.0 for level in CongestionLevel}
-    hotspots = []
-    in_focus_segments = []
-    focus_start = min(0.88, progress + 0.12) if mode == TrafficTestMode.DYNAMIC else 0.42
-    focus_end = min(1.0, focus_start + 0.20) if mode == TrafficTestMode.DYNAMIC else 0.68
+    zone_segments: List[Dict[str, Any]] = []
+    zone_delay = 0.0
+    zone_speed_x_dist = 0.0
+    zone_first_along = None
 
     for segment in segments:
         distance = segment["distance_meters"]
-        center_ratio = (along + distance / 2.0) / total_distance
-        in_focus = phase != CongestionLevel.LOW and focus_start <= center_ratio <= focus_end
-        level = phase if in_focus else CongestionLevel.LOW
+        center = along + distance / 2.0
+        in_zone = phase != CongestionLevel.LOW and zone_start - 0.5 <= center <= zone_end + 0.5
+        level = phase if in_zone else CongestionLevel.LOW
         ratio = SCENARIO_SPEED_RATIO[level]
         freeflow_speed = max(20.0, segment.get("freeflow_speed_kmh", 45.0))
         speed = freeflow_speed * ratio
@@ -11389,47 +11772,37 @@ def apply_traffic_test_scenario(
         })
         delay_total += delay
         distance_by_level[level] += distance
-
-        if in_focus:
-            in_focus_segments.append({
-                "segment": segment,
-                "distance": distance,
-                "delay": delay,
-                "along": along,
-                "speed": speed
-            })
-            
+        if in_zone:
+            if zone_first_along is None:
+                zone_first_along = along
+            zone_segments.append(segment)
+            zone_delay += delay
+            zone_speed_x_dist += speed * distance
         along += distance
 
-    if in_focus_segments:
-        # Create exactly one synthetic hotspot for the entire affected zone
-        total_focus_dist = sum(s["distance"] for s in in_focus_segments)
-        mid_focus_along = in_focus_segments[0]["along"] + (total_focus_dist / 2.0)
-        
-        # Find the segment closest to the center of the focus zone
-        center_seg = min(in_focus_segments, key=lambda s: abs(s["along"] + s["distance"]/2.0 - mid_focus_along))
-        segment = center_seg["segment"]
-        coordinates = segment.get("coordinates", [])
-        lon, lat = 0.0, 0.0
-        if coordinates:
-            lon, lat = coordinates[len(coordinates) // 2]
-            
-        avg_speed = sum(s["speed"] * s["distance"] for s in in_focus_segments) / max(1.0, total_focus_dist)
-        total_focus_delay = sum(s["delay"] for s in in_focus_segments)
-        
+    hotspots: List[Dict[str, Any]] = []
+    if zone_segments:
+        first = zone_segments[0]
+        lon, lat = first["coordinates"][0]
+        zone_len = sum(s["distance_meters"] for s in zone_segments)
+        path = _sample_zone_path(zone_segments)
         hotspots.append({
             "hotspot_id": f"test-{mode.value}-primary",
-            "location_name": segment.get("road_name") or "Traffic ahead",
+            "location_name": first.get("road_name") or "Traffic ahead",
             "lat": lat,
             "lon": lon,
-            "distance_from_origin_m": round(mid_focus_along, 1),
+            # Distance to the START of the affected stretch (what "ahead in X m" means).
+            "distance_from_origin_m": round(zone_first_along or zone_start, 1),
             "congestion_level": phase.value,
-            "average_speed_kmh": round(avg_speed, 1),
-            "estimated_delay_seconds": round(total_focus_delay, 1),
+            "average_speed_kmh": round(zone_speed_x_dist / max(1.0, zone_len), 1),
+            "estimated_delay_seconds": round(zone_delay, 1),
             "description": "Traffic is moving more slowly on this road.",
             "cause": "Controlled traffic test",
+            "zone_end_distance_m": round((zone_first_along or zone_start) + zone_len, 1),
+            "zone_path": path,
         })
 
+    analysis["segments"] = segments
     analysis["hotspots"] = hotspots
     analysis["total_delay_seconds"] = round(delay_total, 1)
     analysis["clear_distance_km"] = round(distance_by_level[CongestionLevel.LOW] / 1000.0, 2)
@@ -11798,23 +12171,27 @@ from services.route_selection import rank_processed_routes
 from services.traffic_scenario import apply_traffic_test_scenario
 from schemas.navigation import TrafficTestMode
 
-def test_emergency_mode_bypass():
-    mock_routes = [{
-        "distance_meters": 10000.0,
-        "duration_seconds": 1200.0,
-        "steps": []
-    }]
+# EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+# def test_emergency_mode_bypass():
+#     mock_routes = [{
+#         "distance_meters": 10000.0,
+#         "duration_seconds": 1200.0,
+#         "steps": []
+#     }]
     
-    # Run in emergency mode
-    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51, is_emergency_mode=True)
+#     # Run in emergency mode
+#     evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51)
     
-    assert len(evaluated) == 1
-    # Congestion factor must be exactly 1.0
-    assert evaluated[0]["congestion_factor"] == 1.0
-    # Predicted duration should match standard duration
-    assert evaluated[0]["predicted_duration_seconds"] == 1200.0
+#     assert len(evaluated) == 1
+#     # Congestion factor must be exactly 1.0
+#     assert evaluated[0]["congestion_factor"] == 1.0
+#     # Predicted duration should match standard duration
+#     assert evaluated[0]["predicted_duration_seconds"] == 1200.0
 
-def test_computed_fields():
+
+def test_computed_fields(monkeypatch):
+    # Emergency mode used to pin the congestion factor to 1.0 for this test; pin it directly instead.
+    monkeypatch.setattr("ml.recommender.congestion_predictor.predict_congestion_factor", lambda **kwargs: 1.0)
     mock_routes = [
         {
             "distance_meters": 10000.0, # 10km
@@ -11828,7 +12205,7 @@ def test_computed_fields():
         }
     ]
     
-    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51, is_emergency_mode=True)
+    evaluated = RouteScorer.evaluate_routes(mock_routes, 12.9, 77.5, 12.91, 77.51)
     
     assert len(evaluated) == 2
     
@@ -12049,6 +12426,115 @@ def test_nearest_point_along_route_calculation():
 ```
 
 
+## `backend\tests\test_patch_regressions.py`
+
+```python
+"""Regression tests for the heavy / severe / dynamic + OSRM alternatives patch."""
+import math
+
+from schemas.navigation import TrafficTestMode, CongestionLevel
+from services.traffic_scenario import (
+    apply_traffic_test_scenario,
+    compute_scenario_zone,
+    dynamic_traffic_phase,
+)
+
+
+def _analysis(total_m: float, chunks: int = 12):
+    m_lon = 111_320.0 * math.cos(math.radians(12.95))
+    step = total_m / chunks
+    segs, lon = [], 77.60
+    for i in range(chunks):
+        lon2 = lon + step / m_lon
+        segs.append({
+            "segment_index": i,
+            "distance_meters": step,
+            "coordinates": [[lon, 12.95], [(lon + lon2) / 2, 12.95], [lon2, 12.95]],
+            "freeflow_speed_kmh": 45.0,
+            "road_name": "Test Road",
+        })
+        lon = lon2
+    return {"segments": segs, "hotspots": [], "clear_distance_km": 0.0, "moderate_distance_km": 0.0,
+            "heavy_distance_km": 0.0, "severe_distance_km": 0.0, "total_delay_seconds": 0.0}
+
+
+def test_zone_is_short_even_on_long_routes():
+    for total in (3_000, 8_000, 20_000, 40_000):
+        start, end = compute_scenario_zone(total)
+        assert 300 <= end - start <= 1000
+        assert end - start <= 0.25 * total + 1e-6
+
+
+def test_coloured_length_equals_hotspot_zone_and_distance_matches_start():
+    for mode in (TrafficTestMode.HEAVY, TrafficTestMode.SEVERE):
+        res = apply_traffic_test_scenario(_analysis(10_000), mode)
+        hotspot = res["hotspots"][0]
+        coloured = sum(s["distance_meters"] for s in res["segments"] if s["congestion_level"] != "LOW")
+        start, end = compute_scenario_zone(10_000)
+        assert abs(coloured - (end - start)) < 3
+        assert abs(hotspot["distance_from_origin_m"] - start) < 3
+        assert hotspot["zone_path"] and len(hotspot["zone_path"]) <= 14
+
+
+def test_dynamic_zone_never_moves_only_severity_changes():
+    starts, levels = set(), []
+    for progress in (0.20, 0.35, 0.45):
+        res = apply_traffic_test_scenario(_analysis(10_000), TrafficTestMode.DYNAMIC, progress=progress)
+        hotspot = res["hotspots"][0]
+        starts.add(round(hotspot["distance_from_origin_m"]))
+        levels.append(hotspot["congestion_level"])
+    assert len(starts) == 1
+    assert levels == ["MODERATE", "HEAVY", "SEVERE"]
+
+
+def test_dynamic_clears_only_after_zone_is_passed():
+    _, end = compute_scenario_zone(10_000)
+    inside = apply_traffic_test_scenario(_analysis(10_000), TrafficTestMode.DYNAMIC, progress=end / 10_000)
+    after = apply_traffic_test_scenario(_analysis(10_000), TrafficTestMode.DYNAMIC, progress=end / 10_000 + 0.05)
+    assert inside["hotspots"]
+    assert after["hotspots"] == []
+
+
+def test_dynamic_phase_helper():
+    assert dynamic_traffic_phase(0.05) == CongestionLevel.LOW
+    assert dynamic_traffic_phase(0.20) == CongestionLevel.MODERATE
+    assert dynamic_traffic_phase(0.35) == CongestionLevel.HEAVY
+    assert dynamic_traffic_phase(0.50, zone_end_ratio=0.6) == CongestionLevel.SEVERE
+    assert dynamic_traffic_phase(0.70, zone_end_ratio=0.6) == CongestionLevel.LOW
+
+
+def test_same_corridor_detection_for_osrm_alternatives():
+    from services.osrm import routes_are_same_corridor
+
+    def route(offset_lat):
+        return {"geometry": {"coordinates": [[77.59 + i * 0.002, 12.97 + offset_lat] for i in range(60)]}}
+
+    assert routes_are_same_corridor(route(0.0), route(0.0002))          # ~22 m apart => same road
+    assert not routes_are_same_corridor(route(0.0), route(0.02))        # ~2.2 km apart => alternative
+
+
+def test_detour_cap_rejects_absurd_bypass():
+    from types import SimpleNamespace
+    from services.reroute_engine import _avoidance_detour_allowed
+
+    ok = SimpleNamespace(predicted_duration_seconds=800.0, distance_meters=9_000.0)
+    too_slow = SimpleNamespace(predicted_duration_seconds=2_400.0, distance_meters=9_000.0)
+    too_long = SimpleNamespace(predicted_duration_seconds=700.0, distance_meters=30_000.0)
+    assert _avoidance_detour_allowed(ok, 700.0, 6_000.0)
+    assert not _avoidance_detour_allowed(too_slow, 700.0, 6_000.0)
+    assert not _avoidance_detour_allowed(too_long, 700.0, 6_000.0)
+
+
+def test_zones_next_to_vehicle_are_ignored():
+    from services.reroute_engine import _usable_avoid_zones
+
+    zones = [{"lat": 12.9500, "lon": 77.6000, "radius_km": 0.06},      # on top of the vehicle
+             {"lat": 12.9600, "lon": 77.6000, "radius_km": 0.06}]      # ~1.1 km ahead
+    usable = _usable_avoid_zones(zones, 12.9500, 77.6000)
+    assert len(usable) == 1 and usable[0]["lat"] == 12.9600
+```
+
+
 ## `backend\tests\test_reroute_validation.py`
 
 ```python
@@ -12191,6 +12677,8 @@ def test_reject_zero_distance_reroute_even_when_geometry_reaches_destination():
     def mock_evaluate_routes(routes, *args, **kwargs):
         return routes
 
+
+
     original_get = services.osrm.OSRMService.get_routes
     original_eval = ml.recommender.RouteScorer.evaluate_routes
     services.osrm.OSRMService.get_routes = mock_get_routes
@@ -12311,42 +12799,43 @@ def test_native_avoidance_candidate_is_offered_even_when_slower(monkeypatch):
     assert waypoint_calls == []
 
 
-def test_emergency_reroute_does_not_apply_congestion_avoidance(monkeypatch):
-    from services.osrm import OSRMService
-    from ml.recommender import RouteScorer
+# EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+# def test_emergency_reroute_does_not_apply_congestion_avoidance(monkeypatch):
+#     from services.osrm import OSRMService
+#     from ml.recommender import RouteScorer
 
-    current_lat, current_lon = 12.9716, 77.5946
-    dest_lat, dest_lon = 13.0516, 77.5946
-    direct_route = {
-        "route_index": 0,
-        "distance_meters": 9000.0,
-        "duration_seconds": 700.0,
-        "geometry": {
-            "type": "LineString",
-            "coordinates": [[current_lon, current_lat + i * 0.01] for i in range(9)],
-        },
-        "steps": [{"name": "Direct Road", "distance": 9000.0, "duration": 700.0}],
-    }
+#     current_lat, current_lon = 12.9716, 77.5946
+#     dest_lat, dest_lon = 13.0516, 77.5946
+#     direct_route = {
+#         "route_index": 0,
+#         "distance_meters": 9000.0,
+#         "duration_seconds": 700.0,
+#         "geometry": {
+#             "type": "LineString",
+#             "coordinates": [[current_lon, current_lat + i * 0.01] for i in range(9)],
+#         },
+#         "steps": [{"name": "Direct Road", "distance": 9000.0, "duration": 700.0}],
+#     }
 
-    async def mock_get_routes(*args, **kwargs):
-        return [direct_route.copy()]
+#     async def mock_get_routes(*args, **kwargs):
+#         return [direct_route.copy()]
 
-    monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
-    monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
+#     monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
+#     monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
 
-    rec = asyncio.run(DynamicRerouteEngine.evaluate_reroute(
-        current_lat=current_lat,
-        current_lon=current_lon,
-        dest_lat=dest_lat,
-        dest_lon=dest_lon,
-        original_remaining_duration_s=1500.0,
-        avoid_hotspots=[{"lat": 13.0116, "lon": 77.5946, "radius_km": 0.6}],
-        is_emergency_mode=True,
-    ))
+#     rec = asyncio.run(DynamicRerouteEngine.evaluate_reroute(
+#         current_lat=current_lat,
+#         current_lon=current_lon,
+#         dest_lat=dest_lat,
+#         dest_lon=dest_lon,
+#         original_remaining_duration_s=1500.0,
+#         avoid_hotspots=[{"lat": 13.0116, "lon": 77.5946, "radius_km": 0.6}],
+#         is_emergency_mode=True,
+#     ))
 
-    assert rec.is_reroute_recommended
-    assert not rec.is_congestion_avoidance
-    assert rec.recommended_route is not None
+#     assert rec.is_reroute_recommended
+#     assert not rec.is_congestion_avoidance
+#     assert rec.recommended_route is not None
 
 
 def test_reroute_uses_waypoint_bypass_when_initial_routes_cross_avoid_zone(monkeypatch):
@@ -14581,12 +15070,14 @@ export default function Home() {
 
       {/* Top-Right Backend Health & Mode Status Badges */}
       <div className="fixed top-4 right-4 flex items-center gap-2 pointer-events-auto" style={{ zIndex: OVERLAY_Z.statusBadge }}>
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
         {isEmergencyMode && (
           <div className="glass-panel px-3.5 py-2 rounded-full flex items-center gap-2 shadow-lg text-xs font-black text-rose-600 border border-rose-500/50 bg-rose-50/95 animate-pulse">
             <Siren className="w-3.5 h-3.5 fill-current" />
             <span className="tracking-wide uppercase">Emergency Mode</span>
           </div>
         )}
+        */}
 
         <div className="glass-panel px-3.5 py-2 rounded-full flex items-center gap-2 shadow-lg text-xs font-semibold">
           <div className="w-6 h-6 rounded-full bg-blue-600/10 flex items-center justify-center text-blue-600">
@@ -14625,6 +15116,12 @@ import { useNavigation, BENGALURU_CENTER, haversineMeters } from "@/context/Navi
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
+// Route identity colours (used only where traffic is clear; congestion keeps its own colours).
+const AI_ROUTE_GREEN = "#16A34A";      // AI recommended route
+const AI_ROUTE_GREEN_DARK = "#15803D";
+const OSRM_ROUTE_BLUE = "#2563EB";     // OSRM preferred / second-best route
+const OSRM_ROUTE_BLUE_DARK = "#1D4ED8";
+
 export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
 
 export const BENGALURU_MAX_BOUNDS: maplibregl.LngLatBoundsLike = [
@@ -14658,6 +15155,7 @@ export const MapCanvas: React.FC = () => {
     calculateRoutes,
     activeLayerMode,
     isEmergencyMode,
+    trafficTestMode,
     isNavigating,
     currentLocation,
     vehicleBearing,
@@ -15016,6 +15514,10 @@ export const MapCanvas: React.FC = () => {
 
         const isSelected = idx === activeRouteIndex;
         const isAI = Boolean(route.is_ai_recommended);
+        // PATCH: identity colour. AI recommended = green, every other route (the OSRM preferred /
+        // second-best one) = blue. Clicking a route no longer changes its identity colour.
+        const clearColor = isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
+        const clearCasing = isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
 
         // Layer Mode Filtering
         if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;
@@ -15028,8 +15530,17 @@ export const MapCanvas: React.FC = () => {
             const casingLayerId = `seg-casing-${idx}-${sIdx}`;
             const lineLayerId = `seg-line-${idx}-${sIdx}`;
 
-            const trafficColor = TRAFFIC_COLORS[seg.congestion_level] || seg.color;
+            // PATCH: clear stretches take the route's identity colour (AI = green, OSRM = blue);
+            // congested stretches always keep their own yellow / orange / red. Unselected = grey.
+            const level = seg.congestion_level;
+            const isCongested = Boolean(level) && level !== "LOW";
+            const trafficColor = isCongested
+              ? (TRAFFIC_COLORS[level] || seg.color)
+              : clearColor;
             const segmentColor = isSelected ? trafficColor : "#94A3B8";
+            const segmentCasing = isSelected
+              ? (isCongested ? trafficColor : clearCasing)
+              : "#1E293B";
 
             map.addSource(sourceId, {
               type: "geojson",
@@ -15051,7 +15562,7 @@ export const MapCanvas: React.FC = () => {
               source: sourceId,
               layout: { "line-join": "round", "line-cap": "round" },
               paint: {
-                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
+                "line-color": segmentCasing,
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
               },
@@ -15236,7 +15747,7 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-                "line-color": isSelected ? (isAI ? "#8B5CF6" : "#2563EB") : "#1E293B",
+                "line-color": isSelected ? clearCasing : "#1E293B",
                 "line-width": isSelected ? 12 : 8,
                 "line-opacity": isSelected ? 0.9 : 0.2,
             },
@@ -15249,7 +15760,8 @@ export const MapCanvas: React.FC = () => {
             source: sourceId,
             layout: { "line-join": "round", "line-cap": "round" },
             paint: {
-              "line-color": isSelected ? (isEmergencyMode ? "#EF4444" : "#3B82F6") : "#64748B",
+              // EMERGENCY FEATURE DISABLED: "line-color": isSelected ? (isEmergencyMode ? "#EF4444" : "#3B82F6") : "#64748B",
+              "line-color": isSelected ? clearColor : "#64748B",
               "line-width": isSelected ? 7 : 5,
               "line-opacity": isSelected ? 1.0 : 0.65,
             },
@@ -15332,6 +15844,7 @@ export const MapCanvas: React.FC = () => {
     setActiveRouteIndex,
     activeLayerMode,
     isEmergencyMode,
+    trafficTestMode,
     isNavigating,
     activeRerouteRecommendation,
   ]);
@@ -15599,7 +16112,8 @@ export const FloatingSearchPanel: React.FC = () => {
             : "border-slate-200/80"
         }`}
       >
-        {/* Emergency Mode Toggle Banner */}
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+
         <div className="flex items-center justify-between pb-1 border-b border-slate-200/60">
           <div className="flex items-center gap-2">
             <span
@@ -15635,6 +16149,7 @@ export const FloatingSearchPanel: React.FC = () => {
             />
           </button>
         </div>
+        */}
 
         {/* Source Input */}
         <div
@@ -15781,7 +16296,7 @@ import React, { useState } from "react";
 import { Plus, Minus, Target, Layers, Siren } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
 import { mapRefContainer } from "@/components/map/MapCanvas";
-import { TrafficTestMode } from "@/lib/trafficScenario";
+import { TrafficTestMode, TRAFFIC_TEST_SCENARIOS } from "@/lib/trafficScenario";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
 export const MapControls: React.FC = () => {
@@ -15868,7 +16383,11 @@ export const MapControls: React.FC = () => {
             <option value="severe">Severe Congestion</option>
             <option value="dynamic">Dynamic Congestion</option>
           </select>
-          {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled Indiranagar → Marathahalli test</p>}
+          {trafficTestMode !== "real" && (
+            <p className="mt-1 text-[10px] leading-tight text-slate-500">
+              Controlled {TRAFFIC_TEST_SCENARIOS[trafficTestMode].description} test
+            </p>
+          )}
         </div>
 
         <div className="glass-panel rounded-full p-1 flex flex-col gap-1 shadow-lg">
@@ -15913,6 +16432,7 @@ export const MapControls: React.FC = () => {
           <Layers className="w-5 h-5" />
         </button>
 
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
         <button
           onClick={toggleEmergencyMode}
           title={isEmergencyMode ? "Emergency Mode Active (Ambulance Priority)" : "Enable Emergency / Ambulance Mode"}
@@ -15924,6 +16444,7 @@ export const MapControls: React.FC = () => {
         >
           <Siren className="w-5 h-5" />
         </button>
+        */}
       </div>
     </>
   );
@@ -16359,6 +16880,7 @@ export const RouteCard: React.FC = () => {
     setIsNavigating,
     isLoadingRoutes,
     isEmergencyMode,
+    trafficTestMode,
   } = useNavigation();
 
   if (isLoadingRoutes) {
@@ -16389,17 +16911,17 @@ export const RouteCard: React.FC = () => {
 
   const distanceKm = (currentRoute.distance_meters / 1000).toFixed(1);
   const isAIRoute = Boolean(currentRoute.is_ai_recommended);
+  const isOsrmPreferredRealRoute =
+    trafficTestMode === "real" && currentRoute.original_route_index === 0 && !isAIRoute;
 
   // Format user-friendly route label
-  let routeLabel = currentRoute.recommendation_label;
+  let routeLabel = isOsrmPreferredRealRoute ? "OSRM Preferred Route" : currentRoute.recommendation_label;
   if (!routeLabel) {
     if (isAIRoute) {
       routeLabel = isEmergencyMode ? "Emergency Priority Corridor" : "Recommended Route";
     } else {
       routeLabel = "Standard Route";
     }
-  } else if (routeLabel === "OSRM Preferred Route") {
-    routeLabel = "Standard Route";
   } else if (routeLabel === "AI Recommended") {
     routeLabel = "Recommended Route";
   }
@@ -16645,15 +17167,15 @@ export const RouteCard: React.FC = () => {
                 const dist = (r.distance_meters / 1000).toFixed(1);
                 const isSelected = idx === activeRouteIndex;
                 const isAI = Boolean(r.is_ai_recommended);
-                let labelText = r.recommendation_label;
+                const isOsrmPreferred =
+                  trafficTestMode === "real" && r.original_route_index === 0 && !isAI;
+                let labelText = isOsrmPreferred ? "OSRM Preferred Route" : r.recommendation_label;
                 if (!labelText) {
                   if (isAI) {
                     labelText = isEmergencyMode ? "Emergency Priority" : "Recommended Route";
                   } else {
                     labelText = "Standard Route";
                   }
-                } else if (labelText === "OSRM Preferred Route") {
-                  labelText = "Standard Route";
                 } else if (labelText === "AI Recommended") {
                   labelText = "Recommended Route";
                 }
@@ -16841,9 +17363,17 @@ export const TrafficLegend: React.FC<TrafficLegendProps> = ({ placement = "navig
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <span className="w-3 h-3 rounded-full bg-emerald-500 shadow-sm" />
-                  <span className="font-bold text-slate-700">Clear Flow</span>
+                  <span className="font-bold text-slate-700">AI Route · Clear</span>
                 </div>
                 <span className="text-xs text-slate-500 font-medium">≥ 80% freeflow</span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="w-3 h-3 rounded-full bg-blue-600 shadow-sm" />
+                  <span className="font-bold text-slate-700">OSRM Route · Clear</span>
+                </div>
+                <span className="text-xs text-slate-500 font-medium">alternate</span>
               </div>
 
               <div className="flex items-center justify-between">
@@ -16989,7 +17519,7 @@ import { TTSService, SpeechPriority } from "@/lib/ttsService";
 import { PushNotificationService } from "@/lib/pushNotificationService";
 import { RerouteEngine, routesHaveSameGeometry } from "@/lib/rerouteEngine";
 import { getManeuverInstruction, getManeuverAnnouncement } from "@/lib/maneuverInstructions";
-import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode } from "@/lib/trafficScenario";
+import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode, TRAFFIC_TEST_SCENARIOS } from "@/lib/trafficScenario";
 
 export interface Coordinate {
   lat: number;
@@ -17046,7 +17576,16 @@ function getUpcomingAvoidHotspots(
         hotspot.distance_from_origin_m >= distanceAlongRouteM - 100
       );
     })
-    .map((hotspot) => ({ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }));
+    .flatMap((hotspot) => {
+      // PATCH: when the hotspot carries the exact congested stretch, avoid THAT stretch
+      // (small circles along it) instead of one 150 m circle at its first point. Otherwise
+      // routes that drove straight through the jam were treated as "clean".
+      const path = hotspot.zone_path;
+      if (path && path.length > 0) {
+        return path.map(([lon, lat]) => ({ lat, lon, radius_km: 0.06 }));
+      }
+      return [{ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }];
+    });
 }
 
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
@@ -17193,11 +17732,16 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [isLoadingRoutes, setIsLoadingRoutes] = useState(false);
   const [currentZoom, setCurrentZoom] = useState(12.5);
   const [pinDropMode, setPinDropMode] = useState<PinDropMode>("none");
-  const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+  // EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+  // const [isEmergencyMode, setIsEmergencyMode] = useState(false);
+  // Hard-wired off so every downstream emergency branch (styles, API flag, voice line) stays inert.
+  const isEmergencyMode = false;
+  const setIsEmergencyMode: React.Dispatch<React.SetStateAction<boolean>> = () => {};
   const [trafficTestMode, setTrafficTestMode] = useState<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const trafficTestModeRef = useRef<TrafficTestMode>(DEFAULT_TRAFFIC_MODE);
   const lastDynamicPhaseRef = useRef<string>("LOW");
   const dynamicProgressRef = useRef(0);
+  const dynamicClearingRef = useRef(false); // PATCH: guards the one-shot "zone passed" clear
   const testCongestionConsumedRef = useRef(false);
 
   // Real-Time Simulation & Navigation Telemetry
@@ -17330,6 +17874,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         lastAutoRerouteCheckTimeRef.current = 0;
         recentRoutesRef.current = [];
         testCongestionConsumedRef.current = false;
+        dynamicClearingRef.current = false;
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
         setActiveRerouteRecommendation(null);
@@ -17360,35 +17905,37 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     RerouteEngine.dismissNoRouteReason();
     lastDynamicPhaseRef.current = "LOW";
     dynamicProgressRef.current = 0;
+    dynamicClearingRef.current = false;
     testCongestionConsumedRef.current = false;
 
     let origin = selectedOrigin;
     let destination = selectedDestination;
     if (mode !== "real") {
-      // Switched from MG Road -> Koramangala: that ~6.5km trip has essentially
-      // one reasonable arterial connection near the tested hotspot (Lower
-      // Agaram Road), so neither OSRM's native alternatives nor a synthesized
-      // bypass waypoint could ever find a genuinely different path around it —
-      // "No avoidance route found" there could be structurally correct, not a
-      // bug. Indiranagar -> Marathahalli is a real, commonly-cited pair of
-      // parallel corridors (100 Feet Road / Old Airport Road vs. the Outer Ring
-      // Road), giving the avoidance logic an actual second road to find.
-      origin = { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" };
-      destination = { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" };
+      const scenario = TRAFFIC_TEST_SCENARIOS[mode];
+      if (!scenario) return;
+      origin = scenario.origin;
+      destination = scenario.destination;
       setSelectedOrigin(origin);
       setSelectedDestination(destination);
-      setSourceQuery(origin.name || "Indiranagar, Bengaluru");
-      setDestinationQuery(destination.name || "Marathahalli, Bengaluru");
+      setSourceQuery(origin.name);
+      setDestinationQuery(destination.name);
     }
     if (!origin || !destination) return;
     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
     if (loaded) setIsNavigating(true);
   };
 
-  const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number) => {
+  const refreshTrafficScenario = useCallback(async (route: CandidateRoute, progress: number): Promise<CandidateRoute | null> => {
     const destination = selectedDestination;
     const start = route.geometry?.coordinates?.[0];
-    if (!destination || !start || trafficTestModeRef.current === "real") return;
+    if (
+      !destination ||
+      !start ||
+      trafficTestModeRef.current === "real" ||
+      testCongestionConsumedRef.current
+    ) {
+      return null;
+    }
 
     try {
       const response = await fetchRoutes(
@@ -17396,37 +17943,58 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isEmergencyMode, trafficTestModeRef.current, progress,
         !testCongestionConsumedRef.current
       );
-      const evaluatedRoute = response.candidates?.[0];
-      if (!response.success || !evaluatedRoute) return;
+      // PATCH: candidates come back re-ranked by ETA, so [0] can be a DIFFERENT road than `route`.
+      // Copying its segments onto this geometry is what made red stretches jump or vanish.
+      // Pick the candidate that is actually this route (same length, same start/end corridor).
+      const evaluatedRoute = (response.candidates || [])
+        .map((candidate) => ({
+          candidate,
+          diff: Math.abs((candidate.distance_meters || 0) - (route.distance_meters || 0)),
+        }))
+        .sort((a, b) => a.diff - b.diff)[0]?.candidate;
+      if (
+        !response.success ||
+        !evaluatedRoute ||
+        Math.abs((evaluatedRoute.distance_meters || 0) - (route.distance_meters || 0)) >
+          Math.max(150, 0.02 * (route.distance_meters || 0))
+      ) {
+        return null;
+      }
+
+      const updatedRoute: CandidateRoute = {
+        ...route,
+        segments: evaluatedRoute.segments,
+        hotspots: evaluatedRoute.hotspots,
+        clear_distance_km: evaluatedRoute.clear_distance_km,
+        moderate_distance_km: evaluatedRoute.moderate_distance_km,
+        heavy_distance_km: evaluatedRoute.heavy_distance_km,
+        severe_distance_km: evaluatedRoute.severe_distance_km,
+        total_delay_seconds: evaluatedRoute.total_delay_seconds,
+        predicted_duration_seconds: evaluatedRoute.predicted_duration_seconds,
+        predicted_duration_minutes: evaluatedRoute.predicted_duration_minutes,
+      };
 
       setRoutes((currentRoutes) => currentRoutes.map((currentRoute) =>
-        currentRoute.route_id === route.route_id
-          ? {
-              ...currentRoute,
-              segments: evaluatedRoute.segments,
-              hotspots: evaluatedRoute.hotspots,
-              clear_distance_km: evaluatedRoute.clear_distance_km,
-              moderate_distance_km: evaluatedRoute.moderate_distance_km,
-              heavy_distance_km: evaluatedRoute.heavy_distance_km,
-              severe_distance_km: evaluatedRoute.severe_distance_km,
-              total_delay_seconds: evaluatedRoute.total_delay_seconds,
-              predicted_duration_seconds: evaluatedRoute.predicted_duration_seconds,
-              predicted_duration_minutes: evaluatedRoute.predicted_duration_minutes,
-            }
-          : currentRoute
+        currentRoute.route_id === route.route_id ? updatedRoute : currentRoute
       ));
+
+      return updatedRoute;
     } catch (error) {
       console.warn("[NavigationContext] Could not refresh test traffic conditions:", error);
+      return null;
     }
   }, [selectedDestination, isEmergencyMode]);
 
-  const toggleEmergencyMode = () => {
-    const newEmergency = !isEmergencyMode;
-    setIsEmergencyMode(newEmergency);
-    if (selectedOrigin && selectedDestination) {
-      calculateRoutes(selectedOrigin, selectedDestination, newEmergency);
-    }
-  };
+  // EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+  // const toggleEmergencyMode = () => {
+  //   const newEmergency = !isEmergencyMode;
+  //   setIsEmergencyMode(newEmergency);
+  //   if (selectedOrigin && selectedDestination) {
+  //     calculateRoutes(selectedOrigin, selectedDestination, newEmergency);
+  //   }
+  // };
+  const toggleEmergencyMode = () => {};
+
 
   const swapSourceAndDestination = async () => {
     const oldOrigin = selectedOrigin;
@@ -17655,6 +18223,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const triggerDynamicRerouteCheck = useCallback(
     async (force: boolean = false, pinnedHotspotId?: string | null) => {
       const activeRoute = routes[activeRouteIndex];
+
+
       if (!activeRoute || !selectedDestination || !currentLocation || !isNavigating) return;
 
       const currentReqId = ++rerouteRequestIdRef.current;
@@ -17889,10 +18459,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // Determine current segment speed
       let speedKmh = 40.0;
       if (activeRoute.segments && activeRoute.segments.length > 0) {
-        const segIdx = Math.min(
-          activeRoute.segments.length - 1,
-          Math.floor(progressRatio * activeRoute.segments.length)
-        );
+        // PATCH: locate the segment by DISTANCE travelled. The old uniform index
+        // (progress * segmentCount) drifted away from the real segment as soon as segments had
+        // unequal lengths (e.g. when a congestion zone is cut out of a longer chunk).
+        let acc = 0;
+        let segIdx = activeRoute.segments.length - 1;
+        for (let i = 0; i < activeRoute.segments.length; i++) {
+          acc += activeRoute.segments[i].distance_meters || 0;
+          if (currentDist <= acc) { segIdx = i; break; }
+        }
         const seg = activeRoute.segments[segIdx];
         if (seg && seg.current_speed_kmh) {
           speedKmh = seg.current_speed_kmh;
@@ -17987,22 +18562,26 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         const hotspots = activeRoute.hotspots || [];
 
         AlertManager.evaluatePosition(interpLat, interpLon, hotspots, speedKmh, (alert) => {
-          TTSService.speakCongestionAlert(
-            alert.locationName,
-            alert.distanceText,
-            alert.averageSpeedKmh,
-            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
-            true,
-            alert.congestionLevel
-          );
+          // PATCH: speak / push ONCE per hotspot. Stage 2 / stage 3 (500 m / 200 m) and severity
+          // escalations only refresh the banner; they used to re-announce the same jam 2-3 times.
+          if (alert.firstAnnouncement) {
+            TTSService.speakCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.averageSpeedKmh,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
+              true,
+              alert.congestionLevel
+            );
 
-          PushNotificationService.sendCongestionAlert(
-            alert.locationName,
-            alert.distanceText,
-            alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
-            alert.averageSpeedKmh,
-            alert.congestionLevel
-          );
+            PushNotificationService.sendCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
+              alert.averageSpeedKmh,
+              alert.congestionLevel
+            );
+          }
 
           // Proactively check for reroute when a new congestion alert stage triggers
           // Only check if no recommendation is already pending
@@ -18099,30 +18678,51 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         }
       }
 
-      // Dynamic demo phases are tied to route progress, so the conditions change with the journey.
-      if (trafficTestModeRef.current === "dynamic") {
+      // Dynamic demo. PATCH: the congestion zone is anchored (it never moves); only its severity
+      // escalates while the vehicle approaches (moderate -> heavy -> severe), and it is cleared once
+      // the vehicle has driven past the end of the zone. The old code re-stamped a new window
+      // ahead of the vehicle on every phase change, so red stretches jumped ahead or vanished
+      // while the car was still inside them, and "moderate" was never refreshed at all.
+      if (trafficTestModeRef.current === "dynamic" && !testCongestionConsumedRef.current) {
         const phase = dynamicTrafficPhase(scenarioProgress);
         if (phase !== lastDynamicPhaseRef.current) {
           lastDynamicPhaseRef.current = phase;
-          void refreshTrafficScenario(activeRoute, scenarioProgress);
           if (phase === "LOW") {
-            AlertManager.reset();
-            RerouteEngine.dismissRecommendation();
-            setActiveRerouteRecommendation(null);
-            TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
+            // nothing to do: the route was loaded clear
+          } else if (!selectedDestination) {
+            void refreshTrafficScenario(activeRoute, scenarioProgress);
+          } else {
+            // Wait for the refreshed hotspots before deciding what to avoid.
+            void (async () => {
+              const updatedRoute = await refreshTrafficScenario(activeRoute, scenarioProgress);
+              if (!updatedRoute || phase === "MODERATE") return;
+              const remainingRatio = Math.max(0, 1 - scenarioProgress);
+              const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
+              RerouteEngine.checkAndReevaluate(
+                interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
+                remainingSeconds, speedKmh, false /* emergency disabled */, true,
+                trafficTestModeRef.current, scenarioProgress,
+                getUpcomingAvoidHotspots(updatedRoute, newDist),
+                recentRoutesRef.current,
+                !testCongestionConsumedRef.current
+              );
+            })();
           }
-          if ((phase === "HEAVY" || phase === "SEVERE") && selectedDestination) {
-            const remainingRatio = Math.max(0, 1 - scenarioProgress);
-            const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
-            RerouteEngine.checkAndReevaluate(
-              interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
-              remainingSeconds, speedKmh, isEmergencyMode, true,
-              trafficTestModeRef.current, scenarioProgress,
-              getUpcomingAvoidHotspots(activeRoute, newDist),
-              recentRoutesRef.current,
-              !testCongestionConsumedRef.current
-            );
-          }
+        }
+
+        // Clear the scenario after the vehicle has passed the end of the congested stretch.
+        const zoneHotspot = (activeRoute.hotspots || []).find(
+          (h) => h.cause === "Controlled traffic test" && typeof h.zone_end_distance_m === "number"
+        );
+        if (zoneHotspot && !dynamicClearingRef.current && newDist > (zoneHotspot.zone_end_distance_m as number) + 30) {
+          dynamicClearingRef.current = true;
+          void refreshTrafficScenario(activeRoute, 1.0).then(() => {
+            testCongestionConsumedRef.current = true; // no further synthetic traffic this trip
+          });
+          AlertManager.reset();
+          RerouteEngine.dismissRecommendation();
+          setActiveRerouteRecommendation(null);
+          TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
         }
       }
 
@@ -18292,6 +18892,8 @@ export interface ActiveCongestionAlert {
   description: string;
   timestamp: number;
   spoken: boolean;
+  /** True only the first time this hotspot is announced (drives voice + push, once). */
+  firstAnnouncement: boolean;
 }
 
 export type AlertListener = (alert: ActiveCongestionAlert | null) => void;
@@ -18300,6 +18902,7 @@ export class AlertManager {
   private static listeners: Set<AlertListener> = new Set();
   private static activeAlert: ActiveCongestionAlert | null = null;
   private static triggeredStages: Map<string, Set<number>> = new Map();
+  private static announcedHotspots: Set<string> = new Set();
 
   // Distance Thresholds in meters for proactive alert triggers
   public static readonly STAGE_1_THRESHOLD_M = 1200; // 1.2 km heads-up
@@ -18418,6 +19021,12 @@ export class AlertManager {
       this.triggeredStages.set(closestHotspot.hotspot_id, hotspotStages);
     }
 
+    // Voice / push fire ONCE per hotspot (first time it is HEAVY or SEVERE). Later stage changes
+    // (1.2 km -> 500 m -> 200 m) and severity changes only update the on-screen banner.
+    const isAnnounceable = closestHotspot.congestion_level === "HEAVY" || closestHotspot.congestion_level === "SEVERE";
+    const firstAnnouncement = isAnnounceable && !this.announcedHotspots.has(closestHotspot.hotspot_id);
+    if (firstAnnouncement) this.announcedHotspots.add(closestHotspot.hotspot_id);
+
     const alertData: ActiveCongestionAlert = {
       hotspotId: closestHotspot.hotspot_id,
       locationName: closestHotspot.location_name,
@@ -18430,6 +19039,7 @@ export class AlertManager {
       description: closestHotspot.description,
       timestamp: Date.now(),
       spoken: !isNewStage,
+      firstAnnouncement,
     };
 
     this.activeAlert = alertData;
@@ -18476,6 +19086,7 @@ export class AlertManager {
   public static reset() {
     this.activeAlert = null;
     this.triggeredStages.clear();
+    this.announcedHotspots.clear();
     this.notifyListeners();
   }
 }
@@ -18534,6 +19145,9 @@ export interface CongestionHotspot {
   estimated_delay_seconds: number;
   description: string;
   cause: string;
+  // Extent of the congested stretch (only set by the traffic test scenarios).
+  zone_end_distance_m?: number | null;
+  zone_path?: number[][] | null; // [[lon, lat], ...]
 }
 
 export interface CandidateRoute {
@@ -18654,7 +19268,7 @@ export async function fetchRoutes(
       origin_lon: originLon,
       dest_lat: destLat,
       dest_lon: destLon,
-      is_emergency_mode: isEmergencyMode,
+      // EMERGENCY FEATURE DISABLED (commented out, not deleted): is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
       synthetic_traffic_active: syntheticTrafficActive,
@@ -18687,7 +19301,7 @@ export async function evaluateReroute(
       dest_lon: destLon,
       original_remaining_duration_seconds: originalRemainingSeconds,
       avoid_hotspots: avoidHotspots,
-      is_emergency_mode: isEmergencyMode,
+      // EMERGENCY FEATURE DISABLED (commented out, not deleted): is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
       recent_routes: recentRoutes,
@@ -19434,6 +20048,50 @@ export type { TrafficTestMode } from "./api";
 
 export const DEFAULT_TRAFFIC_MODE: TrafficTestMode = "real";
 
+export interface TrafficTestScenario {
+  origin: { lat: number; lon: number; name: string };
+  destination: { lat: number; lon: number; name: string };
+  description: string;
+}
+
+/**
+ * Keep each controlled demo mode on a different real Bengaluru corridor.
+ *
+ * The paths deliberately span different parts of the city so switching the
+ * dropdown does not replay the same source/destination pair for every test.
+ * Heavy / severe / dynamic still use the same controlled-hotspot + avoidance
+ * workflow as before; only the test corridor changes.
+ */
+export const TRAFFIC_TEST_SCENARIOS: Record<Exclude<TrafficTestMode, "real">, TrafficTestScenario> = {
+  // PATCH: corridors shortened to ~5-10 km (the old heavy/severe demos were ~20 km, which made
+  // the test drag on and pushed Whitefield to the edge of the Bengaluru bounding box).
+  normal: {
+    origin: { lat: 13.0354, lon: 77.5988, name: "Hebbal, Bengaluru" },
+    destination: { lat: 13.0280, lon: 77.5400, name: "Yeshwanthpur, Bengaluru" },
+    description: "Hebbal → Yeshwanthpur",
+  },
+  moderate: {
+    origin: { lat: 12.9250, lon: 77.5938, name: "Jayanagar 4th Block, Bengaluru" },
+    destination: { lat: 12.9786, lon: 77.6408, name: "Indiranagar, Bengaluru" },
+    description: "Jayanagar → Indiranagar",
+  },
+  heavy: {
+    origin: { lat: 12.9352, lon: 77.6245, name: "Koramangala, Bengaluru" },
+    destination: { lat: 12.9260, lon: 77.6762, name: "Bellandur, Bengaluru" },
+    description: "Koramangala → Bellandur",
+  },
+  severe: {
+    origin: { lat: 12.9756, lon: 77.6060, name: "MG Road, Bengaluru" },
+    destination: { lat: 12.9177, lon: 77.6233, name: "Silk Board, Bengaluru" },
+    description: "MG Road → Silk Board",
+  },
+  dynamic: {
+    origin: { lat: 12.9786, lon: 77.6421, name: "Indiranagar, Bengaluru" },
+    destination: { lat: 12.9569, lon: 77.7011, name: "Marathahalli, Bengaluru" },
+    description: "Indiranagar → Marathahalli",
+  },
+};
+
 export const TRAFFIC_COLORS: Record<CongestionLevel, string> = {
   LOW: "#16A34A",
   MODERATE: "#EAB308",
@@ -19441,12 +20099,17 @@ export const TRAFFIC_COLORS: Record<CongestionLevel, string> = {
   SEVERE: "#DC2626",
 };
 
+/**
+ * Escalation phase while APPROACHING the (fixed) congestion zone. Must mirror
+ * backend/services/traffic_scenario.py::dynamic_traffic_phase. Clearing is NOT decided here:
+ * the client clears the scenario once the vehicle has driven past the hotspot's
+ * `zone_end_distance_m` (the backend also clears when progress passes the zone end).
+ */
 export function dynamicTrafficPhase(progress: number): CongestionLevel {
-  if (progress < 0.20) return "LOW";
-  if (progress < 0.38) return "MODERATE";
-  if (progress < 0.58) return "HEAVY";
-  if (progress < 0.76) return "SEVERE";
-  return "LOW";
+  if (progress < 0.15) return "LOW";
+  if (progress < 0.28) return "MODERATE";
+  if (progress < 0.40) return "HEAVY";
+  return "SEVERE";
 }
 
 export function isTrafficTestMode(mode: TrafficTestMode): boolean {
@@ -19744,10 +20407,12 @@ export class TTSService {
     let message = `Traffic alert: ${severityText} ahead in ${distanceText} near ${locationName}.`;
     if (speedKmh > 0) message += ` Flow speed is ${Math.round(speedKmh)} kilometers per hour.`;
     if (delayMinutes && delayMinutes >= 2) message += ` Expected delay is ${Math.round(delayMinutes)} minutes.`;
-    if (suggestRerouteOption && (severity === "HEAVY" || severity === "SEVERE")) {
-      message += " A route around this congestion may be available.";
-    }
-    this.announce(message, "normal", `congestion_${severity}_${locationName}`, 20_000);
+    // PATCH: the old suffix ("a route around this may be available") was followed a moment later by
+    // the real reroute announcement, which sounded like the same alert twice. The reroute engine
+    // announces the outcome itself, so the suffix is dropped (param kept for API compatibility).
+    void suggestRerouteOption;
+    // PATCH: key is per location only (not per severity/stage) so escalations cannot re-trigger it.
+    this.announce(message, "normal", `congestion_${locationName}`, 120_000);
   }
 
   public static speakRerouteSuggestion(

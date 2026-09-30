@@ -99,18 +99,19 @@ class CongestionDetector:
                 prediction_offset_min=prediction_offset_min
             )
 
-            # In emergency mode, emergency vehicles experience lower baseline congestion
-            if is_emergency_mode:
-                traffic_factors["current_speed_kmh"] = min(
-                    traffic_factors["freeflow_speed_kmh"], 
-                    traffic_factors["current_speed_kmh"] * 1.5 + 10.0
-                )
-                if traffic_factors["congestion_level"] == CongestionLevel.SEVERE.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.HEAVY.value
-                elif traffic_factors["congestion_level"] == CongestionLevel.HEAVY.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.MODERATE.value
-                elif traffic_factors["congestion_level"] == CongestionLevel.MODERATE.value:
-                    traffic_factors["congestion_level"] = CongestionLevel.LOW.value
+            # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+            #             # In emergency mode, emergency vehicles experience lower baseline congestion
+            #             if is_emergency_mode:
+            #                 traffic_factors["current_speed_kmh"] = min(
+            #                     traffic_factors["freeflow_speed_kmh"], 
+            #                     traffic_factors["current_speed_kmh"] * 1.5 + 10.0
+            #                 )
+            #                 if traffic_factors["congestion_level"] == CongestionLevel.SEVERE.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.HEAVY.value
+            #                 elif traffic_factors["congestion_level"] == CongestionLevel.HEAVY.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.MODERATE.value
+            #                 elif traffic_factors["congestion_level"] == CongestionLevel.MODERATE.value:
+            #                     traffic_factors["congestion_level"] = CongestionLevel.LOW.value
 
             current_speed_kmh = max(5.0, traffic_factors["current_speed_kmh"])
             freeflow_speed_kmh = max(20.0, traffic_factors["freeflow_speed_kmh"])

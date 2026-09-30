@@ -63,9 +63,17 @@ export const TrafficLegend: React.FC<TrafficLegendProps> = ({ placement = "navig
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                   <span className="w-3 h-3 rounded-full bg-emerald-500 shadow-sm" />
-                  <span className="font-bold text-slate-700">Clear Flow</span>
+                  <span className="font-bold text-slate-700">AI Route · Clear</span>
                 </div>
                 <span className="text-xs text-slate-500 font-medium">≥ 80% freeflow</span>
+              </div>
+
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="w-3 h-3 rounded-full bg-blue-600 shadow-sm" />
+                  <span className="font-bold text-slate-700">OSRM Route · Clear</span>
+                </div>
+                <span className="text-xs text-slate-500 font-medium">alternate</span>
               </div>
 
               <div className="flex items-center justify-between">

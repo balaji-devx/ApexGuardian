@@ -47,6 +47,9 @@ export interface CongestionHotspot {
   estimated_delay_seconds: number;
   description: string;
   cause: string;
+  // Extent of the congested stretch (only set by the traffic test scenarios).
+  zone_end_distance_m?: number | null;
+  zone_path?: number[][] | null; // [[lon, lat], ...]
 }
 
 export interface CandidateRoute {
@@ -167,7 +170,7 @@ export async function fetchRoutes(
       origin_lon: originLon,
       dest_lat: destLat,
       dest_lon: destLon,
-      is_emergency_mode: isEmergencyMode,
+      // EMERGENCY FEATURE DISABLED (commented out, not deleted): is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
       synthetic_traffic_active: syntheticTrafficActive,
@@ -200,7 +203,7 @@ export async function evaluateReroute(
       dest_lon: destLon,
       original_remaining_duration_seconds: originalRemainingSeconds,
       avoid_hotspots: avoidHotspots,
-      is_emergency_mode: isEmergencyMode,
+      // EMERGENCY FEATURE DISABLED (commented out, not deleted): is_emergency_mode: isEmergencyMode,
       traffic_test_mode: trafficTestMode,
       traffic_progress: trafficProgress,
       recent_routes: recentRoutes,

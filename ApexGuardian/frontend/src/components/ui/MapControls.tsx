@@ -4,7 +4,7 @@ import React, { useState } from "react";
 import { Plus, Minus, Target, Layers, Siren } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
 import { mapRefContainer } from "@/components/map/MapCanvas";
-import { TrafficTestMode } from "@/lib/trafficScenario";
+import { TrafficTestMode, TRAFFIC_TEST_SCENARIOS } from "@/lib/trafficScenario";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
 export const MapControls: React.FC = () => {
@@ -91,7 +91,11 @@ export const MapControls: React.FC = () => {
             <option value="severe">Severe Congestion</option>
             <option value="dynamic">Dynamic Congestion</option>
           </select>
-          {trafficTestMode !== "real" && <p className="mt-1 text-[10px] leading-tight text-slate-500">Controlled Indiranagar → Marathahalli test</p>}
+          {trafficTestMode !== "real" && (
+            <p className="mt-1 text-[10px] leading-tight text-slate-500">
+              Controlled {TRAFFIC_TEST_SCENARIOS[trafficTestMode].description} test
+            </p>
+          )}
         </div>
 
         <div className="glass-panel rounded-full p-1 flex flex-col gap-1 shadow-lg">
@@ -136,6 +140,7 @@ export const MapControls: React.FC = () => {
           <Layers className="w-5 h-5" />
         </button>
 
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
         <button
           onClick={toggleEmergencyMode}
           title={isEmergencyMode ? "Emergency Mode Active (Ambulance Priority)" : "Enable Emergency / Ambulance Mode"}
@@ -147,6 +152,7 @@ export const MapControls: React.FC = () => {
         >
           <Siren className="w-5 h-5" />
         </button>
+        */}
       </div>
     </>
   );

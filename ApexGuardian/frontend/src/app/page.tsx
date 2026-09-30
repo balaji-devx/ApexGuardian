@@ -75,12 +75,14 @@ export default function Home() {
 
       {/* Top-Right Backend Health & Mode Status Badges */}
       <div className="fixed top-4 right-4 flex items-center gap-2 pointer-events-auto" style={{ zIndex: OVERLAY_Z.statusBadge }}>
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
         {isEmergencyMode && (
           <div className="glass-panel px-3.5 py-2 rounded-full flex items-center gap-2 shadow-lg text-xs font-black text-rose-600 border border-rose-500/50 bg-rose-50/95 animate-pulse">
             <Siren className="w-3.5 h-3.5 fill-current" />
             <span className="tracking-wide uppercase">Emergency Mode</span>
           </div>
         )}
+        */}
 
         <div className="glass-panel px-3.5 py-2 rounded-full flex items-center gap-2 shadow-lg text-xs font-semibold">
           <div className="w-6 h-6 rounded-full bg-blue-600/10 flex items-center justify-center text-blue-600">

@@ -123,7 +123,8 @@ export const FloatingSearchPanel: React.FC = () => {
             : "border-slate-200/80"
         }`}
       >
-        {/* Emergency Mode Toggle Banner */}
+        {/* EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+
         <div className="flex items-center justify-between pb-1 border-b border-slate-200/60">
           <div className="flex items-center gap-2">
             <span
@@ -159,6 +160,7 @@ export const FloatingSearchPanel: React.FC = () => {
             />
           </button>
         </div>
+        */}
 
         {/* Source Input */}
         <div

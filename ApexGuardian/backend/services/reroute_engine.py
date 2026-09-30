@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 import uuid
@@ -204,6 +205,53 @@ def _routes_have_same_geometry(candidate_coords: List[List[float]], active_coord
             return False
         search_from_index = closest_index
         
+    return True
+
+
+# A route is considered "inside" a zone sample when it passes this close to it.
+ZONE_SAMPLE_MIN_RADIUS_KM = 0.06
+# Samples this close to the vehicle are under/behind it and cannot be avoided; ignoring them
+# is what stops "No alternate route" when the driver is already at the edge of the jam.
+ZONE_IGNORE_NEAR_VEHICLE_M = 150.0
+# Avoidance detour caps (a "bypass" that adds 20+ min is not a bypass).
+MAX_EXTRA_SECONDS_ABS = 15 * 60.0
+MAX_EXTRA_FRACTION = 0.35
+MIN_EXTRA_ALLOWANCE_S = 4 * 60.0
+MAX_DIST_RATIO_VS_DIRECT = 2.0
+MAX_DIST_EXTRA_M = 1500.0
+
+
+def _usable_avoid_zones(
+    avoid_hotspots: Optional[Sequence[Dict[str, float]]], current_lat: float, current_lon: float
+) -> List[Dict[str, float]]:
+    zones: List[Dict[str, float]] = []
+    for zone in avoid_hotspots or []:
+        try:
+            lat, lon = float(zone["lat"]), float(zone["lon"])
+            radius_km = float(zone.get("radius_km", ZONE_SAMPLE_MIN_RADIUS_KM))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(lat) and math.isfinite(lon) and math.isfinite(radius_km)):
+            continue
+        if haversine_distance_m(current_lon, current_lat, lon, lat) <= ZONE_IGNORE_NEAR_VEHICLE_M:
+            continue
+        zones.append({"lat": lat, "lon": lon, "radius_km": max(0.03, radius_km)})
+    return zones
+
+
+def _avoidance_detour_allowed(
+    route: "CandidateRoute", reference_duration_s: float, direct_distance_m: float
+) -> bool:
+    """Reject 'clean' routes that are absurdly longer than what the driver already has."""
+    if reference_duration_s > 0:
+        allowance = min(
+            MAX_EXTRA_SECONDS_ABS,
+            max(MIN_EXTRA_ALLOWANCE_S, MAX_EXTRA_FRACTION * reference_duration_s),
+        )
+        if route.predicted_duration_seconds > reference_duration_s + allowance:
+            return False
+    if route.distance_meters > MAX_DIST_RATIO_VS_DIRECT * direct_distance_m + MAX_DIST_EXTRA_M:
+        return False
     return True
 
 
@@ -424,9 +472,14 @@ class DynamicRerouteEngine:
 
             # Emergency routing is defined as the physical fastest path; congestion
             # avoidance must not divert an emergency vehicle from that path.
-            zones = [] if is_emergency_mode else list(avoid_hotspots or [])
+            # EMERGENCY FEATURE DISABLED: zones = [] if is_emergency_mode else list(avoid_hotspots or [])
+            zones = _usable_avoid_zones(avoid_hotspots, current_lat, current_lon)
             try:
-                raw_candidates = await OSRMService.get_routes(current_lat, current_lon, dest_lat, dest_lon)
+                # ensure_alternatives=False: this runs every few seconds while driving; do not
+                # spend extra OSRM probe requests here (the bypass logic below does its own).
+                raw_candidates = await OSRMService.get_routes(
+                    current_lat, current_lon, dest_lat, dest_lon, ensure_alternatives=False
+                )
             except Exception as error:
                 logger.warning("Native OSRM alternatives unavailable: %s", error)
                 raw_candidates = []
@@ -450,89 +503,83 @@ class DynamicRerouteEngine:
             bypass_routes: List[CandidateRoute] = []
 
             if zones and not clean_routes:
-                valid_zones = []
-                for zone in zones:
+                # Aim the bypass at the middle of the affected stretch.
+                mid = zones[len(zones) // 2]
+                hotspot_lat, hotspot_lon = mid["lat"], mid["lon"]
+                zone_radius_m = max(ZONE_SAMPLE_MIN_RADIUS_KM * 1000.0, mid["radius_km"] * 1000.0)
+
+                local_bearing = None
+                for candidate in processed:
+                    coords = (
+                        candidate.geometry.get("coordinates", [])
+                        if isinstance(candidate.geometry, dict)
+                        else []
+                    )
+                    local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
+                    if local_bearing is not None:
+                        break
+                approach_bearing = (
+                    local_bearing
+                    if local_bearing is not None
+                    else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
+                )
+                # Waypoints on BOTH sides of the road, far enough out to clear the jam
+                # (radius + margin), nearest detour first.  Probe several in parallel and keep
+                # the FASTEST clean result instead of the first one that merely avoids the zone.
+                offsets_km = [(zone_radius_m + margin) / 1000.0 for margin in (250.0, 600.0, 1100.0)]
+                candidate_waypoints = sorted(
+                    (
+                        compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
+                        for bearing in (approach_bearing, approach_bearing + 180.0)
+                        for offset in offsets_km
+                    ),
+                    key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
+                    + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
+                )
+
+                async def _probe(via_waypoint: Tuple[float, float]) -> List[CandidateRoute]:
                     try:
-                        lat, lon = float(zone["lat"]), float(zone["lon"])
-                        if math.isfinite(lat) and math.isfinite(lon):
-                            valid_zones.append((lat, lon))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-
-                if valid_zones:
-                    hotspot_lat, hotspot_lon = min(
-                        valid_zones,
-                        key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
-                        + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
-                    )
-                    # Use the bearing of the road itself at the hotspot (derived from
-                    # the nearest already-fetched route's own geometry), not the
-                    # crude straight-line bearing from wherever the vehicle currently
-                    # is all the way to the final destination — those two bearings
-                    # can differ by 90 degrees or more on any route with real turns,
-                    # which used to place the bypass waypoint along the congested
-                    # road instead of across it.
-                    local_bearing = None
-                    for candidate in processed:
-                        coords = (
-                            candidate.geometry.get("coordinates", [])
-                            if isinstance(candidate.geometry, dict)
-                            else []
+                        bypass_candidates = await OSRMService.get_routes_via_waypoints(
+                            [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
                         )
-                        local_bearing = _local_route_bearing_near_point(coords, hotspot_lat, hotspot_lon)
-                        if local_bearing is not None:
-                            break
-                    approach_bearing = (
-                        local_bearing
-                        if local_bearing is not None
-                        else _bearing_degrees(current_lat, current_lon, dest_lat, dest_lon)
-                    )
-                    # Try both sides of the road, at a couple of offsets, closest
-                    # candidate (by detour length) first — stop at the first one
-                    # that actually produces a route avoiding the zone. The old
-                    # code tried exactly one waypoint (whichever side was closer
-                    # to the direct line) and gave up entirely if OSRM couldn't
-                    # route through that single point or routed back through the
-                    # same corridor — in dense urban grids that single guess
-                    # missing is the common case, not the exception.
-                    candidate_waypoints = sorted(
-                        (
-                            compute_bypass_waypoint(hotspot_lat, hotspot_lon, bearing, offset_km=offset)
-                            for bearing in (approach_bearing, approach_bearing + 180.0)
-                            for offset in (0.3, 0.6, 1.0)
-                        ),
-                        key=lambda point: haversine_distance_m(current_lon, current_lat, point[1], point[0])
-                        + haversine_distance_m(point[1], point[0], dest_lon, dest_lat),
-                    )
+                        return cls._score_and_process(
+                            bypass_candidates,
+                            current_lat,
+                            current_lon,
+                            dest_lat,
+                            dest_lon,
+                            direct_distance_m,
+                            is_emergency_mode,
+                            traffic_test_mode,
+                            traffic_progress,
+                            synthetic_traffic_active,
+                        )
+                    except Exception as error:
+                        logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
+                        return []
 
-                    for via_waypoint in candidate_waypoints:
-                        try:
-                            bypass_candidates = await OSRMService.get_routes_via_waypoints(
-                                [(current_lat, current_lon), via_waypoint, (dest_lat, dest_lon)]
-                            )
-                            bypass_routes = cls._score_and_process(
-                                bypass_candidates,
-                                current_lat,
-                                current_lon,
-                                dest_lat,
-                                dest_lon,
-                                direct_distance_m,
-                                is_emergency_mode,
-                                traffic_test_mode,
-                                traffic_progress,
-                                synthetic_traffic_active,
-                            )
-                        except Exception as error:
-                            logger.warning("Waypoint bypass routing failed for %s: %s", via_waypoint, error)
-                            continue
+                for batch_start in range(0, len(candidate_waypoints), 3):
+                    batch = candidate_waypoints[batch_start:batch_start + 3]
+                    results = await asyncio.gather(*[_probe(wp) for wp in batch])
+                    for probed in results:
+                        bypass_routes.extend(probed)
+                    clean_bypass_routes = [
+                        route for route in bypass_routes
+                        if not route_intersects_avoid_hotspots(route.geometry, zones)
+                        and _avoidance_detour_allowed(
+                            route, original_remaining_duration_s, direct_distance_m
+                        )
+                    ]
+                    if clean_bypass_routes:
+                        clean_routes.extend(clean_bypass_routes)
+                        break
 
-                        clean_bypass_routes = [
-                            route for route in bypass_routes
-                            if not route_intersects_avoid_hotspots(route.geometry, zones)
-                        ]
-                        if clean_bypass_routes:
-                            clean_routes.extend(clean_bypass_routes)
-                            break
+            # Native alternatives that avoid the zone must obey the same detour caps.
+            if zones:
+                clean_routes = [
+                    route for route in clean_routes
+                    if _avoidance_detour_allowed(route, original_remaining_duration_s, direct_distance_m)
+                ]
 
             # Avoidance is a route-intent request, not a faster-route request. Never
             # recommend a dirty fallback when the user explicitly asked to avoid zones.
@@ -546,7 +593,7 @@ class DynamicRerouteEngine:
                     recommended_duration_seconds=original_remaining_duration_s,
                     recommended_route=None,
                     alternative_routes=[],
-                    reason="No alternate route avoids this stretch — continuing on the only available path.",
+                    reason="No reasonable detour avoids this stretch (any bypass would add too much time) — staying on the current route.",
                 )
 
             # Filter out candidates that are too similar to recently rejected/used routes

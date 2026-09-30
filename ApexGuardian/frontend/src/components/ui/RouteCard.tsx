@@ -28,6 +28,7 @@ export const RouteCard: React.FC = () => {
     setIsNavigating,
     isLoadingRoutes,
     isEmergencyMode,
+    trafficTestMode,
   } = useNavigation();
 
   if (isLoadingRoutes) {
@@ -58,17 +59,17 @@ export const RouteCard: React.FC = () => {
 
   const distanceKm = (currentRoute.distance_meters / 1000).toFixed(1);
   const isAIRoute = Boolean(currentRoute.is_ai_recommended);
+  const isOsrmPreferredRealRoute =
+    trafficTestMode === "real" && currentRoute.original_route_index === 0 && !isAIRoute;
 
   // Format user-friendly route label
-  let routeLabel = currentRoute.recommendation_label;
+  let routeLabel = isOsrmPreferredRealRoute ? "OSRM Preferred Route" : currentRoute.recommendation_label;
   if (!routeLabel) {
     if (isAIRoute) {
       routeLabel = isEmergencyMode ? "Emergency Priority Corridor" : "Recommended Route";
     } else {
       routeLabel = "Standard Route";
     }
-  } else if (routeLabel === "OSRM Preferred Route") {
-    routeLabel = "Standard Route";
   } else if (routeLabel === "AI Recommended") {
     routeLabel = "Recommended Route";
   }
@@ -314,15 +315,15 @@ export const RouteCard: React.FC = () => {
                 const dist = (r.distance_meters / 1000).toFixed(1);
                 const isSelected = idx === activeRouteIndex;
                 const isAI = Boolean(r.is_ai_recommended);
-                let labelText = r.recommendation_label;
+                const isOsrmPreferred =
+                  trafficTestMode === "real" && r.original_route_index === 0 && !isAI;
+                let labelText = isOsrmPreferred ? "OSRM Preferred Route" : r.recommendation_label;
                 if (!labelText) {
                   if (isAI) {
                     labelText = isEmergencyMode ? "Emergency Priority" : "Recommended Route";
                   } else {
                     labelText = "Standard Route";
                   }
-                } else if (labelText === "OSRM Preferred Route") {
-                  labelText = "Standard Route";
                 } else if (labelText === "AI Recommended") {
                   labelText = "Recommended Route";
                 }

@@ -30,7 +30,8 @@ class RouteRequest(BaseModel):
     origin_lon: float
     dest_lat: float
     dest_lon: float
-    is_emergency_mode: bool = False
+    # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+    # is_emergency_mode: bool = False
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -64,6 +65,9 @@ class CongestionHotspot(BaseModel):
     estimated_delay_seconds: float = 0.0
     description: str = ""
     cause: str = "High Vehicle Volume / Choke Point"
+    # Optional extent of the congested stretch (populated by the traffic test scenarios).
+    zone_end_distance_m: Optional[float] = None
+    zone_path: Optional[List[List[float]]] = None  # [[lon, lat], ...] along the affected stretch
 
 class CandidateRoute(BaseModel):
     """Complete candidate route with ML scoring and segmented traffic breakdown."""
@@ -127,7 +131,8 @@ class RerouteRequest(BaseModel):
     original_route_index: int = 0
     original_remaining_duration_seconds: float = 0.0
     avoid_hotspots: List[Dict[str, float]] = Field(default_factory=list)
-    is_emergency_mode: bool = False
+    # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
+    # is_emergency_mode: bool = False
     # Real traffic data is the production default; test modes are opt-in via the frontend dropdown only.
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)

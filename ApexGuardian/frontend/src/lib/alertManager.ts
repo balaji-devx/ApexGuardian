@@ -12,6 +12,8 @@ export interface ActiveCongestionAlert {
   description: string;
   timestamp: number;
   spoken: boolean;
+  /** True only the first time this hotspot is announced (drives voice + push, once). */
+  firstAnnouncement: boolean;
 }
 
 export type AlertListener = (alert: ActiveCongestionAlert | null) => void;
@@ -20,6 +22,7 @@ export class AlertManager {
   private static listeners: Set<AlertListener> = new Set();
   private static activeAlert: ActiveCongestionAlert | null = null;
   private static triggeredStages: Map<string, Set<number>> = new Map();
+  private static announcedHotspots: Set<string> = new Set();
 
   // Distance Thresholds in meters for proactive alert triggers
   public static readonly STAGE_1_THRESHOLD_M = 1200; // 1.2 km heads-up
@@ -138,6 +141,12 @@ export class AlertManager {
       this.triggeredStages.set(closestHotspot.hotspot_id, hotspotStages);
     }
 
+    // Voice / push fire ONCE per hotspot (first time it is HEAVY or SEVERE). Later stage changes
+    // (1.2 km -> 500 m -> 200 m) and severity changes only update the on-screen banner.
+    const isAnnounceable = closestHotspot.congestion_level === "HEAVY" || closestHotspot.congestion_level === "SEVERE";
+    const firstAnnouncement = isAnnounceable && !this.announcedHotspots.has(closestHotspot.hotspot_id);
+    if (firstAnnouncement) this.announcedHotspots.add(closestHotspot.hotspot_id);
+
     const alertData: ActiveCongestionAlert = {
       hotspotId: closestHotspot.hotspot_id,
       locationName: closestHotspot.location_name,
@@ -150,6 +159,7 @@ export class AlertManager {
       description: closestHotspot.description,
       timestamp: Date.now(),
       spoken: !isNewStage,
+      firstAnnouncement,
     };
 
     this.activeAlert = alertData;
@@ -196,6 +206,7 @@ export class AlertManager {
   public static reset() {
     this.activeAlert = null;
     this.triggeredStages.clear();
+    this.announcedHotspots.clear();
     this.notifyListeners();
   }
 }
