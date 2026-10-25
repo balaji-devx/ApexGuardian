@@ -20,3 +20,4 @@ dist/
 # Logs & Diagnostics
 *.log
 debug_*.py
+ApexGuardian/backend/ml/datasets/cbe/csv-traffic-coimbatore.csv
