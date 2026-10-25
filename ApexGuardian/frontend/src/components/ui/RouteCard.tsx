@@ -4,6 +4,8 @@ import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Navigation,
+  MapPin,
+  PlayCircle,
   ShieldCheck,
   ArrowRight,
   Loader2,
@@ -15,7 +17,6 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
-import { TTSService } from "@/lib/ttsService";
 
 export const RouteCard: React.FC = () => {
   const [showHotspotList, setShowHotspotList] = useState(false);
@@ -25,7 +26,10 @@ export const RouteCard: React.FC = () => {
     setActiveRouteIndex,
     selectedDestination,
     isNavigating,
-    setIsNavigating,
+    startNavigation,
+    stopNavigation,
+    gpsStatus,
+    gpsError,
     isLoadingRoutes,
     isEmergencyMode,
     trafficTestMode,
@@ -405,37 +409,52 @@ export const RouteCard: React.FC = () => {
           </div>
         )}
 
-        {/* CTA Button */}
-        <button
-          onClick={() => {
-            if (isNavigating) {
-              TTSService.reset();
-              setIsNavigating(false);
-            } else {
-              TTSService.warmUp();
-              setIsNavigating(true);
-            }
-          }}
-          className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 ${
-            isNavigating
-              ? "bg-rose-700 hover:bg-rose-800 text-white shadow-rose-700/30"
-              : isEmergencyMode
-              ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white shadow-rose-600/30"
-              : isAIRoute
-              ? "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/30"
-              : "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/30"
-          }`}
-        >
-          {isEmergencyMode ? <Siren className="w-4 h-4" /> : <Navigation className="w-4 h-4 fill-current" />}
-          <span>
-            {isNavigating
-              ? "End Active Navigation"
-              : isEmergencyMode
-              ? "Start Priority Navigation"
-              : "Start Smart Navigation"}
-          </span>
-          <ArrowRight className="w-4 h-4 ml-auto" />
-        </button>
+        {/* Journey startup: GPS and simulation are explicit, mutually exclusive modes. */}
+        {isNavigating ? (
+          <button
+            type="button"
+            onClick={stopNavigation}
+            className="w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 bg-rose-700 hover:bg-rose-800 text-white shadow-rose-700/30"
+          >
+            <Navigation className="w-4 h-4" />
+            <span>End Active Navigation</span>
+            <ArrowRight className="w-4 h-4 ml-auto" />
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => void startNavigation("gps")}
+              disabled={gpsStatus === "locating" || isLoadingRoutes}
+              className="w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-60 bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/30"
+            >
+              {gpsStatus === "locating" ? <Loader2 className="w-4 h-4 animate-spin" /> : <MapPin className="w-4 h-4" />}
+              <span>{gpsStatus === "locating" ? "Getting GPS Location…" : "Start with GPS"}</span>
+              <ArrowRight className="w-4 h-4 ml-auto" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void startNavigation("simulation")}
+              disabled={gpsStatus === "locating" || isLoadingRoutes}
+              className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-60 ${
+                isEmergencyMode
+                  ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white shadow-rose-600/30"
+                  : isAIRoute
+                  ? "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/30"
+                  : "bg-slate-800 hover:bg-slate-900 text-white shadow-slate-800/30"
+              }`}
+            >
+              <PlayCircle className="w-4 h-4" />
+              <span>Start Simulation</span>
+              <ArrowRight className="w-4 h-4 ml-auto" />
+            </button>
+            {gpsError && (
+              <p role="status" className={`rounded-lg border px-3 py-2 text-xs font-medium ${gpsStatus === "error" ? "border-rose-200 bg-rose-50 text-rose-700" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`}>
+                {gpsError}
+              </p>
+            )}
+          </div>
+        )}
       </motion.div>
     </AnimatePresence>
   );

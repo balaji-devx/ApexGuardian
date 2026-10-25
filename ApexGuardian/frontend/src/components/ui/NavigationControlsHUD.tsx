@@ -26,7 +26,11 @@ import { OVERLAY_Z } from "@/lib/layoutZones";
 export const NavigationControlsHUD: React.FC = () => {
   const {
     isNavigating,
-    setIsNavigating,
+    navigationMode,
+    gpsStatus,
+    gpsAccuracyMeters,
+    gpsError,
+    stopNavigation,
     currentVehicleSpeed,
     simProgressPercent,
     simDistanceRemainingM,
@@ -139,6 +143,23 @@ export const NavigationControlsHUD: React.FC = () => {
           </div>
         </div>
 
+        <div className="flex items-center justify-between gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-300">
+          <span className={navigationMode === "gps" ? "text-emerald-300" : "text-blue-300"}>
+            {navigationMode === "gps" ? "GPS Navigation" : "Simulation Mode"}
+          </span>
+          {navigationMode === "gps" && (
+            <span aria-live="polite" className={gpsStatus === "tracking" ? "text-emerald-300" : gpsStatus === "arrived" ? "text-blue-200" : "text-amber-300"}>
+              {gpsStatus === "arrived" ? "Arrived" : gpsStatus === "tracking" ? `GPS ±${Math.round(gpsAccuracyMeters || 0)} m` : gpsStatus === "rerouting" ? "Recalculating route" : "GPS signal weak"}
+            </span>
+          )}
+        </div>
+
+        {navigationMode === "gps" && gpsError && (
+          <p role="status" className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-[11px] font-medium text-amber-100">
+            {gpsError}
+          </p>
+        )}
+
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
           <div
             className={`h-full transition-all duration-300 ${isEmergencyMode ? "bg-rose-500" : "bg-emerald-500"}`}
@@ -160,6 +181,7 @@ export const NavigationControlsHUD: React.FC = () => {
             </div>
 
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
+              {navigationMode === "simulation" ? (
               <div className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
                 <button
                   onClick={() => setIsSimPlaying(!isSimPlaying)}
@@ -176,6 +198,11 @@ export const NavigationControlsHUD: React.FC = () => {
                   <FastForward className="h-3.5 w-3.5" /> <span>{simSpeedMultiplier}x</span>
                 </button>
               </div>
+            ) : (
+              <div className="rounded-xl border border-emerald-500/30 bg-emerald-600/15 px-3 py-2 text-xs font-bold text-emerald-200">
+                Live device location
+              </div>
+            )}
 
               <button
                 onClick={handleToggleVoice}
@@ -197,8 +224,7 @@ export const NavigationControlsHUD: React.FC = () => {
 
               <button
                 onClick={() => {
-                  TTSService.reset();
-                  setIsNavigating(false);
+                  stopNavigation();
                 }}
                 className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-bold text-slate-200 hover:bg-rose-900/60 hover:text-rose-100"
               >
