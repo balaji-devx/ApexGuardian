@@ -59,16 +59,22 @@ def _hav(a: List[float], b: List[float]) -> float:
     return 2 * r * math.atan2(math.sqrt(h), math.sqrt(1 - h))
 
 
-def compute_scenario_zone(total_distance_m: float) -> Tuple[float, float]:
-    """Return (zone_start_m, zone_end_m) along the route."""
+def compute_scenario_zone(
+    total_distance_m: float,
+    zone_start_ratio: float = ZONE_START_RATIO,
+    zone_length_m: float | None = None,
+) -> Tuple[float, float]:
+    """Return the controlled congestion stretch, optionally at a planned safe window."""
     total = max(1.0, total_distance_m)
-    length = max(ZONE_MIN_LEN_M, min(ZONE_MAX_LEN_M, 0.10 * total))
+    if zone_length_m is None:
+        length = max(ZONE_MIN_LEN_M, min(ZONE_MAX_LEN_M, 0.10 * total))
+    else:
+        length = max(ZONE_MIN_LEN_M, min(ZONE_MAX_LEN_M, float(zone_length_m)))
     length = min(length, ZONE_MAX_ROUTE_FRACTION * total)
-    start = ZONE_START_RATIO * total
+    start = max(0.0, min(1.0, float(zone_start_ratio))) * total
     if start + length > total - 100.0:
         start = max(0.0, total - 100.0 - length)
     return start, start + length
-
 
 def dynamic_traffic_phase(progress: float, zone_end_ratio: float = 1.0) -> CongestionLevel:
     """Severity as the vehicle approaches the (fixed) zone; LOW once it has passed it."""
@@ -135,7 +141,10 @@ def _sample_zone_path(zone_segments: List[Dict[str, Any]]) -> List[List[float]]:
 
 
 def apply_traffic_test_scenario(
-    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0, synthetic_traffic_active: bool = True
+    analysis: Dict[str, Any], mode: TrafficTestMode, progress: float = 0.0,
+    synthetic_traffic_active: bool = True,
+    zone_start_ratio: float = ZONE_START_RATIO,
+    zone_length_m: float | None = None,
 ) -> Dict[str, Any]:
     """Apply controlled debug traffic to analyzed road segments, never to route geometry."""
     if mode == TrafficTestMode.REAL or not synthetic_traffic_active:
@@ -145,7 +154,7 @@ def apply_traffic_test_scenario(
     if not segments:
         return analysis
     total_distance = sum(s["distance_meters"] for s in segments) or 1.0
-    zone_start, zone_end = compute_scenario_zone(total_distance)
+    zone_start, zone_end = compute_scenario_zone(total_distance, zone_start_ratio, zone_length_m)
 
     if mode == TrafficTestMode.DYNAMIC:
         phase = dynamic_traffic_phase(progress, zone_end / total_distance)
@@ -173,7 +182,8 @@ def apply_traffic_test_scenario(
     for segment in segments:
         distance = segment["distance_meters"]
         center = along + distance / 2.0
-        in_zone = phase != CongestionLevel.LOW and zone_start - 0.5 <= center <= zone_end + 0.5
+        inside_zone = zone_start - 0.5 <= center <= zone_end + 0.5
+        in_zone = phase != CongestionLevel.LOW and inside_zone
         level = phase if in_zone else CongestionLevel.LOW
         ratio = SCENARIO_SPEED_RATIO[level]
         freeflow_speed = max(20.0, segment.get("freeflow_speed_kmh", 45.0))

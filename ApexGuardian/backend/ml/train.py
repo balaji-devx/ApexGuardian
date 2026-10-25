@@ -8,9 +8,10 @@ import numpy as np
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from ml.dataset import TrafficDataPipeline
+from core.region import get_region
 
 WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "weights")
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "congestion_model_v3_fixed.pkl")
+MODEL_PATH = os.path.join(WEIGHTS_DIR, get_region().model_filename)
 
 def train_and_evaluate():
     """Trains XGBoost Regressor for Congestion Factor and saves model weights."""
@@ -24,13 +25,21 @@ def train_and_evaluate():
     print(f"Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
     print(f"Features: {feature_names}")
     
-    model = xgb.XGBRegressor(
-        n_estimators=100, 
-        max_depth=6, 
-        learning_rate=0.05, 
-        random_state=42, 
-        n_jobs=-1
-    )
+    # Preserve the original Bengaluru training parameters exactly. For the much larger
+    # Coimbatore synthetic dataset, use histogram trees and two worker threads to reduce
+    # peak RAM/CPU pressure on typical student laptops.
+    model_kwargs = {
+        "n_estimators": 100,
+        "max_depth": 6,
+        "learning_rate": 0.05,
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+    region = get_region()
+    if region.key == "coimbatore":
+        model_kwargs["tree_method"] = "hist"
+        model_kwargs["n_jobs"] = min(2, os.cpu_count() or 1)
+    model = xgb.XGBRegressor(**model_kwargs)
     model.fit(X_train, y_train)
     
     val_preds = model.predict(X_val)

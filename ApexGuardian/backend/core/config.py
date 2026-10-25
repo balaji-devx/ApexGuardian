@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Apex Guardian API"
     API_V1_STR: str = "/api/v1"
     PORT: int = 8000
+    ACTIVE_REGION: str = "bengaluru"   # "bengaluru" | "coimbatore"
     ENVIRONMENT: str = "development"
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
     OSRM_BASE_URL: str = "https://router.project-osrm.org"

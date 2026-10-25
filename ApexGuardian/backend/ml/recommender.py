@@ -3,6 +3,7 @@ from typing import List, Dict, Any
 from datetime import datetime, timezone, timedelta
 
 from ml.route_model import predictor as congestion_predictor
+from core.region import get_region
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
@@ -19,15 +20,8 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 class RouteScorer:
     """Evaluates multiple route candidates by fetching the Congestion Factor."""
     
-    KNOWN_CORNERS = [
-        (12.9514, 77.6590), # Example Indiranagar/Old Airport Road area
-        (12.9345, 77.6200), # Koramangala
-        (13.1989, 77.7069), # Airport
-        (12.9716, 77.5946), # MG Road
-        (12.9279, 77.6271), # Silk Board
-        (12.9698, 77.7499), # Whitefield
-        (13.0354, 77.5988), # Hebbal
-    ]
+    # Region-specific "historically covered" anchors (see core/region.py).
+    KNOWN_CORNERS = get_region().coverage_anchors()
     
     @classmethod
     def determine_coverage(cls, origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float) -> str:

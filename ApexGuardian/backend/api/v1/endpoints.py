@@ -4,7 +4,7 @@ import uuid
 import math
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Body
-from core.region import BengaluruRegionManager
+from core.region import get_region
 from schemas.navigation import (
     LocationSearchResponse, 
     RouteRequest, 
@@ -14,7 +14,8 @@ from schemas.navigation import (
     TrafficFactorData,
     RerouteRequest,
     RerouteRecommendation,
-    PushNotificationPayload
+    PushNotificationPayload,
+    TrafficTestMode,
 )
 from services.nominatim import NominatimService
 from services.osrm import OSRMService
@@ -24,6 +25,7 @@ from services.reroute_engine import DynamicRerouteEngine
 from services.notification_service import PushNotificationService
 from services.route_selection import rank_processed_routes
 from services.traffic_scenario import apply_traffic_test_scenario
+from services.controlled_bypass_planner import plan_controlled_bypass, build_controlled_bypass_candidates
 from ml.recommender import RouteScorer
 
 logger = logging.getLogger("apexguardian.api")
@@ -33,7 +35,9 @@ router = APIRouter()
 async def health_check():
     return {
         "status": "online",
-        "region": "Bengaluru",
+        "region": get_region().display_name,
+        "region_key": get_region().key,
+        "training_data_is_synthetic": get_region().data_is_synthetic,
         "features": [
             "congestion_point_identification",
             "real_time_traffic_factors",
@@ -80,13 +84,13 @@ async def reverse_geocode(lat: float = Query(..., description="Latitude"), lon: 
 @router.post("/route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
     """Calculates driving routes with ML scoring, multi-colored congestion segments, and hotspot detection."""
-    origin_in_bounds = BengaluruRegionManager.is_within_bounds(request.origin_lat, request.origin_lon)
-    dest_in_bounds = BengaluruRegionManager.is_within_bounds(request.dest_lat, request.dest_lon)
+    origin_in_bounds = get_region().is_within_bounds(request.origin_lat, request.origin_lon)
+    dest_in_bounds = get_region().is_within_bounds(request.dest_lat, request.dest_lon)
 
     if not origin_in_bounds:
-        logger.warning(f"Origin coordinates ({request.origin_lat}, {request.origin_lon}) are outside Bengaluru bounding box.")
+        logger.warning(f"Origin coordinates ({request.origin_lat}, {request.origin_lon}) are outside {get_region().display_name} bounding box.")
     if not dest_in_bounds:
-        logger.warning(f"Destination coordinates ({request.dest_lat}, {request.dest_lon}) are outside Bengaluru bounding box.")
+        logger.warning(f"Destination coordinates ({request.dest_lat}, {request.dest_lon}) are outside {get_region().display_name} bounding box.")
 
     try:
         # 1. Fetch High-Resolution OSRM Street Driving Polylines
@@ -97,6 +101,37 @@ async def calculate_route(request: RouteRequest):
             dest_lon=request.dest_lon
         )
 
+        controlled_plan = None
+        controlled_modes = (TrafficTestMode.HEAVY, TrafficTestMode.SEVERE, TrafficTestMode.DYNAMIC)
+        if request.traffic_test_mode in controlled_modes:
+            # First use alternatives already returned by OSRM. If no real route pair
+            # clears a complete congestion stretch, request compact street routes via
+            # entry -> side-road -> exit waypoints before the simulation starts.
+            controlled_plan = plan_controlled_bypass(raw_candidates)
+            if not controlled_plan:
+                try:
+                    additions, generated_plan = await build_controlled_bypass_candidates(
+                        raw_candidates,
+                        request.origin_lat, request.origin_lon,
+                        request.dest_lat, request.dest_lon,
+                        OSRMService.get_routes_via_waypoints,
+                    )
+                    if additions:
+                        raw_candidates.extend(additions)
+                    controlled_plan = generated_plan or plan_controlled_bypass(raw_candidates)
+                except Exception:
+                    logger.exception("[TrafficTest] OSRM preplanned bypass generation failed")
+            if controlled_plan:
+                logger.info(
+                    "[TrafficTest] Preplanned real-road bypass: active=%s bypass=%s switch=%.0fm zone=%.0f-%.0fm clearance=%.0fm",
+                    controlled_plan["active_route_index"], controlled_plan["bypass_route_index"],
+                    controlled_plan["switch_distance_m"], controlled_plan["zone_start_distance_m"],
+                    controlled_plan["zone_end_distance_m"], controlled_plan["minimum_bypass_clearance_m"],
+                )
+            else:
+                # Important: a failed planner never pauses the vehicle. It continues on
+                # its current road instead of presenting a false "no possible routes" stop.
+                logger.warning("[TrafficTest] No verified bypass exists for this route pair; simulation will continue without pausing")
         # 2. Evaluate Candidates with Route-Level ML Model
         ml_evaluated_candidates = RouteScorer.evaluate_routes(
             raw_candidates,
@@ -132,7 +167,7 @@ async def calculate_route(request: RouteRequest):
 
             candidate["route_id"] = str(uuid.uuid4())
             candidate["source"] = "initial-osrm"
-            candidate["original_route_index"] = candidate.get("route_index", 0)
+            candidate["original_route_index"] = candidate.get("original_route_index", candidate.get("route_index", 0))
 
             analysis = CongestionDetector.analyze_route(
                 geometry=geometry,
@@ -142,8 +177,14 @@ async def calculate_route(request: RouteRequest):
                 # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
             )
             # EMERGENCY FEATURE DISABLED: was `if not request.is_emergency_mode:`
+            use_planned_zone = bool(
+                controlled_plan and
+                int(candidate.get("original_route_index", candidate.get("route_index", 0))) == int(controlled_plan["active_route_index"])
+            )
             analysis = apply_traffic_test_scenario(
-                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active
+                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active,
+                zone_start_ratio=controlled_plan["zone_start_ratio"] if use_planned_zone else 0.50,
+                zone_length_m=controlled_plan["zone_length_m"] if use_planned_zone else None,
             )
 
             candidate["segments"] = analysis["segments"]
@@ -169,6 +210,28 @@ async def calculate_route(request: RouteRequest):
         # congestion to affect the initial recommendation.
         rank_processed_routes(processed_candidates)
 
+        # Store the real OSRM bypass on the active route so the frontend can switch at
+        # the shared approach point without making a second, failure-prone request mid-drive.
+        if controlled_plan:
+            active_idx = int(controlled_plan["active_route_index"])
+            bypass_idx = int(controlled_plan["bypass_route_index"])
+            active_candidate = next((r for r in processed_candidates if r.original_route_index == active_idx), None)
+            bypass_candidate = next((r for r in processed_candidates if r.original_route_index == bypass_idx), None)
+            if active_candidate is not None and bypass_candidate is not None and active_candidate.route_id != bypass_candidate.route_id:
+                bypass_payload = bypass_candidate.model_dump(mode="json")
+                bypass_payload["controlled_test_bypass_route"] = None
+                bypass_payload["controlled_test_switch_distance_m"] = None
+                bypass_payload["controlled_test_zone_start_distance_m"] = None
+                bypass_payload["controlled_test_zone_end_distance_m"] = None
+                active_candidate.controlled_test_bypass_route = bypass_payload
+                active_candidate.controlled_test_switch_distance_m = controlled_plan["switch_distance_m"]
+                active_candidate.controlled_test_zone_start_distance_m = controlled_plan["zone_start_distance_m"]
+                active_candidate.controlled_test_zone_end_distance_m = controlled_plan["zone_end_distance_m"]
+                processed_candidates = [active_candidate] + [
+                    route for route in processed_candidates if route.route_id != active_candidate.route_id
+                ]
+            else:
+                logger.warning("[TrafficTest] The verified OSRM pair was rejected during route validation")
         return RouteResponse(
             success=True,
             routes_count=len(processed_candidates),
@@ -215,7 +278,7 @@ async def get_traffic_factors(lat: float = Query(...), lon: float = Query(...)):
 
 @router.get("/traffic/hotspots")
 async def get_traffic_hotspots():
-    """Returns all active bottleneck hotspots across Bengaluru."""
+    """Returns all active bottleneck hotspots across the active region."""
     hotspots = LiveTrafficService.get_all_active_hotspots()
     return {"success": True, "count": len(hotspots), "hotspots": hotspots}
 

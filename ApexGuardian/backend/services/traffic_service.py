@@ -3,6 +3,7 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from schemas.navigation import CongestionLevel
+from core.region import get_region
 
 class LiveTrafficService:
     """Real-Time Traffic Factor Integration Service (Feature 2).
@@ -272,3 +273,14 @@ class LiveTrafficService:
                 **tf
             })
         return results
+
+
+# The hand-written bottleneck list above describes *Bengaluru* junctions. Keep only the entries that
+# lie inside the active region so a Coimbatore deployment never reports Bengaluru hotspots.
+# (Bengaluru: every entry is inside the bounding box, so behaviour is unchanged.)
+# Coimbatore hotspots are NOT invented here; add measured data, or clearly-labelled synthetic
+# scenarios, to this list when available.
+LiveTrafficService.KNOWN_BOTTLENECKS = [
+    _bn for _bn in LiveTrafficService.KNOWN_BOTTLENECKS
+    if get_region().is_within_bounds(_bn["lat"], _bn["lon"])
+]

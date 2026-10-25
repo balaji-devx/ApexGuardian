@@ -4,6 +4,8 @@ import React, { createContext, useContext, useState, useEffect, useRef, useCallb
 import {
   PlaceSearchResult,
   CandidateRoute,
+  CongestionLevel,
+  CongestionHotspot,
   checkHealth,
   fetchRoutes,
   RerouteRecommendation,
@@ -14,6 +16,20 @@ import { PushNotificationService } from "@/lib/pushNotificationService";
 import { RerouteEngine, routesHaveSameGeometry } from "@/lib/rerouteEngine";
 import { getManeuverInstruction, getManeuverAnnouncement } from "@/lib/maneuverInstructions";
 import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode, TRAFFIC_TEST_SCENARIOS } from "@/lib/trafficScenario";
+
+import { ACTIVE_REGION_CONFIG } from "@/lib/region";
+
+export function selectDisplayedRouteOptions(candidates: CandidateRoute[]): CandidateRoute[] {
+  const combined = candidates.find((route) => route.recommendation_label === "AI + OSRM Best Route");
+  if (combined) return [combined];
+  const aiRoute = candidates.find((route) => route.is_ai_recommended);
+  const osrmRoute = candidates.find(
+    (route) => !route.is_ai_recommended && route.recommendation_label === "OSRM Preferred Route",
+  );
+  if (aiRoute && osrmRoute && aiRoute.route_id !== osrmRoute.route_id) return [aiRoute, osrmRoute];
+  // Defensive fallback for older/mock API responses that do not carry the new labels.
+  return candidates.slice(0, 2);
+}
 
 export interface Coordinate {
   lat: number;
@@ -76,10 +92,173 @@ function getUpcomingAvoidHotspots(
       // routes that drove straight through the jam were treated as "clean".
       const path = hotspot.zone_path;
       if (path && path.length > 0) {
-        return path.map(([lon, lat]) => ({ lat, lon, radius_km: 0.06 }));
+        // A 90m circle at each sampled road point overlaps the next sample. The backend
+        // validates every returned route against ALL circles, covering the whole jam.
+        const radiusKm = hotspot.cause === "Controlled traffic test" ? 0.09 : 0.12;
+        return path.map(([lon, lat]) => ({ lat, lon, radius_km: radiusKm }));
       }
       return [{ lat: hotspot.lat, lon: hotspot.lon, radius_km: 0.15 }];
     });
+}
+
+/** Rebuild the backend's anchored synthetic zone if hotspot metadata could not be refreshed. */
+function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
+  const coords = (route.geometry?.coordinates || []) as [number, number][];
+  if (coords.length < 2) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
+  const cumulative: number[] = [0];
+  for (let i = 1; i < coords.length; i++) {
+    cumulative.push(cumulative[i - 1] + haversineMeters(
+      coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]
+    ));
+  }
+  const total = cumulative[cumulative.length - 1];
+  if (!Number.isFinite(total) || total < 500) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
+  let zoneLength = Math.max(300, Math.min(1000, total * 0.10));
+  zoneLength = Math.min(zoneLength, total * 0.25);
+  let zoneStart = total * 0.50;
+  if (zoneStart + zoneLength > total - 100) zoneStart = Math.max(0, total - 100 - zoneLength);
+  const zoneEnd = Math.min(total, zoneStart + zoneLength);
+  const sampleDistances = [zoneStart];
+  for (let d = zoneStart + 75; d < zoneEnd; d += 75) sampleDistances.push(d);
+  if (sampleDistances[sampleDistances.length - 1] < zoneEnd) sampleDistances.push(zoneEnd);
+  return sampleDistances.map((target) => {
+    let i = 1;
+    while (i < cumulative.length - 1 && cumulative[i] < target) i++;
+    const span = Math.max(0.001, cumulative[i] - cumulative[i - 1]);
+    const t = Math.max(0, Math.min(1, (target - cumulative[i - 1]) / span));
+    return {
+      lon: coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * t,
+      lat: coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * t,
+      radius_km: 0.09,
+    };
+  });
+}
+
+function pointAtRouteDistance(route: CandidateRoute, targetDistanceM: number): [number, number] {
+  const coords = (route.geometry?.coordinates || []) as [number, number][];
+  if (!coords.length) return [0, 0];
+  if (coords.length === 1) return coords[0];
+  let walked = 0;
+  if (targetDistanceM <= 0) return coords[0];
+  for (let i = 1; i < coords.length; i += 1) {
+    const length = haversineMeters(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+    if (walked + length >= targetDistanceM) {
+      const t = length > 0 ? Math.max(0, Math.min(1, (targetDistanceM - walked) / length)) : 0;
+      return [coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * t, coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * t];
+    }
+    walked += length;
+  }
+  return coords[coords.length - 1];
+}
+
+function applyControlledTrafficPhase(route: CandidateRoute, phase: CongestionLevel): CandidateRoute {
+  const startM = route.controlled_test_zone_start_distance_m;
+  const endM = route.controlled_test_zone_end_distance_m;
+  if (typeof startM !== "number" || typeof endM !== "number" || endM <= startM) return route;
+
+  const speedRatio: Record<CongestionLevel, number> = { LOW: 0.90, MODERATE: 0.68, HEAVY: 0.42, SEVERE: 0.20 };
+  const color: Record<CongestionLevel, string> = { LOW: "#16A34A", MODERATE: "#EAB308", HEAVY: "#F97316", SEVERE: "#DC2626" };
+  let along = 0;
+  let totalDelay = 0;
+  let lowDistance = 0, moderateDistance = 0, heavyDistance = 0, severeDistance = 0;
+  let zoneFreeflowSpeedDistance = 0;
+  const segments = (route.segments || []).map((segment) => {
+    const segmentDistance = Math.max(0, segment.distance_meters || 0);
+    const center = along + segmentDistance / 2;
+    const inZone = center >= startM - 1 && center <= endM + 1;
+    along += segmentDistance;
+    const level: CongestionLevel = inZone ? phase : "LOW";
+    const freeflowSpeed = Math.max(20, segment.freeflow_speed_kmh || 45);
+    const currentSpeed = Math.max(1, freeflowSpeed * speedRatio[level]);
+    const duration = segmentDistance / Math.max(0.5, currentSpeed / 3.6);
+    const freeflowDuration = segmentDistance / Math.max(0.5, freeflowSpeed / 3.6);
+    const delay = Math.max(0, duration - freeflowDuration);
+    totalDelay += delay;
+    if (inZone) {
+      zoneFreeflowSpeedDistance += freeflowSpeed * segmentDistance;
+      if (level === "MODERATE") moderateDistance += segmentDistance;
+      else if (level === "HEAVY") heavyDistance += segmentDistance;
+      else if (level === "SEVERE") severeDistance += segmentDistance;
+      else lowDistance += segmentDistance;
+    } else {
+      lowDistance += segmentDistance;
+    }
+    return { ...segment, congestion_level: level, color: color[level], current_speed_kmh: Number(currentSpeed.toFixed(1)), duration_seconds: Number(duration.toFixed(1)), delay_seconds: Number(delay.toFixed(1)), congestion_factor: Number((1 / speedRatio[level]).toFixed(2)) };
+  });
+
+  if (phase === "LOW") {
+    return { ...route, segments, hotspots: (route.hotspots || []).filter((hotspot) => hotspot.cause !== "Controlled traffic test"), total_delay_seconds: 0, clear_distance_km: Number((lowDistance / 1000).toFixed(2)), moderate_distance_km: 0, heavy_distance_km: 0, severe_distance_km: 0 };
+  }
+
+  const zoneLength = endM - startM;
+  const zonePath: number[][] = [];
+  for (let d = startM; d < endM; d += 75) zonePath.push(pointAtRouteDistance(route, d));
+  zonePath.push(pointAtRouteDistance(route, endM));
+  const first = zonePath[0] || pointAtRouteDistance(route, startM);
+  const averageSpeed = zoneFreeflowSpeedDistance / Math.max(1, zoneLength) * speedRatio[phase];
+  const existingHotspot = (route.hotspots || []).find((hotspot) => hotspot.cause === "Controlled traffic test");
+  const hotspot: CongestionHotspot = {
+    ...(existingHotspot || {} as CongestionHotspot),
+    hotspot_id: existingHotspot?.hotspot_id || `controlled-${route.route_id || "test"}`,
+    location_name: existingHotspot?.location_name || "Synthetic congestion test zone",
+    lat: first[1], lon: first[0], distance_from_origin_m: startM,
+    congestion_level: phase, average_speed_kmh: Number(averageSpeed.toFixed(1)),
+    estimated_delay_seconds: Number(segments.filter((segment) => segment.congestion_level === phase).reduce((sum, segment) => sum + (segment.delay_seconds || 0), 0).toFixed(1)),
+    description: `Synthetic ${phase.toLowerCase()} congestion. A preplanned road bypass is available.`,
+    cause: "Controlled traffic test", zone_end_distance_m: endM, zone_path: zonePath,
+  };
+  return {
+    ...route, segments, hotspots: [...(route.hotspots || []).filter((item) => item.cause !== "Controlled traffic test"), hotspot],
+    total_delay_seconds: Number(totalDelay.toFixed(1)), clear_distance_km: Number((lowDistance / 1000).toFixed(2)),
+    moderate_distance_km: Number((moderateDistance / 1000).toFixed(2)), heavy_distance_km: Number((heavyDistance / 1000).toFixed(2)), severe_distance_km: Number((severeDistance / 1000).toFixed(2)),
+  };
+}
+
+function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocation: Coordinate): CandidateRoute | null {
+  const planned = activeRoute.controlled_test_bypass_route;
+  const sourceCoords = (planned?.geometry?.coordinates || []) as [number, number][];
+  if (!planned || sourceCoords.length < 2) return null;
+  const projection = projectPointOntoRoute(currentLocation, planned);
+  if (projection.distanceToRouteMeters > 30) {
+    console.warn("[TrafficTest] Planned bypass does not join the vehicle's current road.", { distanceM: projection.distanceToRouteMeters });
+    return null;
+  }
+  const segmentIndex = Math.max(0, Math.min(sourceCoords.length - 2, projection.segmentIndex));
+  const coords: [number, number][] = [[currentLocation.lon, currentLocation.lat]];
+  const projected: [number, number] = [projection.projectedPoint.lon, projection.projectedPoint.lat];
+  if (haversineMeters(coords[0][0], coords[0][1], projected[0], projected[1]) > 1.5) coords.push(projected);
+  for (const point of sourceCoords.slice(segmentIndex + 1)) {
+    const previous = coords[coords.length - 1];
+    if (haversineMeters(previous[0], previous[1], point[0], point[1]) > 1) coords.push([point[0], point[1]]);
+  }
+  if (coords.length < 3) return null;
+  let distanceM = 0;
+  for (let i = 1; i < coords.length; i += 1) distanceM += haversineMeters(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+  let sourcePolylineM = 0;
+  for (let i = 1; i < sourceCoords.length; i += 1) sourcePolylineM += haversineMeters(sourceCoords[i - 1][0], sourceCoords[i - 1][1], sourceCoords[i][0], sourceCoords[i][1]);
+  const remainingRatio = sourcePolylineM > 0 ? Math.max(0.01, Math.min(1, distanceM / sourcePolylineM)) : 1;
+  const originalDuration = planned.duration_seconds || planned.predicted_duration_seconds || 600;
+  const durationS = originalDuration * remainingRatio;
+  const steps: CandidateRoute["steps"] = [];
+  let stepsDistanceLeft = projection.distanceAlongRouteMeters;
+  for (const step of planned.steps || []) {
+    const stepDistance = Math.max(0, step.distance || 0);
+    if (stepsDistanceLeft >= stepDistance && stepDistance > 0) { stepsDistanceLeft -= stepDistance; continue; }
+    const remainingStepDistance = Math.max(0, stepDistance - stepsDistanceLeft);
+    const fraction = stepDistance > 0 ? remainingStepDistance / stepDistance : 1;
+    steps.push({ ...step, distance: remainingStepDistance, duration: Math.max(0, (step.duration || 0) * fraction) });
+    stepsDistanceLeft = 0;
+  }
+  if (!steps.length) steps.push({ name: "Continue on the clear bypass", distance: distanceM, duration: durationS, maneuver: { type: "depart", instruction: "Continue on the clear bypass", location: coords[0] } });
+  const freeflowSpeed = Math.max(25, planned.predicted_average_speed_kmh || 40);
+  const clearSegment = { segment_index: 0, coordinates: coords as number[][], distance_meters: distanceM, duration_seconds: durationS, freeflow_speed_kmh: freeflowSpeed, current_speed_kmh: freeflowSpeed, delay_seconds: 0, congestion_level: "LOW" as CongestionLevel, color: "#16A34A", congestion_factor: 1, density_index: 15, predicted_arrival_time_min: durationS / 60, road_name: "Clear bypass" };
+  return {
+    ...planned, route_id: `controlled-bypass-${Date.now()}`, source: "controlled-test-bypass", route_index: 0,
+    distance_meters: distanceM, duration_seconds: durationS, predicted_duration_seconds: durationS, predicted_duration_minutes: Number((durationS / 60).toFixed(1)),
+    geometry: { ...planned.geometry, coordinates: coords as number[][] }, steps, segments: [clearSegment], hotspots: (planned.hotspots || []).filter((hotspot) => hotspot.cause !== "Controlled traffic test"),
+    clear_distance_km: Number((distanceM / 1000).toFixed(2)), moderate_distance_km: 0, heavy_distance_km: 0, severe_distance_km: 0, total_delay_seconds: 0,
+    controlled_test_bypass_route: null, controlled_test_switch_distance_m: null, controlled_test_zone_start_distance_m: null, controlled_test_zone_end_distance_m: null,
+  };
 }
 
 export function projectPointOntoRoute(point: Coordinate, route: CandidateRoute): { projectedPoint: Coordinate; distanceAlongRouteMeters: number; distanceToRouteMeters: number; segmentIndex: number } {
@@ -207,14 +386,10 @@ export const BENGALURU_CENTER: Coordinate = {
 };
 
 export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [sourceQuery, setSourceQuery] = useState("Indiranagar, Bengaluru");
+  const [sourceQuery, setSourceQuery] = useState(ACTIVE_REGION_CONFIG.defaultOrigin.name);
   const [destinationQuery, setDestinationQuery] = useState("");
   const [searchResults, setSearchResults] = useState<PlaceSearchResult[]>([]);
-  const [selectedOrigin, setSelectedOrigin] = useState<Coordinate | null>({
-    lat: 12.9786,
-    lon: 77.6421,
-    name: "Indiranagar, Bengaluru",
-  });
+  const [selectedOrigin, setSelectedOrigin] = useState<Coordinate | null>({ ...ACTIVE_REGION_CONFIG.defaultOrigin });
   const [selectedDestination, setSelectedDestination] = useState<Coordinate | null>(null);
   const [routes, setRoutes] = useState<CandidateRoute[]>([]);
   const [activeRouteIndex, setActiveRouteIndex] = useState(0);
@@ -237,6 +412,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const dynamicProgressRef = useRef(0);
   const dynamicClearingRef = useRef(false); // PATCH: guards the one-shot "zone passed" clear
   const testCongestionConsumedRef = useRef(false);
+  const testRerouteTriggeredRef = useRef(false);
 
   // Real-Time Simulation & Navigation Telemetry
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
@@ -271,6 +447,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const animationFrameIdRef = useRef<number | null>(null);
   const lastRerouteInteractionTimeRef = useRef<number>(0);
   const isTransitioningRouteRef = useRef<boolean>(false);
+  const testReroutePausedRef = useRef<boolean>(false);
   const rerouteRequestIdRef = useRef<number>(0);
   const [isApplyingReroute, setIsApplyingReroute] = useState(false);
   const recentRoutesRef = useRef<Array<any>>([]);
@@ -301,7 +478,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }
       
       const now = Date.now();
-      if (now - lastRerouteInteractionTimeRef.current < 30000) {
+      if (now - lastRerouteInteractionTimeRef.current < 30000 && !rec.is_congestion_avoidance) {
         // Cooldown active, ignore new recommendations
         RerouteEngine.dismissRecommendation();
         return;
@@ -310,7 +487,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // Compare against the remaining active geometry, not total route distance:
       // reroute geometry starts at the vehicle while the active route starts at origin.
       const currentRoute = activeRouteRef.current;
-      if (currentRoute && routesHaveSameGeometry(rec.recommended_route, currentRoute)) {
+      if (currentRoute && !rec.is_congestion_avoidance && routesHaveSameGeometry(rec.recommended_route, currentRoute)) {
           // Dismiss duplicates so periodic checks can recover, and avoid stale UI.
           RerouteEngine.dismissRecommendation();
           return;
@@ -361,13 +538,14 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         !testCongestionConsumedRef.current
       );
       if (response.success && response.candidates.length > 0) {
-        setRoutes(response.candidates);
+        setRoutes(selectDisplayedRouteOptions(response.candidates));
         setActiveRouteIndex(0);
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
         recentRoutesRef.current = [];
         testCongestionConsumedRef.current = false;
+        testRerouteTriggeredRef.current = false;
         dynamicClearingRef.current = false;
         AlertManager.reset();
         RerouteEngine.dismissRecommendation();
@@ -401,18 +579,18 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     dynamicProgressRef.current = 0;
     dynamicClearingRef.current = false;
     testCongestionConsumedRef.current = false;
+    testRerouteTriggeredRef.current = false;
 
     let origin = selectedOrigin;
     let destination = selectedDestination;
     if (mode !== "real") {
       const scenario = TRAFFIC_TEST_SCENARIOS[mode];
-      if (!scenario) return;
       origin = scenario.origin;
       destination = scenario.destination;
       setSelectedOrigin(origin);
       setSelectedDestination(destination);
-      setSourceQuery(origin.name);
-      setDestinationQuery(destination.name);
+      setSourceQuery(origin.name ?? "");
+      setDestinationQuery(destination.name ?? "");
     }
     if (!origin || !destination) return;
     const loaded = await calculateRoutes(origin, destination, false, mode, 0);
@@ -440,18 +618,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // PATCH: candidates come back re-ranked by ETA, so [0] can be a DIFFERENT road than `route`.
       // Copying its segments onto this geometry is what made red stretches jump or vanish.
       // Pick the candidate that is actually this route (same length, same start/end corridor).
-      const evaluatedRoute = (response.candidates || [])
-        .map((candidate) => ({
-          candidate,
-          diff: Math.abs((candidate.distance_meters || 0) - (route.distance_meters || 0)),
-        }))
-        .sort((a, b) => a.diff - b.diff)[0]?.candidate;
-      if (
-        !response.success ||
-        !evaluatedRoute ||
-        Math.abs((evaluatedRoute.distance_meters || 0) - (route.distance_meters || 0)) >
-          Math.max(150, 0.02 * (route.distance_meters || 0))
-      ) {
+      const evaluatedRoute = (response.candidates || []).find(
+        (candidate) => routesHaveSameGeometry(candidate, route),
+      );
+      if (!response.success || !evaluatedRoute) {
+        console.warn("[NavigationContext] Could not find the same OSRM geometry during traffic refresh; leaving the current route untouched.");
         return null;
       }
 
@@ -515,6 +686,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setActiveRerouteRecommendation(null);
     RerouteEngine.dismissRecommendation();
     PushNotificationService.clearRerouteAlert();
+    if (testReroutePausedRef.current) {
+      testReroutePausedRef.current = false;
+      setIsSimPlaying(true);
+    }
   };
 
   const dismissNoRouteReason = () => RerouteEngine.dismissNoRouteReason();
@@ -542,33 +717,41 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     let fallbackToStart = false;
 
     if (preservePosition && currentLocation) {
-      proj = projectPointOntoRoute(currentLocation, newRoute);
-      
-      // VERIFY activateRoute safety
-      const isImplausiblyFar = proj.distanceToRouteMeters > 500; // 500m off-route is implausible
-      const isProjectedNearEndWhileNotActuallyNearDest = 
-        (totalRouteDistance - proj.distanceAlongRouteMeters < 50) && (distToDest > 100);
-
-      // 7. HARD INVARIANT: candidate geometry must be consistent with reported distance
+      // Reroute API requests start at the vehicle's paused physical position. Validate that
+      // the candidate begins beside that position, and start at progress 0. Never project
+      // against the entire new line: a later crossing can be closer and cause a teleport.
+      const startDistanceM = haversineMeters(
+        currentLocation.lon, currentLocation.lat, firstCoord[0], firstCoord[1]
+      );
+      const endDistanceM = selectedDestination
+        ? haversineMeters(lastCoord[0], lastCoord[1], selectedDestination.lon, selectedDestination.lat)
+        : 0;
       let calculatedPolylineM = 0;
       for (let i = 1; i < newRoute.geometry.coordinates.length; i++) {
         calculatedPolylineM += haversineMeters(
-          newRoute.geometry.coordinates[i-1][0], newRoute.geometry.coordinates[i-1][1],
+          newRoute.geometry.coordinates[i - 1][0], newRoute.geometry.coordinates[i - 1][1],
           newRoute.geometry.coordinates[i][0], newRoute.geometry.coordinates[i][1]
         );
       }
       const isGeometryAbsurd = Math.abs(calculatedPolylineM - totalRouteDistance) > Math.max(500, totalRouteDistance * 0.2);
-
-      if (isImplausiblyFar || isProjectedNearEndWhileNotActuallyNearDest || isGeometryAbsurd) {
-        console.warn(`[NavigationContext] CATASTROPHIC ROUTE ERROR: Reroute projection rejected. distanceToRouteMeters: ${proj.distanceToRouteMeters}m, projectedDist: ${proj.distanceAlongRouteMeters}m, totalRouteDist: ${totalRouteDistance}m, distToDest: ${distToDest}m, calculatedPolyline: ${calculatedPolylineM}m`);
-        // 1. NEVER call setCurrentLocation(firstCoord) for a rejected reroute.
-        // A failed/invalid route must never change the physical vehicle position.
-        return false; // ABORT ACTIVATION COMPLETELY
-      } else {
-        simDistanceTraversedRef.current = proj.distanceAlongRouteMeters;
-        // IMPORTANT: Do not teleport the vehicle to the projected point (proj.projectedPoint).
-        // Let the simulation loop smoothly interpolate from the physical currentLocation.
+      const badStart = startDistanceM > 35;
+      const badEnd = Boolean(selectedDestination && endDistanceM > 250);
+      if (badStart || badEnd || isGeometryAbsurd) {
+        console.warn("[NavigationContext] Reroute rejected to prevent a vehicle jump.", {
+          startDistanceM, endDistanceM, calculatedPolylineM, reportedDistanceM: totalRouteDistance,
+        });
+        isTransitioningRouteRef.current = false;
+        return false;
       }
+      proj = {
+        projectedPoint: { lon: firstCoord[0], lat: firstCoord[1] },
+        distanceAlongRouteMeters: 0,
+        distanceToRouteMeters: startDistanceM,
+        segmentIndex: 0,
+      };
+      simDistanceTraversedRef.current = 0;
+      // Keep currentLocation/currentLocationRef untouched; the new road route begins where
+      // the reroute was requested, within a strict 35m OSRM snap tolerance.
     } else {
       fallbackToStart = true;
     }
@@ -668,8 +851,22 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       calculated_geometry_length: calcGeomLength
     });
 
+    // In the SEVERE controlled test only, the congestion event has already
+    // served its purpose once the driver accepts the bypass. Do not carry the
+    // synthetic hotspot onto the new active route, otherwise the accepted route
+    // can show a stray severe marker and later trigger a heavy/moderate alert.
+    const routeToActivate =
+      trafficTestModeRef.current === "severe"
+        ? {
+            ...recRoute,
+            hotspots: (recRoute.hotspots || []).filter(
+              (hotspot) => hotspot.cause !== "Controlled traffic test",
+            ),
+          }
+        : recRoute;
+
     setIsApplyingReroute(true);
-    const switched = activateRoute(recommendation.recommended_route, true);
+    const switched = activateRoute(routeToActivate, true);
     setIsApplyingReroute(false);
     if (switched) {
       // Any accepted reroute during a controlled traffic test ends that
@@ -682,6 +879,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       // hotspot even though the driver had already rerouted once.
       if (trafficTestModeRef.current !== "real") {
         testCongestionConsumedRef.current = true;
+      }
+      if (testReroutePausedRef.current) {
+        testReroutePausedRef.current = false;
+        setIsSimPlaying(true);
       }
       if (recommendation.is_congestion_avoidance) {
         const viaRoad = recommendation.recommended_route?.steps?.find(
@@ -698,6 +899,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     } else {
       setActiveRerouteRecommendation(null);
       RerouteEngine.dismissRecommendation();
+      if (testReroutePausedRef.current) {
+        testReroutePausedRef.current = false;
+        setIsSimPlaying(true);
+      }
       TTSService.announce(
         "Could not switch routes. Continue on the current route.",
         SpeechPriority.NORMAL,
@@ -794,6 +999,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
         isTransitioningRouteRef.current = false;
+        testReroutePausedRef.current = false;
         TTSService.warmUp();
         setSimProgressPercent(0);
         setSimDistanceRemainingM(activeRoute.distance_meters || 0);
@@ -822,6 +1028,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         animationFrameIdRef.current = null;
       }
       isTransitioningRouteRef.current = false;
+      testReroutePausedRef.current = false;
       AlertManager.reset();
       RerouteEngine.dismissRecommendation();
       RerouteEngine.dismissNoRouteReason();
@@ -1077,9 +1284,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             );
           }
 
-          // Proactively check for reroute when a new congestion alert stage triggers
-          // Only check if no recommendation is already pending
-          if ((alert.congestionLevel === "HEAVY" || alert.congestionLevel === "SEVERE") && selectedDestination && !RerouteEngine.getActiveRecommendation()) {
+          // Proactively check for reroute when a new congestion alert stage triggers.
+          // Static HEAVY/SEVERE tests use this path. DYNAMIC is intentionally handled
+          // only by the phase transition below so it cannot reroute at HEAVY.
+          if (
+            (alert.congestionLevel === "HEAVY" || alert.congestionLevel === "SEVERE") &&
+            selectedDestination &&
+            !RerouteEngine.getActiveRecommendation() &&
+            trafficTestModeRef.current === "real"
+          ) {
             const traversed = simDistanceTraversedRef.current;
             const activeRouteDist = activeRoute.distance_meters || 1;
             const activeRatio = Math.min(1.0, traversed / activeRouteDist);
@@ -1172,57 +1385,81 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         }
       }
 
-      // Dynamic demo. PATCH: the congestion zone is anchored (it never moves); only its severity
-      // escalates while the vehicle approaches (moderate -> heavy -> severe), and it is cleared once
-      // the vehicle has driven past the end of the zone. The old code re-stamped a new window
-      // ahead of the vehicle on every phase change, so red stretches jumped ahead or vanished
-      // while the car was still inside them, and "moderate" was never refreshed at all.
-      if (trafficTestModeRef.current === "dynamic" && !testCongestionConsumedRef.current) {
-        const phase = dynamicTrafficPhase(scenarioProgress);
-        if (phase !== lastDynamicPhaseRef.current) {
-          lastDynamicPhaseRef.current = phase;
-          if (phase === "LOW") {
-            // nothing to do: the route was loaded clear
-          } else if (!selectedDestination) {
-            void refreshTrafficScenario(activeRoute, scenarioProgress);
-          } else {
-            // Wait for the refreshed hotspots before deciding what to avoid.
-            void (async () => {
-              const updatedRoute = await refreshTrafficScenario(activeRoute, scenarioProgress);
-              if (!updatedRoute || phase === "MODERATE") return;
-              const remainingRatio = Math.max(0, 1 - scenarioProgress);
-              const remainingSeconds = remainingRatio * (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds);
-              RerouteEngine.checkAndReevaluate(
-                interpLat, interpLon, selectedDestination.lat, selectedDestination.lon,
-                remainingSeconds, speedKmh, false /* emergency disabled */, true,
-                trafficTestModeRef.current, scenarioProgress,
-                getUpcomingAvoidHotspots(updatedRoute, newDist),
-                recentRoutesRef.current,
-                !testCongestionConsumedRef.current
-              );
-            })();
-          }
-        }
+      // Controlled traffic scenarios have their bypass preplanned before the simulation
+      // starts. The vehicle opens the chooser at the common road approach; no live OSRM
+      // request is awaited and a missing plan never freezes the animation.
+      const controlledMode = trafficTestModeRef.current;
+      const controlledTestEnabled = controlledMode === "heavy" || controlledMode === "severe" || controlledMode === "dynamic";
+      const plannedSwitchDistance = activeRoute.controlled_test_switch_distance_m;
+      const plannedZoneEnd = activeRoute.controlled_test_zone_end_distance_m;
 
-        // Clear the scenario after the vehicle has passed the end of the congested stretch.
-        const zoneHotspot = (activeRoute.hotspots || []).find(
-          (h) => h.cause === "Controlled traffic test" && typeof h.zone_end_distance_m === "number"
-        );
-        if (zoneHotspot && !dynamicClearingRef.current && newDist > (zoneHotspot.zone_end_distance_m as number) + 30) {
-          dynamicClearingRef.current = true;
-          void refreshTrafficScenario(activeRoute, 1.0).then(() => {
-            testCongestionConsumedRef.current = true; // no further synthetic traffic this trip
-          });
-          AlertManager.reset();
-          RerouteEngine.dismissRecommendation();
-          setActiveRerouteRecommendation(null);
-          TTSService.announce("Traffic has cleared. Continue on the current route.", SpeechPriority.NORMAL, "traffic_cleared");
+      const offerPlannedControlledBypass = () => {
+        if (testRerouteTriggeredRef.current || testCongestionConsumedRef.current || !selectedDestination) return;
+        const bypassRoute = buildControlledBypassSuffix(activeRoute, { lat: interpLat, lon: interpLon });
+        if (!bypassRoute) {
+          testRerouteTriggeredRef.current = true;
+          console.warn("[TrafficTest] Preplanned bypass was not aligned with the vehicle; continuing on the current route.");
+          setNoRouteReason(null);
+          return;
+        }
+        testRerouteTriggeredRef.current = true;
+        const remainingSeconds = Math.max(0, (1 - progressRatio) *
+          (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 600));
+        const bypassDuration = bypassRoute.predicted_duration_seconds || bypassRoute.duration_seconds || 0;
+        const etaDelta = remainingSeconds - bypassDuration;
+        const recommendation: RerouteRecommendation = {
+          is_reroute_recommended: true,
+          is_congestion_avoidance: true,
+          time_saved_seconds: etaDelta,
+          time_saved_minutes: Number((etaDelta / 60).toFixed(1)),
+          original_remaining_seconds: remainingSeconds,
+          recommended_duration_seconds: bypassDuration,
+          recommended_route: bypassRoute,
+          alternative_routes: [bypassRoute],
+          reason: "A preplanned OSRM street route avoids the complete synthetic congestion stretch and rejoins the destination without moving the vehicle.",
+        };
+        testReroutePausedRef.current = true;
+        setIsSimPlaying(false);
+        setNoRouteReason(null);
+        setActiveRerouteRecommendation(recommendation);
+      };
+
+      if (controlledTestEnabled && !testCongestionConsumedRef.current && typeof plannedSwitchDistance === "number") {
+        if (controlledMode === "dynamic") {
+          // Ramp LOW -> MODERATE -> HEAVY -> SEVERE as the vehicle approaches the
+          // planned split. SEVERE occurs at the switching point, before the synthetic jam.
+          const switchRatio = Math.max(0.12, Math.min(0.48, plannedSwitchDistance / Math.max(1, totalRouteDistanceM)));
+          const phaseProgress = Math.min(1, (scenarioProgress / switchRatio) * 0.40);
+          const phase = dynamicTrafficPhase(phaseProgress);
+          if (phase !== lastDynamicPhaseRef.current) {
+            lastDynamicPhaseRef.current = phase;
+            setRoutes((currentRoutes) => currentRoutes.map((route) =>
+              route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, phase) : route
+            ));
+          }
+          if (phase === "SEVERE" && newDist >= plannedSwitchDistance - 5) offerPlannedControlledBypass();
+          if (typeof plannedZoneEnd === "number" && newDist > plannedZoneEnd + 30 && !testRerouteTriggeredRef.current) {
+            testCongestionConsumedRef.current = true;
+            lastDynamicPhaseRef.current = "LOW";
+            setRoutes((currentRoutes) => currentRoutes.map((route) =>
+              route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, "LOW") : route
+            ));
+            AlertManager.reset();
+          }
+        } else if (newDist >= plannedSwitchDistance - 5) {
+          offerPlannedControlledBypass();
         }
       }
-
-      // Continuous Automatic Reroute Re-Evaluation (Gated when recommendation is already displayed)
+      // Continuous automatic reroute re-evaluation is real-navigation behaviour.
+      // Controlled HEAVY/SEVERE/DYNAMIC dropdown tests must not perform unrelated
+      // OSRM/ML reroutes before their synthetic congestion event fires.
+      const controlledTrafficTest =
+        trafficTestModeRef.current === "heavy" ||
+        trafficTestModeRef.current === "severe" ||
+        trafficTestModeRef.current === "dynamic";
       const nowMs = Date.now();
       if (
+        !controlledTrafficTest &&
         selectedDestination &&
         !RerouteEngine.getActiveRecommendation() &&
         nowMs - lastAutoRerouteCheckTimeRef.current > 7000

@@ -1,0 +1,23 @@
+
+> apexguardian-frontend@0.1.0 build
+> next build
+
+  ▲ Next.js 14.2.35
+  - Environments: .env.local
+
+   Creating an optimized production build ...
+ ✓ Compiled successfully
+   Linting and checking validity of types ...
+Failed to compile.
+
+./src/components/map/MapCanvas.tsx:764:18
+Type error: Cannot find name 'BENGALURU_CENTER'.
+
+[0m [90m 762 |[39m     } [36melse[39m {[0m
+[0m [90m 763 |[39m       map[33m.[39mflyTo({[0m
+[0m[31m[1m>[22m[39m[90m 764 |[39m         center[33m:[39m [[33mBENGALURU_CENTER[39m[33m.[39mlon[33m,[39m [33mBENGALURU_CENTER[39m[33m.[39mlat][33m,[39m[0m
+[0m [90m     |[39m                  [31m[1m^[22m[39m[0m
+[0m [90m 765 |[39m         zoom[33m:[39m [35m12.5[39m[33m,[39m[0m
+[0m [90m 766 |[39m         duration[33m:[39m [35m1200[39m[33m,[39m[0m
+[0m [90m 767 |[39m       })[33m;[39m[0m
+Next.js build worker exited with code: 1 and signal: null

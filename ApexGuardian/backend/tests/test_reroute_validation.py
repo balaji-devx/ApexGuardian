@@ -402,3 +402,80 @@ def test_unavailable_bypass_is_explicit_and_does_not_claim_ai_optimal(monkeypatc
     assert rec.recommended_route is None
     assert rec.alternative_routes == []
     assert "No alternate route avoids this stretch" in rec.reason
+
+
+def test_controlled_stretch_bypass_uses_paired_same_side_waypoints(monkeypatch):
+    """A sampled controlled jam must be routed around as one continuous stretch."""
+    import asyncio
+    from services.osrm import OSRMService
+    from ml.recommender import RouteScorer
+    from schemas.navigation import TrafficTestMode
+    from services.reroute_engine import DynamicRerouteEngine, route_intersects_avoid_hotspots
+
+    current_lat, current_lon = 12.9700, 77.5946
+    dest_lat, dest_lon = 13.0500, 77.5946
+
+    def dense_geometry(points):
+        """Model OSRM's dense road geometry instead of fake multi-kilometre jumps."""
+        coordinates = []
+        for start, end in zip(points, points[1:]):
+            steps = max(1, int(max(abs(end[0] - start[0]), abs(end[1] - start[1])) * 111_000 / 120) + 1)
+            for step in range(steps):
+                t = step / steps
+                coordinates.append([
+                    start[0] + (end[0] - start[0]) * t,
+                    start[1] + (end[1] - start[1]) * t,
+                ])
+        coordinates.append(list(points[-1]))
+        return coordinates
+
+    initial = {
+        "route_index": 0,
+        "distance_meters": 9000.0,
+        "duration_seconds": 700.0,
+        "geometry": {"type": "LineString", "coordinates": dense_geometry([
+            [77.5946, 12.9700], [77.5946, 12.9850], [77.5946, 13.0050],
+            [77.5946, 13.0170], [77.5946, 13.0350], [77.5946, 13.0500],
+        ])},
+        "steps": [{"name": "Congested Main Road", "distance": 9000.0, "duration": 700.0}],
+    }
+    bypass = {
+        "route_index": 0,
+        "distance_meters": 11500.0,
+        "duration_seconds": 900.0,
+        "geometry": {"type": "LineString", "coordinates": dense_geometry([
+            [77.5946, 12.9700], [77.6090, 12.9980], [77.6090, 13.0220],
+            [77.5946, 13.0500],
+        ])},
+        "steps": [{"name": "Outer Service Road", "distance": 11500.0, "duration": 900.0}],
+    }
+    zones = [
+        {"lat": round(13.0050 + i * 0.0010, 6), "lon": 77.5946, "radius_km": 0.09}
+        for i in range(13)
+    ]
+    calls = []
+
+    async def mock_get_routes(*args, **kwargs):
+        return [initial.copy()]
+
+    async def mock_get_routes_via_waypoints(waypoints):
+        calls.append(waypoints)
+        return [bypass.copy()]
+
+    monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
+    monkeypatch.setattr(OSRMService, "get_routes_via_waypoints", staticmethod(mock_get_routes_via_waypoints))
+    monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
+
+    recommendation = asyncio.run(DynamicRerouteEngine.evaluate_reroute(
+        current_lat=current_lat, current_lon=current_lon,
+        dest_lat=dest_lat, dest_lon=dest_lon,
+        original_remaining_duration_s=700.0, avoid_hotspots=zones,
+        traffic_test_mode=TrafficTestMode.HEAVY, traffic_progress=0.32,
+        synthetic_traffic_active=True,
+    ))
+
+    assert calls, "The reroute engine should probe street-snapped paired waypoints."
+    assert all(len(waypoints) == 4 for waypoints in calls), "A stretch bypass must use entry + exit waypoints."
+    assert recommendation.is_reroute_recommended
+    assert recommendation.recommended_route is not None
+    assert not route_intersects_avoid_hotspots(recommendation.recommended_route.geometry, zones)

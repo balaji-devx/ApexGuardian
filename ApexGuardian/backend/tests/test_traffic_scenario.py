@@ -86,3 +86,35 @@ def test_10_real_data_mode_remains_unchanged(mock_analysis):
         mock_analysis, TrafficTestMode.REAL, synthetic_traffic_active=True
     )
     assert len(res["hotspots"]) == 0
+
+
+
+def test_dynamic_scenario_has_ordered_phases_for_rerouting():
+    from services.traffic_scenario import dynamic_traffic_phase
+    from schemas.navigation import CongestionLevel
+
+    # The fixed zone is centred around 50% of the road. Trigger a bypass at SEVERE
+    # (40% progress), before the simulated vehicle enters that exclusion zone.
+    assert dynamic_traffic_phase(0.05, 0.60) == CongestionLevel.LOW
+    assert dynamic_traffic_phase(0.20, 0.60) == CongestionLevel.MODERATE
+    assert dynamic_traffic_phase(0.33, 0.60) == CongestionLevel.HEAVY
+    assert dynamic_traffic_phase(0.45, 0.60) == CongestionLevel.SEVERE
+    assert dynamic_traffic_phase(0.64, 0.60) == CongestionLevel.LOW
+
+
+def test_controlled_hotspot_zone_path_survives_schema_serialization():
+    from schemas.navigation import CongestionHotspot, CongestionLevel
+
+    hotspot = CongestionHotspot.model_validate({
+        "hotspot_id": "test-dynamic-primary",
+        "location_name": "Controlled demo road",
+        "lat": 11.02,
+        "lon": 77.00,
+        "distance_from_origin_m": 4000.0,
+        "congestion_level": CongestionLevel.SEVERE,
+        "zone_end_distance_m": 4800.0,
+        "zone_path": [[77.00, 11.02], [77.001, 11.021], [77.002, 11.022]],
+        "cause": "Controlled traffic test",
+    })
+    assert hotspot.zone_end_distance_m == 4800.0
+    assert hotspot.zone_path == [[77.0, 11.02], [77.001, 11.021], [77.002, 11.022]]

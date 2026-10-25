@@ -1,14 +1,16 @@
 from typing import List, Dict, Any
 import httpx
 from core.config import settings
+from core.region import get_region
 
 class NominatimService:
     @staticmethod
     async def search_places(query: str) -> List[Dict[str, Any]]:
         """Search places via Nominatim API bounded to Bengaluru region with static fallback for reliability."""
         sanitized_query = query.strip()
-        if "bengaluru" not in sanitized_query.lower() and "bangalore" not in sanitized_query.lower():
-            sanitized_query = f"{sanitized_query}, Bengaluru, India"
+        region = get_region()
+        if not any(alias in sanitized_query.lower() for alias in region.nominatim_aliases):
+            sanitized_query = f"{sanitized_query}, {region.nominatim_suffix}"
 
         headers = {
             "User-Agent": "ApexGuardian/1.0 (contact@apexguardian.local)"
@@ -16,7 +18,7 @@ class NominatimService:
         params = {
             "q": sanitized_query,
             "format": "json",
-            "viewbox": "77.46,13.15,77.75,12.80",
+            "viewbox": region.nominatim_viewbox,
             "bounded": "1",
             "limit": "5"
         }

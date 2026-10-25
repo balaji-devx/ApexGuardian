@@ -1,0 +1,16 @@
+................................................                         [100%]
+============================== warnings summary ===============================
+C:\Python314\Lib\site-packages\fastapi\testclient.py:1
+  C:\Python314\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+C:\Python314\Lib\site-packages\starlette\testclient.py:53
+  C:\Python314\Lib\site-packages\starlette\testclient.py:53: DeprecationWarning: The anyio.abc.BlockingPortal alias is deprecated, use anyio.from_thread.BlockingPortal instead.
+    _PortalFactoryType = Callable[[], AbstractContextManager[anyio.abc.BlockingPortal]]
+
+tests/test_patch_regressions.py::test_controlled_dropdown_reroute_uses_street_snapped_osrm
+  E:\PROJECTS\ApexGuardian V2.0\ApexGuardian\backend\tests\test_patch_regressions.py:225: PydanticDeprecatedSince20: The `dict` method is deprecated; use `model_dump` instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.13/migration/
+    assert "Synthetic Congestion Bypass" not in str(recommendation.recommended_route.dict())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+48 passed, 3 warnings in 15.03s

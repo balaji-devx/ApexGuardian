@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from typing import Tuple, List, Dict
 from openlocationcode import openlocationcode as olc
+from core.region import get_region
 import asyncio
 import time
 
@@ -10,18 +11,21 @@ class TrafficDataPipeline:
     """Feature engineering pipeline for Apex Guardian V2.0 Route-Level Model."""
 
     DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
-    TML_TRAFFIC_CSV = os.path.join(DATASETS_DIR, "tml", "csv-traffic-bangalore.csv")
-    CACHE_FILE = os.path.join(DATASETS_DIR, "tml", "osrm_cache.json")
-    
-    BLR_LAT = 12.9716
-    BLR_LON = 77.5946
+    # Dataset, OSRM-cache and Plus-Code reference all follow the ACTIVE_REGION setting
+    # (default "bengaluru" => behaviour identical to before this change).
+    REGION = get_region()
+    TML_TRAFFIC_CSV = REGION.traffic_csv
+    CACHE_FILE = REGION.osrm_cache
+
+    # Shortened Plus Codes (e.g. "XJG4+7J") are recovered relative to this point.
+    REF_LAT, REF_LON = REGION.plus_code_reference
     
     _osrm_cache = {}
 
     @classmethod
     def _decode_plus_code(cls, code: str) -> Tuple[float, float]:
         if len(code) <= 8 and '+' in code:
-            full_code = olc.recoverNearest(code, cls.BLR_LAT, cls.BLR_LON)
+            full_code = olc.recoverNearest(code, cls.REF_LAT, cls.REF_LON)
         else:
             full_code = code
         decoded = olc.decode(full_code)
@@ -101,99 +105,148 @@ class TrafficDataPipeline:
 
     @classmethod
     def load_canonical_dataset(cls) -> pd.DataFrame:
+        """Load canonical rows efficiently by decoding/cache-resolving each unique route once.
+
+        The output columns and feature values are unchanged. This avoids row-wise Python
+        ``DataFrame.apply`` calls across multi-million-row synthetic datasets.
+        """
         if not os.path.exists(cls.TML_TRAFFIC_CSV):
             raise FileNotFoundError(f"Missing TML dataset at {cls.TML_TRAFFIC_CSV}")
-            
-        df = pd.read_csv(cls.TML_TRAFFIC_CSV)
-        df['timestamp'] = pd.to_datetime(df['date'] + ' ' + df['time'])
-        
-        def resolve_route(rc: str):
-            parts = str(rc).split('|')
-            if len(parts) == 2:
+
+        # Weather columns are not model features. Reading only the five required source
+        # columns saves substantial RAM for the 5M+ row Coimbatore dataset.
+        df = pd.read_csv(
+            cls.TML_TRAFFIC_CSV,
+            usecols=["date", "time", "route_code", "duration", "distance"],
+            dtype={"date": "string", "time": "string", "route_code": "category"},
+        )
+        df["timestamp"] = pd.to_datetime(df["date"] + " " + df["time"], errors="coerce")
+        df = df.dropna(subset=["timestamp", "route_code"]).copy()
+
+        # Decode each unique route once, not once for every observation.
+        route_codes = [str(code) for code in df["route_code"].cat.categories]
+        coords_by_code = {}
+        for rc in route_codes:
+            parts = rc.split("|")
+            if len(parts) != 2:
+                coords_by_code[rc] = (np.nan, np.nan, np.nan, np.nan)
+                continue
+            try:
                 o_lat, o_lon = cls._decode_plus_code(parts[0])
                 d_lat, d_lon = cls._decode_plus_code(parts[1])
-                return pd.Series([o_lat, o_lon, d_lat, d_lon])
-            return pd.Series([np.nan, np.nan, np.nan, np.nan])
-            
-        df[['origin_lat', 'origin_lon', 'destination_lat', 'destination_lon']] = df['route_code'].apply(resolve_route)
-        df = df.dropna(subset=['origin_lat'])
-        unique_routes = df[['route_code', 'origin_lat', 'origin_lon', 'destination_lat', 'destination_lon']].drop_duplicates()
-        
+                coords_by_code[rc] = (o_lat, o_lon, d_lat, d_lon)
+            except Exception:
+                coords_by_code[rc] = (np.nan, np.nan, np.nan, np.nan)
+
+        coord_cols = ["origin_lat", "origin_lon", "destination_lat", "destination_lon"]
+        for i, col in enumerate(coord_cols):
+            df[col] = df["route_code"].map({rc: coords[i] for rc, coords in coords_by_code.items()}).astype("float64")
+        df = df.dropna(subset=["origin_lat", "origin_lon", "destination_lat", "destination_lon"]).copy()
+
+        unique_routes = df[["route_code", *coord_cols]].drop_duplicates()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-            
         if loop and loop.is_running():
             raise RuntimeError("load_canonical_dataset must be run in a separate sync wrapper")
-        else:
-            asyncio.run(cls._build_osrm_cache(unique_routes))
-            
-        def apply_osrm(row):
-            key = f"{row['origin_lat']},{row['origin_lon']},{row['destination_lat']},{row['destination_lon']}"
-            f = cls._osrm_cache[key]
-            return pd.Series([
-                f['osrm_dist'],
-                f['osrm_dur_min'],
-                f['steps_count'],
-                f['turns'],
-                f['roundabouts'],
-                f['avg_step_len']
-            ])
-            
-        df[['osrm_dist', 'osrm_dur_min', 'steps_count', 'turns', 'roundabouts', 'avg_step_len']] = df.apply(apply_osrm, axis=1)
-        df = df[df['osrm_dur_min'] > 0]
-        
-        df['distance_km'] = df['distance']
-        df['observed_duration_min'] = df['duration']
-        df['congestion_factor'] = df['observed_duration_min'] / df['osrm_dur_min']
-        
-        df['hour'] = df['timestamp'].dt.hour
-        df['day_of_week'] = df['timestamp'].dt.dayofweek
-        df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
-        df['month'] = df['timestamp'].dt.month
-        
+        asyncio.run(cls._build_osrm_cache(unique_routes))
+
+        # Attach OSRM features by route code. The persisted cache remains authoritative and
+        # retains the same key format as the original implementation.
+        route_features = {}
+        for row in unique_routes.itertuples(index=False, name=None):
+            route_code, o_lat, o_lon, d_lat, d_lon = row
+            key = f"{o_lat},{o_lon},{d_lat},{d_lon}"
+            if key not in cls._osrm_cache:
+                raise RuntimeError(f"Missing OSRM cache entry for route {route_code}: {key}")
+            route_features[str(route_code)] = cls._osrm_cache[key]
+
+        feature_map_fields = {
+            "osrm_dist": "osrm_dist",
+            "osrm_dur_min": "osrm_dur_min",
+            "steps_count": "steps_count",
+            "turns": "turns",
+            "roundabouts": "roundabouts",
+            "avg_step_len": "avg_step_len",
+        }
+        for column, cache_field in feature_map_fields.items():
+            df[column] = df["route_code"].map({rc: feat[cache_field] for rc, feat in route_features.items()}).astype("float64")
+        df = df[df["osrm_dur_min"] > 0].copy()
+
+        df["distance_km"] = df["distance"]
+        df["observed_duration_min"] = df["duration"]
+        df["congestion_factor"] = df["observed_duration_min"] / df["osrm_dur_min"]
+        df["hour"] = df["timestamp"].dt.hour
+        df["day_of_week"] = df["timestamp"].dt.dayofweek
+        df["is_weekend"] = df["day_of_week"].isin([5, 6]).astype(int)
+        df["month"] = df["timestamp"].dt.month
+
         canonical_cols = [
-            'timestamp', 'route_code', 'origin_lat', 'origin_lon', 
-            'destination_lat', 'destination_lon', 'observed_duration_min', 
-            'osrm_dist', 'osrm_dur_min', 'steps_count', 'turns', 'roundabouts', 'avg_step_len',
-            'congestion_factor', 'hour', 'day_of_week', 'is_weekend', 'month'
+            "timestamp", "route_code", "origin_lat", "origin_lon",
+            "destination_lat", "destination_lon", "observed_duration_min",
+            "osrm_dist", "osrm_dur_min", "steps_count", "turns", "roundabouts", "avg_step_len",
+            "congestion_factor", "hour", "day_of_week", "is_weekend", "month",
         ]
-        
         return df[canonical_cols].copy()
 
     @classmethod
     def get_train_val_test_splits(cls):
         df = cls.load_canonical_dataset()
-        
+
         # SANITY CHECKS BEFORE SPLIT
-        if (df['osrm_dur_min'] == 1.0).all():
+        if (df["osrm_dur_min"] == 1.0).all():
             raise RuntimeError("SANITY CHECK FAILED: All OSRM durations are exactly 1.0! Dataset is corrupted.")
-        if df['osrm_dur_min'].min() <= 0:
+        if df["osrm_dur_min"].min() <= 0:
             raise RuntimeError("SANITY CHECK FAILED: OSRM duration <= 0 found!")
-        
+        if not np.isfinite(df["congestion_factor"].to_numpy()).all() or (df["congestion_factor"] <= 0).any():
+            raise RuntimeError("SANITY CHECK FAILED: non-finite or non-positive congestion factor found!")
+
         print("\n--- SANITY CHECKS ---")
         print(f"Valid Rows: {len(df)}")
         print(f"OSRM Duration Mean: {df['osrm_dur_min'].mean():.2f}")
         print("Congestion Factor Stats:")
-        print(df['congestion_factor'].describe(percentiles=[0.9, 0.95, 0.99]))
-        
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
+        print(df["congestion_factor"].describe(percentiles=[0.9, 0.95, 0.99]))
+
+        df = df.sort_values("timestamp", kind="mergesort").reset_index(drop=True)
         features = [
-            'hour', 'day_of_week', 'is_weekend', 'month',
-            'osrm_dist', 'osrm_dur_min', 'steps_count', 'turns', 'roundabouts', 'avg_step_len'
+            "hour", "day_of_week", "is_weekend", "month",
+            "osrm_dist", "osrm_dur_min", "steps_count", "turns", "roundabouts", "avg_step_len",
         ]
-            
-        X = df[features].values
-        y = df['congestion_factor'].values
-        
+        X = df[features].to_numpy()
+        y = df["congestion_factor"].to_numpy()
+
         n = len(df)
-        train_idx = int(0.75 * n)
-        val_idx = int(0.85 * n)
-        
+        train_target = int(0.75 * n)
+        val_target = int(0.85 * n)
+
+        if cls.REGION.key == "coimbatore":
+            # All routes are observed at the same timestamp in the balanced CBE schedule.
+            # Split at timestamp-group boundaries to avoid sharing a timestamp across train/val/test.
+            group_sizes = df.groupby("timestamp", sort=True, observed=True).size().to_numpy(dtype=np.int64)
+            cumulative = np.cumsum(group_sizes, dtype=np.int64)
+            if len(cumulative) < 3:
+                raise RuntimeError("Insufficient unique timestamps for chronological train/val/test splits")
+            i_train = int(np.argmin(np.abs(cumulative - train_target)))
+            candidates = np.arange(i_train + 1, len(cumulative))
+            if len(candidates) == 0:
+                raise RuntimeError("Insufficient timestamps after training split")
+            i_val = int(candidates[np.argmin(np.abs(cumulative[candidates] - val_target))])
+            train_idx = int(cumulative[i_train])
+            val_idx = int(cumulative[i_val])
+            print("Split strategy: strict chronological timestamp groups (Coimbatore)")
+        else:
+            # Preserve the exact historical Bengaluru row-split behaviour.
+            train_idx = train_target
+            val_idx = val_target
+
         X_train, y_train = X[:train_idx], y[:train_idx]
         X_val, y_val = X[train_idx:val_idx], y[train_idx:val_idx]
         X_test, y_test = X[val_idx:], y[val_idx:]
-        
+
+        if not all(len(a) > 0 for a in (X_train, X_val, X_test)):
+            raise RuntimeError("Chronological split produced an empty train, validation, or test partition")
+        if not all(np.isfinite(a).all() for a in (X_train, X_val, X_test, y_train, y_val, y_test)):
+            raise RuntimeError("SANITY CHECK FAILED: non-finite feature or target values in train/validation/test")
+
         return X_train, y_train, X_val, y_val, X_test, y_test, features

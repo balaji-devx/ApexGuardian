@@ -101,3 +101,125 @@ def test_zones_next_to_vehicle_are_ignored():
              {"lat": 12.9600, "lon": 77.6000, "radius_km": 0.06}]      # ~1.1 km ahead
     usable = _usable_avoid_zones(zones, 12.9500, 77.6000)
     assert len(usable) == 1 and usable[0]["lat"] == 12.9600
+
+def test_controlled_dropdown_reroute_uses_street_snapped_osrm(monkeypatch):
+    """HEAVY/SEVERE/DYNAMIC test reroutes must use OSRM road geometry, never a fake polyline."""
+    import asyncio
+    from services.osrm import OSRMService
+    from ml.recommender import RouteScorer
+    from services.reroute_engine import DynamicRerouteEngine
+
+    current_lat, current_lon = 12.9300, 77.6000
+    dest_lat, dest_lon = 12.9900, 77.6500
+
+    def dense_coords(points, max_segment_m=900.0):
+        from math import ceil, cos, hypot, radians
+        dense = [list(points[0])]
+        for start, end in zip(points, points[1:]):
+            mean_lat = radians((start[1] + end[1]) / 2.0)
+            dx = (end[0] - start[0]) * 111320.0 * cos(mean_lat)
+            dy = (end[1] - start[1]) * 111132.0
+            pieces = max(1, ceil(hypot(dx, dy) / max_segment_m))
+            for part in range(1, pieces + 1):
+                fraction = part / pieces
+                dense.append([
+                    start[0] + (end[0] - start[0]) * fraction,
+                    start[1] + (end[1] - start[1]) * fraction,
+                ])
+        return dense
+
+    initial = {
+        "route_index": 0,
+        "distance_meters": 10000.0,
+        "duration_seconds": 700.0,
+        "geometry": {
+            "type": "LineString",
+            "coordinates": dense_coords([
+                    [77.6000, 12.9300],
+                    [77.6120, 12.9420],
+                    [77.6240, 12.9540],
+                    [77.6360, 12.9660],
+                    [77.6500, 12.9900],
+                ]),
+        },
+        "steps": [
+            {
+                "distance": 7800.0,
+                "duration": 700.0,
+                "name": "Congested Main Road",
+                "maneuver": {"type": "continue", "modifier": "straight"},
+            }
+        ],
+    }
+
+    # This represents an OSRM-returned street-snapped alternative.  The test
+    # deliberately uses named roads/turns rather than a synthetic single-step.
+    bypass = {
+        "route_index": 0,
+        "distance_meters": 11000.0,
+        "duration_seconds": 900.0,
+        "geometry": {
+            "type": "LineString",
+            "coordinates": dense_coords([
+                    [77.6000, 12.9300],
+                    [77.6020, 12.9380],
+                    [77.6200, 12.9400],
+                    [77.6400, 12.9520],
+                    [77.6500, 12.9900],
+                ]),
+        },
+        "steps": [
+            {
+                "distance": 2100.0,
+                "duration": 190.0,
+                "name": "Service Road",
+                "maneuver": {"type": "depart", "modifier": "straight"},
+            },
+            {
+                "distance": 4300.0,
+                "duration": 420.0,
+                "name": "Outer Ring Road",
+                "maneuver": {"type": "turn", "modifier": "right"},
+            },
+            {
+                "distance": 2900.0,
+                "duration": 290.0,
+                "name": "Bellandur Road",
+                "maneuver": {"type": "turn", "modifier": "left"},
+            },
+        ],
+    }
+
+    waypoint_calls = []
+
+    async def mock_get_routes(*args, **kwargs):
+        return [initial.copy()]
+
+    async def mock_get_routes_via_waypoints(waypoints):
+        waypoint_calls.append(waypoints)
+        return [bypass.copy()]
+
+    monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
+    monkeypatch.setattr(OSRMService, "get_routes_via_waypoints", staticmethod(mock_get_routes_via_waypoints))
+    monkeypatch.setattr(RouteScorer, "evaluate_routes", staticmethod(lambda routes, *args, **kwargs: routes))
+
+    recommendation = asyncio.run(
+        DynamicRerouteEngine.evaluate_reroute(
+            current_lat=current_lat,
+            current_lon=current_lon,
+            dest_lat=dest_lat,
+            dest_lon=dest_lon,
+            original_remaining_duration_s=700.0,
+            avoid_hotspots=[{"lat": 12.9540, "lon": 77.6240, "radius_km": 0.45}],
+            traffic_test_mode=TrafficTestMode.HEAVY,
+            traffic_progress=0.40,
+            synthetic_traffic_active=True,
+        )
+    )
+
+    assert waypoint_calls, "Controlled test reroute must probe OSRM via waypoints"
+    assert recommendation.is_reroute_recommended
+    assert recommendation.recommended_route is not None
+    assert recommendation.recommended_route.source == "reroute"
+    assert recommendation.recommended_route.steps[1]["name"] == "Outer Ring Road"
+    assert "Synthetic Congestion Bypass" not in str(recommendation.recommended_route.dict())

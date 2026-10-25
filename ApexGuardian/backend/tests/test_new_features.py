@@ -88,9 +88,16 @@ def test_traffic_factors_endpoint():
 def test_traffic_hotspots_endpoint():
     response = client.get("/api/v1/traffic/hotspots")
     assert response.status_code == 200
+
     data = response.json()
     assert data["success"] is True
-    assert len(data["hotspots"]) > 0
+    assert isinstance(data["hotspots"], list)
+    assert data["count"] == len(data["hotspots"])
+
+    for hotspot in data["hotspots"]:
+        assert "lat" in hotspot
+        assert "lon" in hotspot
+        assert "location_name" in hotspot
 
 def test_dynamic_reroute_endpoint():
     payload = {

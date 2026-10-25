@@ -114,3 +114,53 @@ def test_test_traffic_scenarios_change_only_backend_segment_evaluation():
     assert test_result["hotspots"]
     assert all(hotspot["congestion_level"] == "SEVERE" for hotspot in test_result["hotspots"])
     assert all(segment["color"] == "#DC2626" for segment in severe_segments)
+
+
+def _candidate_for_route_selection(index, duration_s, predicted_s, lat_offset):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        route_index=index,
+        original_route_index=index,
+        distance_meters=duration_s * 12.0,
+        duration_seconds=duration_s,
+        predicted_duration_seconds=predicted_s,
+        geometry={
+            "type": "LineString",
+            "coordinates": [
+                [76.9500, 11.0100 + lat_offset],
+                [76.9600, 11.0200 + lat_offset],
+                [76.9700, 11.0300 + lat_offset],
+            ],
+        },
+        is_ai_recommended=False,
+        recommendation_label="",
+    )
+
+
+def test_route_selector_returns_one_ai_and_one_distinct_osrm_choice():
+    fastest_osrm = _candidate_for_route_selection(0, 600.0, 620.0, 0.00)
+    fastest_ai = _candidate_for_route_selection(1, 760.0, 410.0, 0.025)
+    extra_route = _candidate_for_route_selection(2, 690.0, 470.0, 0.050)
+
+    ranked = rank_processed_routes([fastest_osrm, fastest_ai, extra_route])
+
+    assert ranked[0] is fastest_ai
+    assert ranked[0].is_ai_recommended is True
+    assert ranked[0].recommendation_label == "AI Recommended Route"
+    assert ranked[1] is fastest_osrm
+    assert ranked[1].is_ai_recommended is False
+    assert ranked[1].recommendation_label == "OSRM Preferred Route"
+    assert ranked[2].recommendation_label == "Additional Alternative"
+    assert sum(route.is_ai_recommended for route in ranked) == 1
+    assert sum(route.recommendation_label == "OSRM Preferred Route" for route in ranked) == 1
+
+
+def test_route_selector_never_duplicates_geometry_to_fake_an_osrm_choice():
+    first = _candidate_for_route_selection(0, 600.0, 500.0, 0.00)
+    duplicate = _candidate_for_route_selection(1, 650.0, 550.0, 0.0001)
+
+    ranked = rank_processed_routes([first, duplicate])
+
+    assert ranked[0] is first
+    assert ranked[0].recommendation_label == "AI + OSRM Best Route"
+    assert sum(route.recommendation_label == "OSRM Preferred Route" for route in ranked) == 0

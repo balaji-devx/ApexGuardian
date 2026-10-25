@@ -4,6 +4,7 @@ import numpy as np
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from ml.dataset import TrafficDataPipeline
+from core.region import get_region
 
 class RouteCongestionPredictor:
     """V3.0 ML Model for Apex Guardian.
@@ -15,7 +16,7 @@ class RouteCongestionPredictor:
     def __init__(self):
         self.model = None
         self.weights_dir = os.path.join(os.path.dirname(__file__), "weights")
-        self.model_path = os.path.join(self.weights_dir, "congestion_model_v3_fixed.pkl")
+        self.model_path = os.path.join(self.weights_dir, get_region().model_filename)
         
         if not os.path.exists(self.weights_dir):
             os.makedirs(self.weights_dir)
@@ -47,4 +48,3 @@ class RouteCongestionPredictor:
 
 # Global instance
 predictor = RouteCongestionPredictor()
-

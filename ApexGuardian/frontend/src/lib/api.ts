@@ -88,6 +88,11 @@ export interface CandidateRoute {
   // Segmented Breakdown & Hotspots (Features 1 & 2)
   segments?: CongestionSegment[];
   hotspots?: CongestionHotspot[];
+  /** Preplanned real OSRM road alternative for a controlled congestion test. */
+  controlled_test_bypass_route?: CandidateRoute | null;
+  controlled_test_switch_distance_m?: number | null;
+  controlled_test_zone_start_distance_m?: number | null;
+  controlled_test_zone_end_distance_m?: number | null;
   clear_distance_km?: number;
   moderate_distance_km?: number;
   heavy_distance_km?: number;

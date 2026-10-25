@@ -4,7 +4,8 @@ import React, { useEffect, useRef } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { TRAFFIC_COLORS } from "@/lib/trafficScenario";
-import { useNavigation, BENGALURU_CENTER, haversineMeters } from "@/context/NavigationContext";
+import { useNavigation, haversineMeters } from "@/context/NavigationContext";
+import { ACTIVE_REGION_CENTER, ACTIVE_REGION_CONFIG, ACTIVE_REGION_MAP_BOUNDS } from "@/lib/region";
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
@@ -14,12 +15,12 @@ const AI_ROUTE_GREEN_DARK = "#15803D";
 const OSRM_ROUTE_BLUE = "#2563EB";     // OSRM preferred / second-best route
 const OSRM_ROUTE_BLUE_DARK = "#1D4ED8";
 
-export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
+const escapePopupText = (value: unknown): string => String(value ?? "").replace(/[&<>"']/g, (character) => {
+  const entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" };
+  return entities[character] ?? character;
+});
 
-export const BENGALURU_MAX_BOUNDS: maplibregl.LngLatBoundsLike = [
-  [77.4000, 12.8000], // South-West
-  [77.8000, 13.1500], // North-East
-];
+export const mapRefContainer: { current: maplibregl.Map | null } = { current: null };
 
 export const MapCanvas: React.FC = () => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -82,11 +83,11 @@ export const MapCanvas: React.FC = () => {
           },
         ],
       },
-      center: [BENGALURU_CENTER.lon, BENGALURU_CENTER.lat],
-      zoom: 12.5,
+      center: [ACTIVE_REGION_CENTER.lon, ACTIVE_REGION_CENTER.lat],
+      zoom: ACTIVE_REGION_CONFIG.defaultZoom,
       minZoom: 10,
       maxZoom: 19,
-      maxBounds: BENGALURU_MAX_BOUNDS,
+      maxBounds: ACTIVE_REGION_MAP_BOUNDS,
       pitch: 0,
       bearing: 0,
       attributionControl: false,
@@ -476,13 +477,12 @@ export const MapCanvas: React.FC = () => {
             renderedLayersRef.current.push(lineLayerId);
 
             // Click-to-switch behavior
-            if (!isSelected) {
-              const clickListener = () => {
-                if (!isNavigating) {
-                  setActiveRouteIndex(idx);
-                }
-              };
+            if (!isSelected && !isNavigating) {
+              const clickListener = () => setActiveRouteIndex(idx);
+              // The outer casing is a wide hit target on thick/glowing route lines.
+              map.on("click", casingLayerId, clickListener);
               map.on("click", lineLayerId, clickListener);
+              renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
               renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
             }
           });
@@ -491,7 +491,12 @@ export const MapCanvas: React.FC = () => {
           if (route.hotspots && route.hotspots.length > 0) {
             route.hotspots.forEach((hotspot) => {
               const locId = `${hotspot.lat.toFixed(3)}_${hotspot.lon.toFixed(3)}`;
-              if (renderedHotspotIds.has(locId)) return;
+              // Routes are drawn inactive-first, so otherwise an inactive marker can be
+              // deduplicated here and suppress the active route's clickable popup.
+              const activeRouteHasSameHotspot = !isSelected && (routes[activeRouteIndex]?.hotspots || []).some(
+                (activeHotspot) => `${activeHotspot.lat.toFixed(3)}_${activeHotspot.lon.toFixed(3)}` === locId,
+              );
+              if (activeRouteHasSameHotspot || renderedHotspotIds.has(locId)) return;
               renderedHotspotIds.add(locId);
 
               // Skip a pin that is essentially co-located with the vehicle.
@@ -511,49 +516,9 @@ export const MapCanvas: React.FC = () => {
               const el = document.createElement("div");
               const level = hotspot.congestion_level || "HEAVY";
               const isSevere = level === "SEVERE";
-              const isModerate = level === "MODERATE";
               const levelColor = TRAFFIC_COLORS[level];
-              const isHeavy = level === "HEAVY";
               const accessibleLabel = `${level[0]}${level.slice(1).toLowerCase()} traffic ahead at ${hotspot.location_name}`;
 
-              let pinFill = "#DC2626"; // Red (Heavy)
-              let pinStroke = "#F87171";
-              let shadowColor = "rgba(220, 38, 38, 0.4)";
-              let iconSvg = "";
-              let titleColor = "text-rose-400";
-              let badgeBg = "bg-rose-600 text-white";
-
-              if (isModerate) {
-                pinFill = "#D97706"; // Amber (Moderate)
-                pinStroke = "#FBBF24";
-                shadowColor = "rgba(217, 119, 6, 0.35)";
-                titleColor = "text-amber-400";
-                badgeBg = "bg-amber-600 text-white";
-                // Shape: Single vehicle silhouette
-                iconSvg = `
-                  <path d="M22 13H14c-.5 0-.9.3-1.1.7L11.5 16v4.5c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7V16l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#D97706"/>
-                `;
-              } else if (isSevere) {
-                pinFill = "#991B1B"; // Crimson Maroon (Severe)
-                pinStroke = "#E11D48";
-                shadowColor = "rgba(225, 29, 72, 0.6)";
-                titleColor = "text-rose-400";
-                badgeBg = "bg-rose-700 text-white ring-1 ring-rose-400";
-                // Shape: Queued vehicles + warning badge (!)
-                iconSvg = `
-                  <path d="M19 10h-4c-.3 0-.5.2-.6.4L13.5 12h7l-.7-1.6c-.1-.2-.4-.4-.8-.4z" fill="#991B1B" opacity="0.6"/>
-                  <path d="M22 13.5H14c-.5 0-.9.3-1.1.7L11.5 16.5V21c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-4.5l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#991B1B"/>
-                  <circle cx="28" cy="8" r="5.5" fill="#FBBF24" stroke="#78350F" stroke-width="1"/>
-                  <path d="M28 5v4M28 10v1" stroke="#991B1B" stroke-width="1.5" stroke-linecap="round"/>
-                `;
-              } else {
-                // Shape: Group of 3 vehicles
-                iconSvg = `
-                  <path d="M15 13H11c-.3 0-.5.2-.6.4l-1.4 1.8V18c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-.5h6v.5c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-2.8l-1.4-1.8c-.1-.2-.3-.4-.6-.4zm-4.1.5h4.2l.4 1.2h-5l.4-1.2zm4.1 3c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5zm-4 0c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5z" fill="#DC2626" opacity="0.5"/>
-                  <path d="M26 13h-4c-.3 0-.5.2-.6.4L20 15.2V18c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-.5h6v.5c0 .3.2.5.5.5h.5c.3 0 .5-.2.5-.5v-2.8l-1.4-1.8c-.1-.2-.3-.4-.6-.4zm-4.1.5h4.2l.4 1.2h-5l.4-1.2zm4.1 3c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5zm-4 0c-.3 0-.5-.2-.5-.5s.2-.5.5-.5.5.2.5.5-.2.5-.5.5z" fill="#DC2626" opacity="0.5"/>
-                  <path d="M22 17.5h-8c-.5 0-.9.3-1.1.7L11.5 20.5V25c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-.7h8.8v.7c0 .4.3.7.7.7h.7c.4 0 .7-.3.7-.7v-4.5l-1.4-2.3c-.2-.4-.6-.7-1.1-.7zm-7.7.7h7.4l.7 1.8h-8.8l.7-1.8zm7.7 5.3c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7zm-8 0c-.4 0-.7-.3-.7-.7s.3-.7.7-.7.7.3.7.7-.3.7-.7.7z" fill="#DC2626"/>
-                `;
-              }
               // Opacity for non-selected route pins
               if (!isSelected) {
                 el.style.opacity = "0.5";
@@ -563,7 +528,8 @@ export const MapCanvas: React.FC = () => {
               }
 
               el.className = "relative cursor-pointer group";
-              el.setAttribute("role", "img");
+              el.setAttribute("role", "button");
+              el.tabIndex = isSelected ? 0 : -1;
               el.setAttribute("aria-label", accessibleLabel);
               el.setAttribute("title", accessibleLabel);
               el.style.width = "44px";
@@ -583,23 +549,28 @@ export const MapCanvas: React.FC = () => {
               // Interactive Popup on Click / Hover (only if selected)
               if (isSelected) {
                 const popupContent = `
-                  <div class="p-2.5 rounded-xl bg-slate-900/95 text-white text-xs space-y-1 shadow-2xl border border-slate-700 min-w-[170px] backdrop-blur-md">
-                    <div class="font-extrabold text-xs flex items-center gap-1.5" style="color:${levelColor}">
-                      <span>${accessibleLabel}</span>
+                  <div class="p-3 rounded-xl bg-slate-900/95 text-white text-xs space-y-1.5 shadow-2xl border border-slate-700 min-w-[190px] backdrop-blur-md">
+                    <div class="font-extrabold text-xs" style="color:${levelColor}">
+                      ${escapePopupText(accessibleLabel)}
                     </div>
                     <div class="flex items-center justify-between text-slate-300 text-[11px]">
-                      <span>Average Speed:</span>
-                      <span class="font-bold text-amber-300">${hotspot.average_speed_kmh} km/h</span>
+                      <span>Average speed</span>
+                      <span class="font-bold text-amber-300">${escapePopupText(hotspot.average_speed_kmh)} km/h</span>
                     </div>
-                    <div class="text-[10px] text-slate-400 font-medium pt-0.5">
-                      ${hotspot.description || hotspot.cause || "Traffic congestion bottleneck"}
+                    <div class="flex items-center justify-between text-slate-300 text-[11px]">
+                      <span>Estimated delay</span>
+                      <span class="font-bold text-rose-300">${Math.max(0, Math.round((hotspot.estimated_delay_seconds || 0) / 60))} min</span>
+                    </div>
+                    <div class="text-[11px] text-slate-300 font-medium pt-1 border-t border-slate-700">
+                      ${escapePopupText(hotspot.description || hotspot.cause || "Traffic congestion bottleneck")}
                     </div>
                   </div>
                 `;
 
                 const popup = new maplibregl.Popup({
                   offset: [0, -46],
-                  closeButton: false,
+                  closeButton: true,
+                  closeOnClick: false,
                   className: "custom-hotspot-popup",
                 }).setHTML(popupContent);
 
@@ -607,6 +578,12 @@ export const MapCanvas: React.FC = () => {
                   .setLngLat([hotspot.lon, hotspot.lat])
                   .setPopup(popup)
                   .addTo(map);
+                el.addEventListener("keydown", (event: KeyboardEvent) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    marker.togglePopup();
+                  }
+                });
 
                 hotspotMarkersRef.current.push(marker);
               } else {
@@ -660,13 +637,12 @@ export const MapCanvas: React.FC = () => {
           });
           renderedLayersRef.current.push(lineLayerId);
 
-          if (!isSelected) {
-            const clickListener = () => {
-              if (!isNavigating) {
-                setActiveRouteIndex(idx);
-              }
-            };
+          if (!isSelected && !isNavigating) {
+            const clickListener = () => setActiveRouteIndex(idx);
+            // The outer casing is a wide hit target on thick/glowing route lines.
+            map.on("click", casingLayerId, clickListener);
             map.on("click", lineLayerId, clickListener);
+            renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
             renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
           }
         }
@@ -760,7 +736,7 @@ export const MapCanvas: React.FC = () => {
       });
     } else {
       map.flyTo({
-        center: [BENGALURU_CENTER.lon, BENGALURU_CENTER.lat],
+        center: [ACTIVE_REGION_CENTER.lon, ACTIVE_REGION_CENTER.lat],
         zoom: 12.5,
         duration: 1200,
       });

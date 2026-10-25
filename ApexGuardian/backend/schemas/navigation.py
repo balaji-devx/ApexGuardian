@@ -93,6 +93,10 @@ class CandidateRoute(BaseModel):
     # Feature 1 & 2: Segmented congestion breakdown & Hotspots
     segments: List[CongestionSegment] = Field(default_factory=list)
     hotspots: List[CongestionHotspot] = Field(default_factory=list)
+    controlled_test_bypass_route: Optional[Dict[str, Any]] = None
+    controlled_test_switch_distance_m: Optional[float] = None
+    controlled_test_zone_start_distance_m: Optional[float] = None
+    controlled_test_zone_end_distance_m: Optional[float] = None
     clear_distance_km: float = 0.0
     moderate_distance_km: float = 0.0
     heavy_distance_km: float = 0.0
