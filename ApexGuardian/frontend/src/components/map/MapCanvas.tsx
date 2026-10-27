@@ -10,10 +10,29 @@ import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
 // Route identity colours (used only where traffic is clear; congestion keeps its own colours).
-const AI_ROUTE_GREEN = "#16A34A";      // AI recommended route
-const AI_ROUTE_GREEN_DARK = "#15803D";
-const OSRM_ROUTE_BLUE = "#2563EB";     // OSRM preferred / second-best route
-const OSRM_ROUTE_BLUE_DARK = "#1D4ED8";
+export const AI_ROUTE_GREEN = "#16A34A";      // AI recommended route
+export const AI_ROUTE_GREEN_DARK = "#15803D";
+export const OSRM_ROUTE_BLUE = "#2563EB";     // OSRM preferred / second-best route
+export const OSRM_ROUTE_BLUE_DARK = "#1D4ED8";
+
+export interface RouteClearColorOptions {
+  isSelected: boolean;
+  isAI: boolean;
+  trafficTestMode: string;
+}
+
+export function getRouteClearColors({
+  isSelected,
+  isAI,
+  trafficTestMode,
+}: RouteClearColorOptions): { clearColor: string; clearCasing: string } {
+  const isRerouteColorTest = trafficTestMode === "heavy" || trafficTestMode === "dynamic";
+  const useGreenForClearStretches = isAI || (isSelected && isRerouteColorTest);
+  return {
+    clearColor: useGreenForClearStretches ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE,
+    clearCasing: useGreenForClearStretches ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK,
+  };
+}
 
 const escapePopupText = (value: unknown): string => String(value ?? "").replace(/[&<>"']/g, (character) => {
   const entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" };
@@ -126,9 +145,7 @@ export const MapCanvas: React.FC = () => {
       const newOrigin = { lat: roundedLat, lon: roundedLon, name: initialName };
       setSelectedOriginRef.current(newOrigin);
       setSourceQueryRef.current(initialName);
-      if (currentMode !== "none") {
-        setPinDropModeRef.current("none");
-      }
+      setPinDropModeRef.current("none");
       if (selectedDestinationRef.current) {
         void calculateRoutesRef.current(newOrigin, selectedDestinationRef.current);
       }
@@ -145,9 +162,7 @@ export const MapCanvas: React.FC = () => {
       const newDest = { lat: roundedLat, lon: roundedLon, name: initialName };
       setSelectedDestinationRef.current(newDest);
       setDestinationQueryRef.current(initialName);
-      if (currentMode !== "none") {
-        setPinDropModeRef.current("none");
-      }
+      setPinDropModeRef.current("none");
       if (selectedOriginRef.current) {
         void calculateRoutesRef.current(selectedOriginRef.current, newDest);
       }
@@ -480,10 +495,10 @@ export const MapCanvas: React.FC = () => {
 
         const isSelected = idx === activeRouteIndex;
         const isAI = Boolean(route.is_ai_recommended);
-        // The currently selected/active route is always green, regardless of whether its
-        // original source was AI or OSRM. Unselected OSRM alternatives remain blue.
-        const clearColor = isSelected || isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
-        const clearCasing = isSelected || isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
+        const isRerouteColorTest = trafficTestMode === "heavy" || trafficTestMode === "dynamic";
+        const useGreenForClearStretches = isAI || (isSelected && isRerouteColorTest);
+        const clearColor = useGreenForClearStretches ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
+        const clearCasing = useGreenForClearStretches ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
 
         // Layer Mode Filtering
         if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;

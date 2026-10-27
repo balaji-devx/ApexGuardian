@@ -99,7 +99,26 @@ def test_traffic_hotspots_endpoint():
         assert "lon" in hotspot
         assert "location_name" in hotspot
 
-def test_dynamic_reroute_endpoint():
+def test_dynamic_reroute_endpoint(monkeypatch):
+    from services.osrm import OSRMService
+    mock_candidate = {
+        "route_index": 0,
+        "distance_meters": 5200.0,
+        "duration_seconds": 720.0,
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [
+                [77.6066, 12.9756],
+                [77.6150, 12.9550],
+                [77.6245, 12.9352],
+            ],
+        },
+        "steps": [{"name": "Brigade Rd", "distance": 5200.0, "duration": 720.0}],
+    }
+    async def mock_get_routes(*args, **kwargs):
+        return [mock_candidate.copy()]
+    monkeypatch.setattr(OSRMService, "get_routes", staticmethod(mock_get_routes))
+
     payload = {
         "current_lat": 12.9756,
         "current_lon": 77.6066,

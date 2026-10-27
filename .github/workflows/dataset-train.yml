@@ -1,0 +1,112 @@
+name: Manual Dataset & Model Training Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo_id:
+        description: "Hugging Face dataset repo (e.g. your-org/apexguardian-coimbatore-traffic)"
+        required: true
+        type: string
+      expected_sha256:
+        description: "Expected SHA-256 checksum of csv-traffic-coimbatore.csv"
+        required: false
+        default: "07d185de5333cc477782ac6a44d8595d3032024fd81ff7bd559d0b64a0c58612"
+        type: string
+      region:
+        description: "Region key to train"
+        required: true
+        default: "coimbatore"
+        type: choice
+        options:
+          - coimbatore
+          - bengaluru
+
+permissions:
+  contents: read
+
+jobs:
+  train-model:
+    name: Download Dataset & Train Model
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ApexGuardian/backend
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: ApexGuardian/backend/requirements.txt
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install huggingface_hub
+
+      - name: Download Dataset from Private Hugging Face Hub
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - << 'EOF'
+          import os, sys
+          from huggingface_hub import hf_hub_download
+
+          token = os.environ.get("HF_TOKEN")
+          if not token:
+              print("::error::HF_TOKEN secret is required to download from private Hugging Face repo.")
+              sys.exit(1)
+
+          repo_id = "${{ inputs.hf_repo_id }}"
+          print(f"Downloading csv-traffic-coimbatore.csv from {repo_id}...")
+          target_dir = os.path.join("ml", "datasets", "cbe")
+          os.makedirs(target_dir, exist_ok=True)
+          
+          downloaded = hf_hub_download(
+              repo_id=repo_id,
+              filename="csv-traffic-coimbatore.csv",
+              repo_type="dataset",
+              token=token,
+              local_dir=target_dir,
+              local_dir_use_symlinks=False
+          )
+          print(f"Downloaded to: {downloaded}")
+          EOF
+
+      - name: Validate Dataset Checksum
+        run: |
+          EXPECTED="${{ inputs.expected_sha256 }}"
+          if [ -n "$EXPECTED" ]; then
+            CALCULATED=$(sha256sum ml/datasets/cbe/csv-traffic-coimbatore.csv | awk '{print $1}')
+            echo "Calculated: $CALCULATED"
+            echo "Expected:   $EXPECTED"
+            if [ "$CALCULATED" != "$EXPECTED" ]; then
+              echo "::error::Dataset SHA-256 checksum mismatch!"
+              exit 1
+            fi
+            echo "Dataset checksum verified."
+          fi
+
+      - name: Train XGBoost Congestion Model
+        env:
+          ACTIVE_REGION: ${{ inputs.region }}
+        run: |
+          python ml/train.py
+
+      - name: Run Regression Tests Against Trained Model
+        env:
+          ACTIVE_REGION: ${{ inputs.region }}
+        run: |
+          python -m pytest tests/test_ml_pipeline.py -q
+
+      - name: Upload Trained Model Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-${{ inputs.region }}-model
+          path: ApexGuardian/backend/ml/weights/*.pkl
+          retention-days: 14

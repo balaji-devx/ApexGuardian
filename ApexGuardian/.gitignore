@@ -38,9 +38,11 @@ build/
 *.tsbuildinfo
 tsconfig.tsbuildinfo
 
-# ML Weights (Only track the canonical V3 fixed weights)
+# ML Weights (Only track canonical production weights)
 backend/ml/weights/*.pkl
+backend/ml/weights/*.candidate.pkl
 !backend/ml/weights/congestion_model_v3_fixed.pkl
+!backend/ml/weights/congestion_model_coimbatore_synthetic_v1.pkl
 
 # Do not ignore frontend lib directory
 !frontend/src/lib/

@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: apexguardian-backend
+    runtime: python
+    rootDir: ApexGuardian/backend
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    plan: free
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: ENVIRONMENT
+        value: production
+      - key: ACTIVE_REGION
+        value: coimbatore
+      - key: OSRM_BASE_URL
+        value: https://router.project-osrm.org
+      - key: NOMINATIM_BASE_URL
+        value: https://nominatim.openstreetmap.org
+      - key: MODEL_WEIGHTS_PATH
+        value: ml/weights/congestion_model_coimbatore_synthetic_v1.pkl
+      - key: CORS_ORIGINS
+        # Update this list in Render dashboard with your actual Vercel domain upon frontend deployment
+        value: '["http://localhost:3000", "http://127.0.0.1:3000"]'
