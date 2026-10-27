@@ -28,6 +28,7 @@ export const NavigationControlsHUD: React.FC = () => {
     isNavigating,
     navigationMode,
     gpsStatus,
+    gpsLocationSource,
     gpsAccuracyMeters,
     gpsError,
     stopNavigation,
@@ -126,7 +127,7 @@ export const NavigationControlsHUD: React.FC = () => {
           <div className="flex shrink-0 items-center gap-2">
             <div className="flex flex-col items-end rounded-xl border border-white/10 bg-black/30 px-2 py-1 sm:px-3">
               <div className="flex items-baseline gap-1">
-                <span className="text-lg font-black text-emerald-400 sm:text-2xl">{Math.round(currentVehicleSpeed)}</span>
+                <span className={`text-lg font-black sm:text-2xl ${navigationMode === "gps" && gpsLocationSource === "demo" ? "text-amber-300" : "text-emerald-400"}`}>{Math.round(currentVehicleSpeed)}</span>
                 <span className="text-[9px] font-extrabold uppercase text-slate-400">km/h</span>
               </div>
               {isDetailsExpanded && <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Speed</span>}
@@ -148,8 +149,41 @@ export const NavigationControlsHUD: React.FC = () => {
             {navigationMode === "gps" ? "GPS Navigation" : "Simulation Mode"}
           </span>
           {navigationMode === "gps" && (
-            <span aria-live="polite" className={gpsStatus === "tracking" ? "text-emerald-300" : gpsStatus === "arrived" ? "text-blue-200" : "text-amber-300"}>
-              {gpsStatus === "arrived" ? "Arrived" : gpsStatus === "tracking" ? `GPS ±${Math.round(gpsAccuracyMeters || 0)} m` : gpsStatus === "rerouting" ? "Recalculating route" : "GPS signal weak"}
+            <span
+              aria-live="polite"
+              className={`inline-flex min-w-0 items-center gap-1.5 ${
+                gpsLocationSource === "demo"
+                  ? "text-amber-300"
+                  : gpsStatus === "tracking"
+                  ? "text-emerald-300"
+                  : gpsStatus === "arrived"
+                  ? "text-blue-200"
+                  : "text-amber-300"
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  gpsLocationSource === "demo"
+                    ? "bg-amber-300"
+                    : gpsStatus === "tracking"
+                    ? "bg-emerald-300"
+                    : "bg-amber-300"
+                }`}
+              />
+              <span className="truncate">
+                {gpsStatus === "arrived"
+                  ? "Arrived"
+                  : gpsLocationSource === "demo"
+                  ? "GPS navigation active"
+                  : gpsStatus === "tracking"
+                  ? `GPS ±${Math.round(gpsAccuracyMeters || 0)} m`
+                  : gpsStatus === "rerouting"
+                  ? "Updating route"
+                  : gpsStatus === "degraded" && gpsAccuracyMeters
+                  ? `GPS ±${Math.round(gpsAccuracyMeters)} m · low accuracy`
+                  : "GPS navigation active"}
+              </span>
             </span>
           )}
         </div>
@@ -167,43 +201,38 @@ export const NavigationControlsHUD: React.FC = () => {
           />
         </div>
 
+        <div className="flex items-center justify-between text-[11px] font-bold text-slate-300">
+          <span aria-label="Distance remaining">
+            {simDistanceRemainingM >= 1000
+              ? `${(simDistanceRemainingM / 1000).toFixed(1)} km remaining`
+              : `${Math.round(simDistanceRemainingM)} m remaining`}
+          </span>
+          <span aria-label="Estimated time to destination">
+            {simEtaSeconds > 0 ? `${Math.ceil(simEtaSeconds / 60)} min to destination` : "Arrived"}
+          </span>
+        </div>
+
         {isDetailsExpanded && (
           <>
-            <div className="flex items-center justify-between text-[11px] font-bold text-slate-300">
-              <span aria-label="Distance remaining">
-                {simDistanceRemainingM >= 1000
-                  ? `${(simDistanceRemainingM / 1000).toFixed(1)} km remaining`
-                  : `${Math.round(simDistanceRemainingM)} m remaining`}
-              </span>
-              <span aria-label="Estimated time to destination">
-                {simEtaSeconds > 0 ? `${Math.ceil(simEtaSeconds / 60)} min to destination` : "Arrived"}
-              </span>
-            </div>
-
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
-              {navigationMode === "simulation" ? (
-              <div className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
-                <button
-                  onClick={() => setIsSimPlaying(!isSimPlaying)}
-                  className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 text-white hover:bg-white/20"
-                  title={isSimPlaying ? "Pause Simulation" : "Play Simulation"}
-                >
-                  {isSimPlaying ? <Pause className="h-4 w-4 fill-current" /> : <Play className="ml-0.5 h-4 w-4 fill-current" />}
-                </button>
-                <button
-                  onClick={() => setSimSpeedMultiplier(simSpeedMultiplier === 1 ? 2 : simSpeedMultiplier === 2 ? 5 : 1)}
-                  className="flex items-center gap-1 rounded-xl bg-white/10 px-2.5 py-1.5 text-xs font-black text-amber-300 hover:bg-white/20"
-                  title="Simulation Speed Multiplier"
-                >
-                  <FastForward className="h-3.5 w-3.5" /> <span>{simSpeedMultiplier}x</span>
-                </button>
-              </div>
-            ) : (
-              <div className="rounded-xl border border-emerald-500/30 bg-emerald-600/15 px-3 py-2 text-xs font-bold text-emerald-200">
-                Live device location
-              </div>
-            )}
-
+              {navigationMode === "simulation" && (
+                <div className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
+                  <button
+                    onClick={() => setIsSimPlaying(!isSimPlaying)}
+                    className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 text-white hover:bg-white/20"
+                    title={isSimPlaying ? "Pause Simulation" : "Play Simulation"}
+                  >
+                    {isSimPlaying ? <Pause className="h-4 w-4 fill-current" /> : <Play className="ml-0.5 h-4 w-4 fill-current" />}
+                  </button>
+                  <button
+                    onClick={() => setSimSpeedMultiplier(simSpeedMultiplier === 1 ? 2 : simSpeedMultiplier === 2 ? 5 : 1)}
+                    className="flex items-center gap-1 rounded-xl bg-white/10 px-2.5 py-1.5 text-xs font-black text-amber-300 hover:bg-white/20"
+                    title="Simulation Speed Multiplier"
+                  >
+                    <FastForward className="h-3.5 w-3.5" /> <span>{simSpeedMultiplier}x</span>
+                  </button>
+                </div>
+              )}
               <button
                 onClick={handleToggleVoice}
                 className={`flex items-center gap-1.5 rounded-2xl border px-3 py-2 text-xs font-bold ${!isVoiceMuted ? "border-blue-500/50 bg-blue-600/30 text-blue-200" : "border-white/10 bg-white/5 text-slate-300"}`}

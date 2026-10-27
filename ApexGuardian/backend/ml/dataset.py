@@ -12,7 +12,7 @@ class TrafficDataPipeline:
 
     DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
     # Dataset, OSRM-cache and Plus-Code reference all follow the ACTIVE_REGION setting
-    # (default "bengaluru" => behaviour identical to before this change).
+    # (default "coimbatore" for the college demo; set ACTIVE_REGION=bengaluru to opt into Bengaluru).
     REGION = get_region()
     TML_TRAFFIC_CSV = REGION.traffic_csv
     CACHE_FILE = REGION.osrm_cache

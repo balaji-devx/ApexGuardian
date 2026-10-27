@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useCallback } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { TRAFFIC_COLORS } from "@/lib/trafficScenario";
 import { useNavigation, haversineMeters } from "@/context/NavigationContext";
-import { ACTIVE_REGION_CENTER, ACTIVE_REGION_CONFIG, ACTIVE_REGION_MAP_BOUNDS } from "@/lib/region";
+import { ACTIVE_REGION_CENTER, ACTIVE_REGION_CONFIG } from "@/lib/region";
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
@@ -30,6 +30,7 @@ export const MapCanvas: React.FC = () => {
   const vehicleMarkerRef = useRef<maplibregl.Marker | null>(null);
   const hotspotMarkersRef = useRef<maplibregl.Marker[]>([]);
   const lastCameraFollowTimeRef = useRef<number>(0);
+  const lastClickTimestampRef = useRef<number>(0);
 
   const {
     selectedOrigin,
@@ -55,6 +56,113 @@ export const MapCanvas: React.FC = () => {
     activeRerouteRecommendation,
     navigationHudHeight,
   } = useNavigation();
+
+  // Stable refs for values used inside event handlers.
+  // This lets us register map listeners ONCE and always read the latest state.
+  const pinDropModeRef = useRef(pinDropMode);
+  const selectedOriginRef = useRef(selectedOrigin);
+  const selectedDestinationRef = useRef(selectedDestination);
+  const calculateRoutesRef = useRef(calculateRoutes);
+  const setSelectedOriginRef = useRef(setSelectedOrigin);
+  const setSelectedDestinationRef = useRef(setSelectedDestination);
+  const setSourceQueryRef = useRef(setSourceQuery);
+  const setDestinationQueryRef = useRef(setDestinationQuery);
+  const setPinDropModeRef = useRef(setPinDropMode);
+  const isNavigatingRef = useRef(isNavigating);
+  const activeRouteIndexRef = useRef(activeRouteIndex);
+
+  // Keep refs in sync with latest values on every render (no effects needed).
+  pinDropModeRef.current = pinDropMode;
+  selectedOriginRef.current = selectedOrigin;
+  selectedDestinationRef.current = selectedDestination;
+  calculateRoutesRef.current = calculateRoutes;
+  setSelectedOriginRef.current = setSelectedOrigin;
+  setSelectedDestinationRef.current = setSelectedDestination;
+  setSourceQueryRef.current = setSourceQuery;
+  setDestinationQueryRef.current = setDestinationQuery;
+  setPinDropModeRef.current = setPinDropMode;
+  isNavigatingRef.current = isNavigating;
+  activeRouteIndexRef.current = activeRouteIndex;
+
+  // Map Click Listener for Destination and Origin Selection — stable callback that reads from refs.
+  // Defined before the map init effect so it can be passed to map.on() during initialization.
+  const stableHandleMapClick = useCallback((e: maplibregl.MapMouseEvent) => {
+    // If actively driving/navigating, do not permit map click destination changes
+    if (isNavigatingRef.current) return;
+
+    // Ignore clicks directly on map markers, popups, or controls
+    const origTarget = e.originalEvent?.target as HTMLElement | null;
+    if (origTarget && (
+      origTarget.closest(".maplibregl-marker") ||
+      origTarget.closest(".maplibregl-popup") ||
+      origTarget.closest(".maplibregl-ctrl")
+    )) {
+      return;
+    }
+
+    // Map clicks only place a pin when the user explicitly enabled a drop mode.
+    // Otherwise the click is reserved for route-line selection (OSRM vs AI route).
+    const currentMode = pinDropModeRef.current;
+    if (currentMode === "none") return;
+
+    // Debounce rapid double-clicks to prevent duplicate pin / route requests.
+    const now = Date.now();
+    if (now - lastClickTimestampRef.current < 300) {
+      return;
+    }
+    lastClickTimestampRef.current = now;
+
+    const { lng, lat } = e.lngLat;
+    const roundedLat = parseFloat(lat.toFixed(5));
+    const roundedLon = parseFloat(lng.toFixed(5));
+
+    // The explicit button determines the target. After one pin is placed the mode
+    // returns to "none", so another map click cannot silently replace the destination.
+    const targetMode: "source" | "destination" = currentMode;
+
+    const initialName = `Location (${roundedLat}, ${roundedLon})`;
+
+    if (targetMode === "source") {
+      const newOrigin = { lat: roundedLat, lon: roundedLon, name: initialName };
+      setSelectedOriginRef.current(newOrigin);
+      setSourceQueryRef.current(initialName);
+      if (currentMode !== "none") {
+        setPinDropModeRef.current("none");
+      }
+      if (selectedDestinationRef.current) {
+        void calculateRoutesRef.current(newOrigin, selectedDestinationRef.current);
+      }
+      reverseGeocode(roundedLat, roundedLon).then((rev) => {
+        if (rev?.display_name) {
+          const resolvedName = rev.display_name;
+          setSelectedOriginRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+          setSourceQueryRef.current(resolvedName);
+        }
+      }).catch((err) => {
+        console.warn("[MapCanvas] Reverse geocode background warning:", err);
+      });
+    } else {
+      const newDest = { lat: roundedLat, lon: roundedLon, name: initialName };
+      setSelectedDestinationRef.current(newDest);
+      setDestinationQueryRef.current(initialName);
+      if (currentMode !== "none") {
+        setPinDropModeRef.current("none");
+      }
+      if (selectedOriginRef.current) {
+        void calculateRoutesRef.current(selectedOriginRef.current, newDest);
+      }
+      reverseGeocode(roundedLat, roundedLon).then((rev) => {
+        if (rev?.display_name) {
+          const resolvedName = rev.display_name;
+          setSelectedDestinationRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+          setDestinationQueryRef.current(resolvedName);
+        }
+      }).catch((err) => {
+        console.warn("[MapCanvas] Reverse geocode background warning:", err);
+      });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // stable — reads from refs
 
   // Initialize MapLibre GL
   useEffect(() => {
@@ -85,9 +193,8 @@ export const MapCanvas: React.FC = () => {
       },
       center: [ACTIVE_REGION_CENTER.lon, ACTIVE_REGION_CENTER.lat],
       zoom: ACTIVE_REGION_CONFIG.defaultZoom,
-      minZoom: 10,
+      minZoom: 3,
       maxZoom: 19,
-      maxBounds: ACTIVE_REGION_MAP_BOUNDS,
       pitch: 0,
       bearing: 0,
       attributionControl: false,
@@ -100,6 +207,10 @@ export const MapCanvas: React.FC = () => {
     map.on("zoom", () => setCurrentZoom(map.getZoom()));
     map.on("zoomend", () => setCurrentZoom(map.getZoom()));
 
+    // Register the stable click handler here — guaranteed map exists, and it
+    // persists for the full lifetime of this map instance.
+    map.on("click", stableHandleMapClick);
+
     mapRef.current = map;
     mapRefContainer.current = map;
 
@@ -109,11 +220,12 @@ export const MapCanvas: React.FC = () => {
 
     return () => {
       clearTimeout(timer);
+      map.off("click", stableHandleMapClick);
       map.remove();
       mapRef.current = null;
       mapRefContainer.current = null;
     };
-  }, [setCurrentZoom]);
+  }, [setCurrentZoom, stableHandleMapClick]);
 
   // Window Resize Listener
   useEffect(() => {
@@ -134,68 +246,23 @@ export const MapCanvas: React.FC = () => {
     };
   }, []);
 
+  // Disable double-click zoom while pin drop mode is active so double clicks don't zoom instead of placing pin
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (pinDropMode !== "none") {
+      map.doubleClickZoom.disable();
+    } else {
+      map.doubleClickZoom.enable();
+    }
+  }, [pinDropMode]);
+
   // Update cursor based on pinDropMode
   useEffect(() => {
     if (mapRef.current) {
       mapRef.current.getCanvas().style.cursor = pinDropMode !== "none" ? "crosshair" : "";
     }
   }, [pinDropMode]);
-
-
-  // Map Click Listener for Pin Drop
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const handleMapClick = async (e: maplibregl.MapMouseEvent) => {
-      if (pinDropMode === "none") return;
-
-      const { lng, lat } = e.lngLat;
-      const roundedLat = parseFloat(lat.toFixed(5));
-      const roundedLon = parseFloat(lng.toFixed(5));
-
-      let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-      try {
-        const rev = await reverseGeocode(roundedLat, roundedLon);
-        if (rev && rev.display_name) resolvedName = rev.display_name;
-      } catch (err) {
-        console.error("Reverse geocode error:", err);
-      }
-
-      if (pinDropMode === "source") {
-        const newOrigin = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-        setSelectedOrigin(newOrigin);
-        setSourceQuery(resolvedName);
-        setPinDropMode("none");
-        if (selectedDestination) {
-          await calculateRoutes(newOrigin, selectedDestination);
-        }
-      } else if (pinDropMode === "destination") {
-        const newDest = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-        setSelectedDestination(newDest);
-        setDestinationQuery(resolvedName);
-        setPinDropMode("none");
-        if (selectedOrigin) {
-          await calculateRoutes(selectedOrigin, newDest);
-        }
-      }
-    };
-
-    map.on("click", handleMapClick);
-    return () => {
-      map.off("click", handleMapClick);
-    };
-  }, [
-    pinDropMode,
-    selectedOrigin,
-    selectedDestination,
-    setSelectedOrigin,
-    setSelectedDestination,
-    setSourceQuery,
-    setDestinationQuery,
-    setPinDropMode,
-    calculateRoutes,
-  ]);
 
   // Origin Marker (Section 5: Matching Drop-Pin Style in Emerald Green)
   useEffect(() => {
@@ -217,25 +284,28 @@ export const MapCanvas: React.FC = () => {
           .setLngLat([selectedOrigin.lon, selectedOrigin.lat])
           .addTo(map);
 
-        marker.on("dragend", async () => {
+        marker.on("dragend", () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
+          const initialName = `Location (${roundedLat}, ${roundedLon})`;
 
-          let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-          try {
-            const rev = await reverseGeocode(roundedLat, roundedLon);
-            if (rev && rev.display_name) resolvedName = rev.display_name;
-          } catch (err) {
-            console.error("Reverse geocode drag error:", err);
+          const newOrigin = { lat: roundedLat, lon: roundedLon, name: initialName };
+          setSelectedOriginRef.current(newOrigin);
+          setSourceQueryRef.current(initialName);
+          if (selectedDestinationRef.current) {
+            void calculateRoutesRef.current(newOrigin, selectedDestinationRef.current);
           }
 
-          const newOrigin = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-          setSelectedOrigin(newOrigin);
-          setSourceQuery(resolvedName);
-          if (selectedDestination) {
-            await calculateRoutes(newOrigin, selectedDestination);
-          }
+          reverseGeocode(roundedLat, roundedLon).then((rev) => {
+            if (rev?.display_name) {
+              const resolvedName = rev.display_name;
+              setSelectedOriginRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+              setSourceQueryRef.current(resolvedName);
+            }
+          }).catch((err) => {
+            console.warn("[MapCanvas] Reverse geocode drag error:", err);
+          });
         });
 
         originMarkerRef.current = marker;
@@ -246,7 +316,7 @@ export const MapCanvas: React.FC = () => {
       originMarkerRef.current.remove();
       originMarkerRef.current = null;
     }
-  }, [selectedOrigin, selectedDestination, setSelectedOrigin, setSourceQuery, calculateRoutes]);
+  }, [selectedOrigin]);
 
   // Destination Marker
   useEffect(() => {
@@ -268,25 +338,28 @@ export const MapCanvas: React.FC = () => {
           .setLngLat([selectedDestination.lon, selectedDestination.lat])
           .addTo(map);
 
-        marker.on("dragend", async () => {
+        marker.on("dragend", () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
+          const initialName = `Location (${roundedLat}, ${roundedLon})`;
 
-          let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-          try {
-            const rev = await reverseGeocode(roundedLat, roundedLon);
-            if (rev && rev.display_name) resolvedName = rev.display_name;
-          } catch (err) {
-            console.error("Reverse geocode drag error:", err);
+          const newDest = { lat: roundedLat, lon: roundedLon, name: initialName };
+          setSelectedDestinationRef.current(newDest);
+          setDestinationQueryRef.current(initialName);
+          if (selectedOriginRef.current) {
+            void calculateRoutesRef.current(selectedOriginRef.current, newDest);
           }
 
-          const newDest = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-          setSelectedDestination(newDest);
-          setDestinationQuery(resolvedName);
-          if (selectedOrigin) {
-            await calculateRoutes(selectedOrigin, newDest);
-          }
+          reverseGeocode(roundedLat, roundedLon).then((rev) => {
+            if (rev?.display_name) {
+              const resolvedName = rev.display_name;
+              setSelectedDestinationRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+              setDestinationQueryRef.current(resolvedName);
+            }
+          }).catch((err) => {
+            console.warn("[MapCanvas] Reverse geocode drag error:", err);
+          });
         });
 
         destMarkerRef.current = marker;
@@ -297,7 +370,7 @@ export const MapCanvas: React.FC = () => {
       destMarkerRef.current.remove();
       destMarkerRef.current = null;
     }
-  }, [selectedDestination, selectedOrigin, setSelectedDestination, setDestinationQuery, calculateRoutes]);
+  }, [selectedDestination]);
 
   // Smooth Vehicle Marker & Camera Follow (Section 4)
   useEffect(() => {
@@ -407,10 +480,10 @@ export const MapCanvas: React.FC = () => {
 
         const isSelected = idx === activeRouteIndex;
         const isAI = Boolean(route.is_ai_recommended);
-        // PATCH: identity colour. AI recommended = green, every other route (the OSRM preferred /
-        // second-best one) = blue. Clicking a route no longer changes its identity colour.
-        const clearColor = isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
-        const clearCasing = isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
+        // The currently selected/active route is always green, regardless of whether its
+        // original source was AI or OSRM. Unselected OSRM alternatives remain blue.
+        const clearColor = isSelected || isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
+        const clearCasing = isSelected || isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
 
         // Layer Mode Filtering
         if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;
@@ -478,11 +551,11 @@ export const MapCanvas: React.FC = () => {
 
             // Click-to-switch behavior
             if (!isSelected && !isNavigating) {
-              const clickListener = () => setActiveRouteIndex(idx);
-              // The outer casing is a wide hit target on thick/glowing route lines.
-              map.on("click", casingLayerId, clickListener);
+              const clickListener = () => {
+                if (pinDropModeRef.current !== "none") return;
+                setActiveRouteIndex(idx);
+              };
               map.on("click", lineLayerId, clickListener);
-              renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
               renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
             }
           });
@@ -638,11 +711,11 @@ export const MapCanvas: React.FC = () => {
           renderedLayersRef.current.push(lineLayerId);
 
           if (!isSelected && !isNavigating) {
-            const clickListener = () => setActiveRouteIndex(idx);
-            // The outer casing is a wide hit target on thick/glowing route lines.
-            map.on("click", casingLayerId, clickListener);
+            const clickListener = () => {
+              if (pinDropModeRef.current !== "none") return;
+              setActiveRouteIndex(idx);
+            };
             map.on("click", lineLayerId, clickListener);
-            renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
             renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
           }
         }
@@ -669,8 +742,10 @@ export const MapCanvas: React.FC = () => {
           source: rerouteSourceId,
           layout: { "line-join": "round", "line-cap": "round" },
           paint: {
-            "line-color": "#EC4899",
-            "line-width": 6,
+            // Once an alternate route is recommended, show it with the same green
+            // active-route color as the committed navigation path.
+            "line-color": AI_ROUTE_GREEN,
+            "line-width": 7,
             "line-opacity": 0.9,
             "line-offset": 4,
           },
@@ -751,7 +826,7 @@ export const MapCanvas: React.FC = () => {
         style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0 }}
       />
       {pinDropMode !== "none" && (
-        <div className="absolute top-6 left-3 right-3 mx-auto w-fit max-w-[calc(100%-1.5rem)] bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse" style={{ zIndex: OVERLAY_Z.mapPrompt }}>
+        <div className="absolute top-6 left-3 right-3 mx-auto w-fit max-w-[calc(100%-1.5rem)] bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse pointer-events-none" style={{ zIndex: OVERLAY_Z.mapPrompt }}>
           <p className="text-sm font-bold tracking-wide text-center">
             Tap the map to set your <span className="text-blue-400">{pinDropMode === "source" ? "starting" : "destination"}</span> point
           </p>

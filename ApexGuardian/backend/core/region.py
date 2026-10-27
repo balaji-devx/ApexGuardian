@@ -114,11 +114,68 @@ REGIONS = {
 
 
 def get_region(key: Optional[str] = None) -> RegionProfile:
-    """Return the active region profile (``ACTIVE_REGION`` env/.env setting; default Bengaluru)."""
+    """Return the active region profile (``ACTIVE_REGION`` env/.env setting; default Coimbatore)."""
     if key is None:
         from core.config import settings
         key = settings.ACTIVE_REGION
-    key = (key or "bengaluru").strip().lower()
+    key = (key or "coimbatore").strip().lower()
     if key not in REGIONS:
         raise ValueError(f"Unknown ACTIVE_REGION '{key}'. Valid options: {sorted(REGIONS)}")
     return REGIONS[key]
+
+
+def list_registered_regions() -> List[RegionProfile]:
+    """Return all registered region profiles."""
+    return list(REGIONS.values())
+
+
+
+def is_valid_coordinate(lat: float, lon: float) -> bool:
+    """Check if lat/lon are finite, valid WGS-84 coordinates (-90 <= lat <= 90, -180 <= lon <= 180)."""
+    try:
+        import math
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+            return False
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return False
+        return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+    except Exception:
+        return False
+
+
+def find_region_by_coordinates(lat: float, lon: float) -> Optional[RegionProfile]:
+    """Find a registered region whose bounding box contains the coordinate."""
+    for region in REGIONS.values():
+        if region.is_within_bounds(lat, lon):
+            return region
+    return None
+
+
+def resolve_route_region(
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    requested_region: Optional[str] = None,
+) -> Optional[RegionProfile]:
+    """
+    Resolve which traffic region applies to a route.
+    1. If requested_region is provided and matches a registered region, use it.
+    2. Check if origin and destination fall within the same registered region.
+    3. If one point falls within a registered region and the other is near or inside, use that region.
+    4. Otherwise, return None (unsupported traffic region; standard OSRM routing applies).
+    """
+    if requested_region and requested_region.strip().lower() in REGIONS:
+        return REGIONS[requested_region.strip().lower()]
+
+    origin_region = find_region_by_coordinates(origin_lat, origin_lon)
+    dest_region = find_region_by_coordinates(dest_lat, dest_lon)
+
+    if origin_region and dest_region and origin_region.key == dest_region.key:
+        return origin_region
+    if origin_region and not dest_region:
+        return origin_region
+    if dest_region and not origin_region:
+        return dest_region
+
+    return None

@@ -1,5 +1,5 @@
 import math
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from services.traffic_service import LiveTrafficService
 from schemas.navigation import CongestionLevel
 
@@ -32,7 +32,8 @@ class CongestionDetector:
         steps: List[Dict[str, Any]], 
         total_distance_m: float, 
         base_duration_s: float,
-        is_emergency_mode: bool = False
+        is_emergency_mode: bool = False,
+        region: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Analyzes a candidate route and returns segmented traffic breakdown, hotspots, and predictive metrics."""
         coordinates: List[List[float]] = geometry.get("coordinates", [])
@@ -92,12 +93,24 @@ class CongestionDetector:
             # Predictive arrival offset: When will the driver physically reach this segment?
             prediction_offset_min = cumulative_elapsed_s / 60.0
 
-            # Real-time traffic factor telemetry at that predicted timestamp
-            traffic_factors = LiveTrafficService.get_point_traffic_factors(
-                lat=mid_lat, 
-                lon=mid_lon, 
-                prediction_offset_min=prediction_offset_min
-            )
+            # Real-time traffic factor telemetry: out-of-coverage routes use baseline freeflow
+            if region is None:
+                traffic_factors = {
+                    "current_speed_kmh": 45.0,
+                    "freeflow_speed_kmh": 45.0,
+                    "density_index": 20.0,
+                    "congestion_level": CongestionLevel.LOW.value,
+                    "congestion_factor": 1.0,
+                    "color": "#16A34A",
+                    "incident_description": None,
+                }
+            else:
+                traffic_factors = LiveTrafficService.get_point_traffic_factors(
+                    lat=mid_lat, 
+                    lon=mid_lon, 
+                    prediction_offset_min=prediction_offset_min,
+                    region=region
+                )
 
             # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
             #             # In emergency mode, emergency vehicles experience lower baseline congestion

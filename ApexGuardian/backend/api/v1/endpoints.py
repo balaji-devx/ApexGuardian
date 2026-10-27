@@ -4,7 +4,7 @@ import uuid
 import math
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Body
-from core.region import get_region
+from core.region import get_region, is_valid_coordinate, resolve_route_region
 from schemas.navigation import (
     LocationSearchResponse, 
     RouteRequest, 
@@ -24,12 +24,49 @@ from services.congestion_detector import CongestionDetector
 from services.reroute_engine import DynamicRerouteEngine
 from services.notification_service import PushNotificationService
 from services.route_selection import rank_processed_routes
-from services.traffic_scenario import apply_traffic_test_scenario
+from services.traffic_scenario import apply_traffic_test_scenario, compute_scenario_zone
 from services.controlled_bypass_planner import plan_controlled_bypass, build_controlled_bypass_candidates
 from ml.recommender import RouteScorer
 
 logger = logging.getLogger("apexguardian.api")
 router = APIRouter()
+
+
+def _clear_controlled_test_analysis(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a clean-road traffic view for alternative routes in controlled tests.
+
+    Only the selected test corridor should carry the synthetic jam. Applying the
+    same scenario to every OSRM candidate paints a second jam onto the bypass and
+    can make the UI reroute repeatedly between congested alternatives.
+    """
+    segments: List[Dict[str, Any]] = []
+    total_distance = 0.0
+    for raw_segment in analysis.get("segments", []):
+        segment = dict(raw_segment)
+        distance = max(0.0, float(segment.get("distance_meters", 0.0) or 0.0))
+        freeflow_speed = max(20.0, float(segment.get("freeflow_speed_kmh", 45.0) or 45.0))
+        duration = distance / max(0.5, freeflow_speed / 3.6)
+        segment.update({
+            "congestion_level": "LOW",
+            "color": "#16A34A",
+            "current_speed_kmh": round(freeflow_speed, 1),
+            "delay_seconds": 0.0,
+            "duration_seconds": round(duration, 1),
+            "congestion_factor": 1.0,
+        })
+        segments.append(segment)
+        total_distance += distance
+    cleaned = dict(analysis)
+    cleaned.update({
+        "segments": segments,
+        "hotspots": [],
+        "total_delay_seconds": 0.0,
+        "clear_distance_km": round(total_distance / 1000.0, 2),
+        "moderate_distance_km": 0.0,
+        "heavy_distance_km": 0.0,
+        "severe_distance_km": 0.0,
+    })
+    return cleaned
 
 @router.get("/health")
 async def health_check():
@@ -84,16 +121,37 @@ async def reverse_geocode(lat: float = Query(..., description="Latitude"), lon: 
 @router.post("/route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
     """Calculates driving routes with ML scoring, multi-colored congestion segments, and hotspot detection."""
-    origin_in_bounds = get_region().is_within_bounds(request.origin_lat, request.origin_lon)
-    dest_in_bounds = get_region().is_within_bounds(request.dest_lat, request.dest_lon)
+    # 1. Coordinate Validation
+    if not is_valid_coordinate(request.origin_lat, request.origin_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid origin coordinates: ({request.origin_lat}, {request.origin_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+    if not is_valid_coordinate(request.dest_lat, request.dest_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination coordinates: ({request.dest_lat}, {request.dest_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
 
-    if not origin_in_bounds:
-        logger.warning(f"Origin coordinates ({request.origin_lat}, {request.origin_lon}) are outside {get_region().display_name} bounding box.")
-    if not dest_in_bounds:
-        logger.warning(f"Destination coordinates ({request.dest_lat}, {request.dest_lon}) are outside {get_region().display_name} bounding box.")
+    # 2. Dynamic Geographic Region Resolution
+    route_region = resolve_route_region(
+        request.origin_lat,
+        request.origin_lon,
+        request.dest_lat,
+        request.dest_lon,
+        requested_region=request.region
+    )
+    if route_region:
+        logger.info(
+            f"Route matched traffic region '{route_region.display_name}' ({route_region.key}). Regional ML traffic model active."
+        )
+    else:
+        logger.info(
+            f"Coordinates ({request.origin_lat}, {request.origin_lon}) -> ({request.dest_lat}, {request.dest_lon}) outside regional traffic models. Baseline routing active."
+        )
 
     try:
-        # 1. Fetch High-Resolution OSRM Street Driving Polylines
+        # 3. Fetch High-Resolution OSRM Street Driving Polylines
         raw_candidates = await OSRMService.get_routes(
             origin_lat=request.origin_lat,
             origin_lon=request.origin_lon,
@@ -129,16 +187,18 @@ async def calculate_route(request: RouteRequest):
                     controlled_plan["zone_end_distance_m"], controlled_plan["minimum_bypass_clearance_m"],
                 )
             else:
-                # Important: a failed planner never pauses the vehicle. It continues on
-                # its current road instead of presenting a false "no possible routes" stop.
-                logger.warning("[TrafficTest] No verified bypass exists for this route pair; simulation will continue without pausing")
-        # 2. Evaluate Candidates with Route-Level ML Model
+                # The frontend will attempt a zone-specific live avoidance reroute at the
+                # 1 km trigger when no valid preplanned pair exists; it never reroutes for
+                # unrelated congestion in a controlled test.
+                logger.warning("[TrafficTest] No preplanned bypass; zone-specific fallback reroute will be attempted 1000m before the test hotspot")
+        # 4. Evaluate Candidates with Route-Level ML Model
         ml_evaluated_candidates = RouteScorer.evaluate_routes(
             raw_candidates,
             request.origin_lat,
             request.origin_lon,
             request.dest_lat,
             request.dest_lon,
+            region=route_region,
             # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
         )
 
@@ -174,19 +234,31 @@ async def calculate_route(request: RouteRequest):
                 steps=steps,
                 total_distance_m=route_dist_m,
                 base_duration_s=base_dur_s,
+                region=route_region,
                 # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
             )
-            # EMERGENCY FEATURE DISABLED: was `if not request.is_emergency_mode:`
-            use_planned_zone = bool(
-                controlled_plan and
-                int(candidate.get("original_route_index", candidate.get("route_index", 0))) == int(controlled_plan["active_route_index"])
-            )
-            analysis = apply_traffic_test_scenario(
-                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active,
-                zone_start_ratio=controlled_plan["zone_start_ratio"] if use_planned_zone else 0.50,
-                zone_length_m=controlled_plan["zone_length_m"] if use_planned_zone else None,
-            )
+            # In a controlled test, put the synthetic jam on exactly ONE route. If a
+            # preplanned pair exists it is the planner's active route; otherwise use
+            # original route index 0 and let the frontend attempt a zone-specific fallback.
+            is_controlled_test = request.traffic_test_mode in controlled_modes
+            controlled_active_index = int(controlled_plan["active_route_index"]) if controlled_plan else 0
+            candidate_original_index = int(candidate.get("original_route_index", candidate.get("route_index", 0)))
+            use_controlled_zone = is_controlled_test and candidate_original_index == controlled_active_index
+            use_planned_zone = bool(controlled_plan and use_controlled_zone)
+            if is_controlled_test and not use_controlled_zone:
+                analysis = _clear_controlled_test_analysis(analysis)
+            else:
+                analysis = apply_traffic_test_scenario(
+                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active,
+                    zone_start_ratio=controlled_plan["zone_start_ratio"] if use_planned_zone else 0.50,
+                    zone_length_m=controlled_plan["zone_length_m"] if use_planned_zone else None,
+                )
 
+            if is_controlled_test:
+                analysis["hotspots"] = [
+                    hotspot for hotspot in analysis.get("hotspots", [])
+                    if hotspot.get("cause") == "Controlled traffic test"
+                ]
             candidate["segments"] = analysis["segments"]
             candidate["hotspots"] = analysis["hotspots"]
             candidate["clear_distance_km"] = analysis["clear_distance_km"]
@@ -194,12 +266,21 @@ async def calculate_route(request: RouteRequest):
             candidate["heavy_distance_km"] = analysis["heavy_distance_km"]
             candidate["severe_distance_km"] = analysis["severe_distance_km"]
             candidate["total_delay_seconds"] = analysis["total_delay_seconds"]
+            if is_controlled_test and use_controlled_zone and not controlled_plan:
+                # The zone needs stable distance metadata even while DYNAMIC starts at LOW
+                # (when it intentionally has no visible hotspot yet).
+                zone_start_m, zone_end_m = compute_scenario_zone(route_dist_m, 0.50, None)
+                candidate["controlled_test_zone_start_distance_m"] = zone_start_m
+                candidate["controlled_test_zone_end_distance_m"] = zone_end_m
 
-            # Incorporate segment-level live delays with ML duration
+            # Incorporate segment-level live delays with ML duration. Clean alternatives
+            # in controlled tests use the unsurcharged OSRM duration, not a residual ML jam.
             live_delay = analysis["total_delay_seconds"]
             ml_predicted_dur = candidate.get("predicted_duration_seconds", base_dur_s)
-            final_predicted_dur = max(ml_predicted_dur, base_dur_s + live_delay)
-            
+            final_predicted_dur = (
+                base_dur_s if is_controlled_test and not use_controlled_zone
+                else max(ml_predicted_dur, base_dur_s + live_delay)
+            )
             candidate["predicted_duration_seconds"] = final_predicted_dur
             candidate["predicted_duration_minutes"] = round(final_predicted_dur / 60.0, 1)
 
@@ -232,10 +313,20 @@ async def calculate_route(request: RouteRequest):
                 ]
             else:
                 logger.warning("[TrafficTest] The verified OSRM pair was rejected during route validation")
+
+        if not processed_candidates:
+            logger.warning("No driving route found or all candidate routes rejected.")
+            raise HTTPException(
+                status_code=404,
+                detail="No driving route found between the specified origin and destination."
+            )
+
         return RouteResponse(
             success=True,
             routes_count=len(processed_candidates),
-            candidates=processed_candidates
+            candidates=processed_candidates,
+            traffic_coverage="supported" if route_region is not None else "unsupported",
+            region=route_region.key if route_region is not None else None,
         )
     except HTTPException:
         raise
@@ -246,6 +337,17 @@ async def calculate_route(request: RouteRequest):
 @router.post("/reroute/evaluate", response_model=RerouteRecommendation)
 async def evaluate_reroute(request: RerouteRequest):
     """Dynamically generates alternative routes from CURRENT user location and recommends the fastest (Features 8 & 9)."""
+    if not is_valid_coordinate(request.current_lat, request.current_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid current coordinates: ({request.current_lat}, {request.current_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+    if not is_valid_coordinate(request.dest_lat, request.dest_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination coordinates: ({request.dest_lat}, {request.dest_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+
     recommendation = await DynamicRerouteEngine.evaluate_reroute(
         current_lat=request.current_lat,
         current_lon=request.current_lon,
@@ -258,12 +360,18 @@ async def evaluate_reroute(request: RerouteRequest):
         traffic_progress=request.traffic_progress,
         recent_routes=request.recent_routes,
         synthetic_traffic_active=request.synthetic_traffic_active,
+        region_name=request.region,
     )
     return recommendation
 
 @router.get("/traffic/factors", response_model=TrafficFactorData)
 async def get_traffic_factors(lat: float = Query(...), lon: float = Query(...)):
     """Returns real-time traffic factor metrics for a location (Feature 2)."""
+    if not is_valid_coordinate(lat, lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid coordinates: ({lat}, {lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
     factors = LiveTrafficService.get_point_traffic_factors(lat, lon)
     return TrafficFactorData(
         location_name=factors["location_name"],

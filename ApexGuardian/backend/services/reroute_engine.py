@@ -4,8 +4,9 @@ import math
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.region import resolve_route_region
 from ml.recommender import RouteScorer
-from schemas.navigation import CandidateRoute, RerouteRecommendation, TrafficTestMode
+from schemas.navigation import CandidateRoute, CongestionLevel, RerouteRecommendation, TrafficTestMode
 from services.congestion_detector import CongestionDetector
 from services.osrm import OSRMService
 
@@ -258,6 +259,37 @@ def _usable_avoid_zones(
     return zones
 
 
+def _mark_clear_controlled_bypass(route: CandidateRoute) -> CandidateRoute:
+    """Mark a route that passed controlled-zone avoidance as the clean demo bypass.
+
+    Controlled tests intentionally ask for a route without congestion, so do not carry
+    unrelated predicted hotspots into the accepted alternative and immediately re-trigger
+    the same reroute flow. Real-navigation routes are never processed by this helper.
+    """
+    total_distance = 0.0
+    for segment in route.segments or []:
+        distance = max(0.0, float(segment.distance_meters or 0.0))
+        freeflow_speed = max(20.0, float(segment.freeflow_speed_kmh or 45.0))
+        segment.congestion_level = CongestionLevel.LOW
+        segment.color = "#16A34A"
+        segment.current_speed_kmh = round(freeflow_speed, 1)
+        segment.delay_seconds = 0.0
+        segment.duration_seconds = round(distance / max(0.5, freeflow_speed / 3.6), 1)
+        segment.congestion_factor = 1.0
+        total_distance += distance
+
+    route.hotspots = []
+    route.clear_distance_km = round((route.distance_meters or total_distance) / 1000.0, 2)
+    route.moderate_distance_km = 0.0
+    route.heavy_distance_km = 0.0
+    route.severe_distance_km = 0.0
+    route.total_delay_seconds = 0.0
+    route.congestion_factor = 1.0
+    route.predicted_duration_seconds = float(route.duration_seconds or 0.0)
+    route.predicted_duration_minutes = round(route.predicted_duration_seconds / 60.0, 1)
+    return route
+
+
 def _avoidance_detour_allowed(
     route: "CandidateRoute", reference_duration_s: float, direct_distance_m: float
 ) -> bool:
@@ -289,6 +321,7 @@ class DynamicRerouteEngine:
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
         synthetic_traffic_active: bool,
+        region: Optional[Any] = None,
     ) -> Optional[CandidateRoute]:
         route_dist_m = candidate.get("distance_meters", 0.0)
         base_dur_s = candidate.get("duration_seconds", 0.0)
@@ -376,6 +409,7 @@ class DynamicRerouteEngine:
             steps=steps,
             total_distance_m=route_dist_m,
             base_duration_s=base_dur_s,
+            region=region,
             is_emergency_mode=is_emergency_mode,
         )
         # Deliberately do NOT re-apply the controlled traffic-test scenario here.
@@ -428,6 +462,7 @@ class DynamicRerouteEngine:
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
         synthetic_traffic_active: bool,
+        region: Optional[Any] = None,
     ) -> List[CandidateRoute]:
         evaluated = RouteScorer.evaluate_routes(
             raw_candidates,
@@ -435,6 +470,7 @@ class DynamicRerouteEngine:
             origin_lon=current_lon,
             dest_lat=dest_lat,
             dest_lon=dest_lon,
+            region=region,
             is_emergency_mode=is_emergency_mode,
         )
         processed: List[CandidateRoute] = []
@@ -451,6 +487,7 @@ class DynamicRerouteEngine:
                     traffic_test_mode,
                     traffic_progress,
                     synthetic_traffic_active,
+                    region=region,
                 )
             except Exception:
                 logger.exception("Rejecting reroute candidate after processing failure")
@@ -473,9 +510,13 @@ class DynamicRerouteEngine:
         traffic_progress: float = 0.0,
         recent_routes: Optional[List[Dict[str, Any]]] = None,
         synthetic_traffic_active: bool = True,
+        region_name: Optional[str] = None,
     ) -> RerouteRecommendation:
         """Evaluate alternatives, attempting a waypoint bypass around supplied avoid zones."""
         try:
+            route_region = resolve_route_region(
+                current_lat, current_lon, dest_lat, dest_lon, requested_region=region_name
+            )
             direct_distance_m = haversine_distance_m(current_lon, current_lat, dest_lon, dest_lat)
             if direct_distance_m <= 500.0:
                 return RerouteRecommendation(
@@ -508,6 +549,7 @@ class DynamicRerouteEngine:
                 traffic_test_mode,
                 traffic_progress,
                 synthetic_traffic_active,
+                region=route_region,
             )
 
             clean_routes = [
@@ -659,6 +701,7 @@ class DynamicRerouteEngine:
                                     bypass_candidates, current_lat, current_lon, dest_lat, dest_lon,
                                     direct_distance_m, is_emergency_mode, traffic_test_mode,
                                     traffic_progress, synthetic_traffic_active,
+                                    region=route_region,
                                 )
                             except Exception as error:
                                 logger.warning(
@@ -706,6 +749,12 @@ class DynamicRerouteEngine:
                     alternative_routes=[],
                     reason="No alternate route avoids this stretch â€” continuing on the only available path.",
                 )
+
+            # Controlled-test avoidance routes are the green/clear alternative in the demo.
+            # Remove model-generated hotspots after geometry has passed every avoidance zone,
+            # so accepting this route cannot immediately announce a second unrelated jam.
+            if zones and traffic_test_mode in (TrafficTestMode.HEAVY, TrafficTestMode.SEVERE, TrafficTestMode.DYNAMIC):
+                clean_routes = [_mark_clear_controlled_bypass(route) for route in clean_routes]
 
             # Filter out candidates that are too similar to recently rejected/used routes
             # UNLESS they offer a truly massive improvement (e.g. they became totally clear)

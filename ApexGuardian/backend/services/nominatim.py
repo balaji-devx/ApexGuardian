@@ -1,15 +1,22 @@
 from typing import List, Dict, Any
 import httpx
 from core.config import settings
-from core.region import get_region
+from core.region import get_region, list_registered_regions
 
 class NominatimService:
     @staticmethod
     async def search_places(query: str) -> List[Dict[str, Any]]:
-        """Search places via Nominatim API bounded to Bengaluru region with static fallback for reliability."""
+        """Search places via Nominatim API with active region viewbox bias and multi-region fallback."""
         sanitized_query = query.strip()
         region = get_region()
-        if not any(alias in sanitized_query.lower() for alias in region.nominatim_aliases):
+        
+        # Check if the query explicitly specifies any registered region alias
+        has_region_alias = any(
+            alias in sanitized_query.lower()
+            for r in list_registered_regions()
+            for alias in r.nominatim_aliases
+        )
+        if not has_region_alias and region.nominatim_suffix:
             sanitized_query = f"{sanitized_query}, {region.nominatim_suffix}"
 
         headers = {
@@ -19,7 +26,7 @@ class NominatimService:
             "q": sanitized_query,
             "format": "json",
             "viewbox": region.nominatim_viewbox,
-            "bounded": "1",
+            "bounded": "0",  # Bias toward viewbox rather than strictly excluding outside matches
             "limit": "5"
         }
 

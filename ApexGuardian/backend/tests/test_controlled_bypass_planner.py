@@ -1,4 +1,4 @@
-from services.controlled_bypass_planner import plan_controlled_bypass
+from services.controlled_bypass_planner import plan_controlled_bypass, _cumulative, _project_distance_along_route
 from services.traffic_scenario import compute_scenario_zone
 
 
@@ -26,7 +26,7 @@ def test_planner_selects_shared_junction_and_a_clear_existing_route():
     assert plan["active_route_index"] != plan["bypass_route_index"]
     assert 0.12 <= plan["switch_distance_m"] / 12000.0 <= 0.48
     assert plan["zone_start_distance_m"] >= plan["switch_distance_m"] + 100
-    assert plan["minimum_bypass_clearance_m"] >= 125
+    assert plan["minimum_bypass_clearance_m"] >= 40
 
 
 def test_zone_can_be_placed_after_the_shared_switch_point():
@@ -67,8 +67,51 @@ def test_fallback_builds_bypass_from_shared_route_prefix():
         [base], 11.0, 77.0, 11.1, 77.0, fake_osrm
     ))
     assert requested, "fallback should request OSRM geometry starting at the route's entry junction"
+    # Every probe entry must fall inside the planner's feasible divergence window.
+    # A former 55% probe fell outside the 48% cap and could never produce a plan.
+    main_cumulative = _cumulative(main)
+    assert len(requested) == 6
+    probe_offsets_m = []
+    for waypoints in requested:
+        entry = [waypoints[0][1], waypoints[0][0]]  # OSRM input is (lat, lon); route points are (lon, lat).
+        along, cross_track = _project_distance_along_route(entry, main, main_cumulative)
+        assert cross_track <= 18.0
+        assert 0.12 <= along / main_cumulative[-1] <= 0.48
+
+        offset_point = [waypoints[1][1], waypoints[1][0]]
+        _, offset_distance = _project_distance_along_route(offset_point, main, main_cumulative)
+        probe_offsets_m.append(offset_distance)
+    assert min(probe_offsets_m) >= 250.0
+    assert max(probe_offsets_m) >= 650.0
     assert additions and plan is not None
     assert plan["active_route_index"] == 0
     assert plan["bypass_route_index"] != 0
-    assert plan["minimum_bypass_clearance_m"] >= 125
+    assert plan["minimum_bypass_clearance_m"] >= 40
     assert additions[0]["geometry"]["coordinates"][0] == main[0]
+
+
+def test_planner_relaxes_for_early_narrow_split():
+    """A real network often splits early and only ~70 m apart; a bypass must still be planned."""
+    main = _dense([[77.0, 11.0], [77.0, 11.1]])
+    # Splits ~1.1 km in (10 %), runs ~75 m east of the main road, rejoins near the end.
+    side = _dense([[77.0, 11.0], [77.0, 11.010], [77.0007, 11.0115], [77.0007, 11.088], [77.0, 11.09], [77.0, 11.1]])
+    plan = plan_controlled_bypass([
+        {"route_index": 0, "distance_meters": 11100.0, "geometry": {"type": "LineString", "coordinates": main}},
+        {"route_index": 1, "distance_meters": 11300.0, "geometry": {"type": "LineString", "coordinates": side}},
+    ])
+    assert plan is not None
+    assert plan["active_route_index"] != plan["bypass_route_index"]
+    assert abs((plan["zone_start_distance_m"] - plan["switch_distance_m"]) - 1000.0) <= 1.0
+    assert plan["zone_end_distance_m"] > plan["zone_start_distance_m"]
+
+
+def test_planner_last_resort_close_parallel_alternative():
+    """Two real routes only ~50 m apart after an early split still get a jam on one of them."""
+    main = _dense([[77.0, 11.0], [77.0, 11.1]])
+    side = _dense([[77.0, 11.0], [77.0, 11.006], [77.00045, 11.0075], [77.00045, 11.09], [77.0, 11.092], [77.0, 11.1]])
+    plan = plan_controlled_bypass([
+        {"route_index": 0, "distance_meters": 11100.0, "geometry": {"type": "LineString", "coordinates": main}},
+        {"route_index": 1, "distance_meters": 11200.0, "geometry": {"type": "LineString", "coordinates": side}},
+    ])
+    assert plan is not None
+    assert abs((plan["zone_start_distance_m"] - plan["switch_distance_m"]) - 1000.0) <= 1.0

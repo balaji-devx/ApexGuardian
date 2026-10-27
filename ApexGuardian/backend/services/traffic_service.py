@@ -169,12 +169,13 @@ class LiveTrafficService:
         lat: float, 
         lon: float, 
         prediction_offset_min: float = 0.0,
-        now_dt: Optional[datetime] = None
+        now_dt: Optional[datetime] = None,
+        region: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Calculates real-time & predictive traffic factors for a given point.
         
         Considers:
-        - Proximity to known bottleneck hubs
+        - Proximity to known bottleneck hubs within the active region
         - Time-of-day curve (evaluated at current time + prediction_offset_min)
         - Dynamic live incident feeds
         """
@@ -192,8 +193,13 @@ class LiveTrafficService:
         active_hotspot = None
         min_dist = float('inf')
 
-        # Check proximity to known bottleneck nodes
-        for node in cls.KNOWN_BOTTLENECKS:
+        # Check proximity to bottleneck nodes that belong to the specified region
+        candidate_bottlenecks = [
+            b for b in cls.ALL_KNOWN_BOTTLENECKS
+            if region.is_within_bounds(b["lat"], b["lon"])
+        ] if region is not None else cls.KNOWN_BOTTLENECKS
+
+        for node in candidate_bottlenecks:
             dist = cls.haversine_km(lat, lon, node["lat"], node["lon"])
             if dist <= node["radius_km"]:
                 if dist < min_dist:
@@ -280,7 +286,8 @@ class LiveTrafficService:
 # (Bengaluru: every entry is inside the bounding box, so behaviour is unchanged.)
 # Coimbatore hotspots are NOT invented here; add measured data, or clearly-labelled synthetic
 # scenarios, to this list when available.
+LiveTrafficService.ALL_KNOWN_BOTTLENECKS = list(LiveTrafficService.KNOWN_BOTTLENECKS)
 LiveTrafficService.KNOWN_BOTTLENECKS = [
-    _bn for _bn in LiveTrafficService.KNOWN_BOTTLENECKS
+    _bn for _bn in LiveTrafficService.ALL_KNOWN_BOTTLENECKS
     if get_region().is_within_bounds(_bn["lat"], _bn["lon"])
 ]

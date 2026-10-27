@@ -40,3 +40,14 @@ def test_pipeline_decodes_with_region_reference():
     assert "12.9716" in _run(code, "bengaluru").stdout
     out = _run(code, "coimbatore").stdout
     assert "11.0168" in out and "12.9" not in out.split("(")[1]       # same short code now resolves near Coimbatore, not Bengaluru
+
+
+def test_active_settings_region_is_coimbatore():
+    from core.config import settings
+    assert settings.ACTIVE_REGION == "coimbatore"
+    r = get_region(settings.ACTIVE_REGION)
+    assert r.key == "coimbatore"
+    assert r.display_name == "Coimbatore"
+    assert r.is_within_bounds(11.0168, 76.9558)
+
+

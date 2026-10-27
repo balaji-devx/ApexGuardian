@@ -20,7 +20,31 @@ import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode, TRAFFIC_TES
 
 import { ACTIVE_REGION_CONFIG } from "@/lib/region";
 
-export function selectDisplayedRouteOptions(candidates: CandidateRoute[]): CandidateRoute[] {
+export function selectDisplayedRouteOptions(
+  candidates: CandidateRoute[],
+  trafficTestMode?: TrafficTestMode
+): CandidateRoute[] {
+  if (trafficTestMode === "heavy" || trafficTestMode === "severe" || trafficTestMode === "dynamic") {
+    const controlledCandidate = candidates.find(
+      (route) =>
+        typeof route.controlled_test_switch_distance_m === "number" &&
+        route.controlled_test_bypass_route &&
+        Array.isArray(route.controlled_test_bypass_route.geometry?.coordinates) &&
+        route.controlled_test_bypass_route.geometry.coordinates.length >= 2
+    );
+    const testRoute = controlledCandidate || candidates.find((route) =>
+      typeof route.controlled_test_zone_start_distance_m === "number" ||
+      (route.hotspots || []).some((hotspot) => hotspot.cause === "Controlled traffic test")
+    );
+    if (testRoute) {
+      const remainingCandidates = candidates.filter((route) => route !== testRoute);
+      const secondCandidate = remainingCandidates.find(
+        (route) => !routesHaveSameGeometry(route, testRoute)
+      ) || remainingCandidates[0];
+      return secondCandidate ? [testRoute, secondCandidate] : [testRoute];
+    }
+  }
+
   const combined = candidates.find((route) => route.recommendation_label === "AI + OSRM Best Route");
   if (combined) return [combined];
   const aiRoute = candidates.find((route) => route.is_ai_recommended);
@@ -32,34 +56,309 @@ export function selectDisplayedRouteOptions(candidates: CandidateRoute[]): Candi
   return candidates.slice(0, 2);
 }
 
+
 export interface Coordinate {
   lat: number;
   lon: number;
   name?: string;
 }
 
+export const GPS_REAL_FIX_MAX_ACCURACY_METERS = 150;
+/** Offer a controlled-test bypass once the vehicle is exactly 1 km from the synthetic jam. */
+export const CONTROLLED_REROUTE_LOOKAHEAD_METERS = 1000;
+/** Default start place (PSG Tech, Peelamedu); same as the region default origin / map centre. */
+export const GPS_DEMO_FALLBACK_ORIGIN: Coordinate = {
+  lat: 11.0247,
+  lon: 77.0030,
+  name: "PSG College of Technology, Peelamedu, Coimbatore",
+};
+export type GPSLocationSource = "device" | "demo";
+
 export type PinDropMode = "none" | "source" | "destination";
 export type LayerMode = "ALL" | "AI_ONLY" | "STANDARD_ONLY";
 export type NavigationMode = "gps" | "simulation";
 export type GPSStatus = "idle" | "locating" | "tracking" | "degraded" | "rerouting" | "arrived" | "error";
 
-function readBrowserPosition(options: PositionOptions): Promise<GeolocationPosition> {
-  return new Promise((resolve, reject) => {
-    if (typeof navigator === "undefined" || !navigator.geolocation) {
-      reject(new Error("This browser does not support device location."));
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(resolve, reject, options);
-  });
+function logGpsDiagnostic(event: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  const sanitized = { ...(details || {}) };
+  if (typeof sanitized.lat === "number") {
+    sanitized.lat = Number((sanitized.lat as number).toFixed(4));
+  }
+  if (typeof sanitized.lon === "number") {
+    sanitized.lon = Number((sanitized.lon as number).toFixed(4));
+  }
+  console.log(`[ApexGuardian GPS Diagnostics] [${event}]`, sanitized);
+}
+
+function logGpsWarning(event: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  console.warn(`[ApexGuardian GPS Warning] [${event}]`, details || {});
 }
 
 function describeGeolocationError(error: unknown): string {
   const code = (error as GeolocationPositionError | undefined)?.code;
   if (code === 1) return "Location permission was denied. Allow location access in your browser settings, then try again.";
-  if (code === 2) return "Your device could not determine a location. Check that Location Services are enabled and try again.";
-  if (code === 3) return "Getting your location timed out. Move somewhere with a clearer GPS signal and try again.";
+  if (code === 2) return "Your device could not determine a location. Check that Location Services are enabled on your device and try again.";
+  if (code === 3) return "Getting your location timed out. Move somewhere with a clearer GPS signal or network reception, then try again.";
   if (error instanceof Error && error.message) return error.message;
   return "Unable to obtain a reliable GPS location. Check your location settings and try again.";
+}
+
+export interface LocationAcquisitionProgress {
+  status: "permission_required" | "acquiring" | "waiting_accuracy";
+  accuracy: number | null;
+  message: string;
+}
+
+export interface AcquireAccuratePositionResult {
+  position: GeolocationPosition;
+  totalSamples: number;
+}
+
+function acquireAccuratePosition(options: {
+  targetAccuracyMeters?: number;
+  maxAcceptableAccuracyMeters?: number;
+  timeoutMs?: number;
+  refinementWindowMs?: number;
+  onProgress?: (progress: LocationAcquisitionProgress) => void;
+  signal?: { isAborted: boolean };
+}): { promise: Promise<AcquireAccuratePositionResult>; cancel: () => void } {
+  let watchId: number | null = null;
+  let overallTimer: ReturnType<typeof setTimeout> | null = null;
+  let refinementTimer: ReturnType<typeof setTimeout> | null = null;
+  let isSettled = false;
+  let sampleCount = 0;
+  let bestPosition: GeolocationPosition | null = null;
+  let lastGeolocationError: GeolocationPositionError | null = null;
+
+  const cleanup = () => {
+    if (watchId !== null && typeof navigator !== "undefined" && navigator.geolocation) {
+      try {
+        navigator.geolocation.clearWatch(watchId);
+      } catch {
+        // ignore
+      }
+      watchId = null;
+    }
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = null;
+    }
+    if (refinementTimer) {
+      clearTimeout(refinementTimer);
+      refinementTimer = null;
+    }
+  };
+
+  const targetAccuracy = options.targetAccuracyMeters ?? 75;
+  const maxAcceptableAccuracy = options.maxAcceptableAccuracyMeters ?? 250;
+  const timeoutMs = options.timeoutMs ?? 12000;
+  const refinementWindowMs = options.refinementWindowMs ?? 2500;
+
+  let cancelStartup: (() => void) | null = null;
+  const promise = new Promise<AcquireAccuratePositionResult>(async (resolve, reject) => {
+    const settleResolve = (pos: GeolocationPosition) => {
+      if (isSettled) return;
+      isSettled = true;
+      cleanup();
+      resolve({ position: pos, totalSamples: sampleCount });
+    };
+
+    const settleReject = (err: Error) => {
+      if (isSettled) return;
+      isSettled = true;
+      cleanup();
+      reject(err);
+    };
+    cancelStartup = () => settleReject(new Error("GPS startup was cancelled."));
+
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      settleReject(new Error("This browser does not support device location."));
+      return;
+    }
+
+    let permState: PermissionState | null = null;
+    if (typeof navigator !== "undefined" && navigator.permissions?.query) {
+      try {
+        const perm = await navigator.permissions.query({ name: "geolocation" as PermissionName });
+        permState = perm.state;
+        logGpsDiagnostic("PERMISSION_QUERY", { state: permState });
+        if (perm.state === "denied") {
+          settleReject(new Error("Location permission was denied. Allow location access in your browser settings, then try again."));
+          return;
+        }
+        if (perm.state === "prompt") {
+          options.onProgress?.({
+            status: "permission_required",
+            accuracy: null,
+            message: "Location permission required. Please allow location access in your browser.",
+          });
+        }
+      } catch (e: any) {
+        if (e?.message?.includes("denied")) {
+          settleReject(e);
+          return;
+        }
+      }
+    }
+
+    if (options.signal?.isAborted) {
+      settleReject(new Error("GPS startup was cancelled."));
+      return;
+    }
+
+    logGpsDiagnostic("ACQUISITION_STARTED", {
+      targetAccuracy,
+      maxAcceptableAccuracy,
+      timeoutMs,
+      permissionState: permState,
+    });
+
+    options.onProgress?.({
+      status: "acquiring",
+      accuracy: null,
+      message: "Acquiring GPS locationâ€¦",
+    });
+
+    const handlePositionSample = (pos: GeolocationPosition) => {
+      if (isSettled || options.signal?.isAborted) return;
+      sampleCount += 1;
+      const { latitude, longitude, accuracy } = pos.coords;
+      const timestamp = pos.timestamp || Date.now();
+      const sampleAgeMs = Math.max(0, Date.now() - timestamp);
+
+      if (
+        !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+        latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180
+      ) {
+        logGpsWarning("INVALID_COORDINATES_DISCARDED", { lat: latitude, lon: longitude });
+        return;
+      }
+
+      if (sampleAgeMs > 30000) {
+        logGpsWarning("STALE_SAMPLE_DISCARDED", { sampleAgeMs, accuracy: Math.round(accuracy) });
+        return;
+      }
+
+      logGpsDiagnostic("SAMPLE_RECEIVED", {
+        sampleIndex: sampleCount,
+        lat: latitude,
+        lon: longitude,
+        accuracyMeters: Math.round(accuracy),
+        sampleAgeMs,
+        isPotentiallyCached: sampleAgeMs > 5000,
+      });
+
+      if (!bestPosition || accuracy < bestPosition.coords.accuracy) {
+        bestPosition = pos;
+      }
+
+      if (accuracy <= targetAccuracy) {
+        logGpsDiagnostic("TARGET_ACCURACY_ACHIEVED", {
+          sampleIndex: sampleCount,
+          accuracyMeters: Math.round(accuracy),
+          targetAccuracy,
+        });
+        settleResolve(pos);
+        return;
+      }
+
+      if (accuracy <= maxAcceptableAccuracy) {
+        logGpsDiagnostic("ACCEPTABLE_ACCURACY_WAITING_REFINEMENT", {
+          sampleIndex: sampleCount,
+          accuracyMeters: Math.round(accuracy),
+          threshold: maxAcceptableAccuracy,
+        });
+        options.onProgress?.({
+          status: "waiting_accuracy",
+          accuracy: Math.round(accuracy),
+          message: `Location accuracy: approximately ${Math.round(accuracy)} metres. Refining positionâ€¦`,
+        });
+
+        if (!refinementTimer) {
+          refinementTimer = setTimeout(() => {
+            if (!isSettled && bestPosition && !options.signal?.isAborted) {
+              logGpsDiagnostic("REFINEMENT_WINDOW_RESOLVED", {
+                finalAccuracyMeters: Math.round(bestPosition.coords.accuracy),
+                totalSamples: sampleCount,
+              });
+              settleResolve(bestPosition);
+            }
+          }, refinementWindowMs);
+        }
+        return;
+      }
+
+      logGpsDiagnostic("COARSE_SAMPLE_WAITING_IMPROVEMENT", {
+        sampleIndex: sampleCount,
+        accuracyMeters: Math.round(accuracy),
+        threshold: maxAcceptableAccuracy,
+      });
+      options.onProgress?.({
+        status: "waiting_accuracy",
+        accuracy: Math.round(accuracy),
+        message: `Location accuracy: approximately ${Math.round(accuracy)} metres. Waiting for a more accurate positionâ€¦`,
+      });
+    };
+
+    const handlePositionError = (err: GeolocationPositionError) => {
+      lastGeolocationError = err;
+      logGpsWarning("GEOLOCATION_CALLBACK_ERROR", {
+        code: err.code,
+        message: err.message,
+        codeName: err.code === 1 ? "PERMISSION_DENIED" : err.code === 2 ? "POSITION_UNAVAILABLE" : err.code === 3 ? "TIMEOUT" : "UNKNOWN",
+      });
+      if (err.code === 1) {
+        settleReject(new Error(describeGeolocationError(err)));
+      }
+    };
+
+    try {
+      watchId = navigator.geolocation.watchPosition(
+        handlePositionSample,
+        handlePositionError,
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 }
+      );
+    } catch (e: any) {
+      settleReject(new Error(e?.message || "Failed to start GPS location watch."));
+      return;
+    }
+
+    try {
+      navigator.geolocation.getCurrentPosition(
+        handlePositionSample,
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 4000 }
+      );
+    } catch {
+      // ignore
+    }
+
+    overallTimer = setTimeout(() => {
+      if (isSettled || options.signal?.isAborted) return;
+      if (bestPosition) {
+        logGpsDiagnostic("OVERALL_TIMEOUT_ACCEPTING_BEST_SAMPLE", {
+          accuracyMeters: Math.round(bestPosition.coords.accuracy),
+          totalSamples: sampleCount,
+        });
+        settleResolve(bestPosition);
+      } else if (lastGeolocationError) {
+        settleReject(new Error(describeGeolocationError(lastGeolocationError)));
+      } else {
+        settleReject(
+          new Error("Getting your location timed out. Move somewhere with a clearer GPS signal and try again.")
+        );
+      }
+    }, timeoutMs);
+  });
+
+  return {
+    promise,
+    cancel: () => {
+      cancelStartup?.();
+    },
+  };
 }
 
 export function haversineMeters(lon1: number, lat1: number, lon2: number, lat2: number): number {
@@ -124,6 +423,28 @@ function getUpcomingAvoidHotspots(
 }
 
 /** Rebuild the backend's anchored synthetic zone if hotspot metadata could not be refreshed. */
+function getControlledTestZoneDistances(route: CandidateRoute): { startM: number; endM: number } | null {
+  const routeStart = route.controlled_test_zone_start_distance_m;
+  const routeEnd = route.controlled_test_zone_end_distance_m;
+  if (typeof routeStart === "number" && typeof routeEnd === "number" && routeEnd > routeStart) {
+    return { startM: routeStart, endM: routeEnd };
+  }
+  const controlledHotspot = (route.hotspots || []).find((hotspot) => hotspot.cause === "Controlled traffic test");
+  if (controlledHotspot && typeof controlledHotspot.distance_from_origin_m === "number" && typeof controlledHotspot.zone_end_distance_m === "number" && controlledHotspot.zone_end_distance_m > controlledHotspot.distance_from_origin_m) {
+    return { startM: controlledHotspot.distance_from_origin_m, endM: controlledHotspot.zone_end_distance_m };
+  }
+  const coords = (route.geometry?.coordinates || []) as [number, number][];
+  if (coords.length < 2) return null;
+  let total = 0;
+  for (let i = 1; i < coords.length; i++) total += haversineMeters(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+  if (!Number.isFinite(total) || total < 500) return null;
+  let length = Math.max(300, Math.min(1000, total * 0.10));
+  length = Math.min(length, total * 0.25);
+  let start = total * 0.50;
+  if (start + length > total - 100) start = Math.max(0, total - 100 - length);
+  return { startM: start, endM: Math.min(total, start + length) };
+}
+
 function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
   const coords = (route.geometry?.coordinates || []) as [number, number][];
   if (coords.length < 2) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
@@ -134,14 +455,12 @@ function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
     ));
   }
   const total = cumulative[cumulative.length - 1];
-  if (!Number.isFinite(total) || total < 500) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
-  let zoneLength = Math.max(300, Math.min(1000, total * 0.10));
-  zoneLength = Math.min(zoneLength, total * 0.25);
-  let zoneStart = total * 0.50;
-  if (zoneStart + zoneLength > total - 100) zoneStart = Math.max(0, total - 100 - zoneLength);
-  const zoneEnd = Math.min(total, zoneStart + zoneLength);
+  const zone = getControlledTestZoneDistances(route);
+  if (!Number.isFinite(total) || total < 500 || !zone) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
+  const zoneStart = Math.max(0, Math.min(total, zone.startM));
+  const zoneEnd = Math.max(zoneStart, Math.min(total, zone.endM));
   const sampleDistances = [zoneStart];
-  for (let d = zoneStart + 75; d < zoneEnd; d += 75) sampleDistances.push(d);
+  for (let d = zoneStart + 50; d < zoneEnd; d += 50) sampleDistances.push(d);
   if (sampleDistances[sampleDistances.length - 1] < zoneEnd) sampleDistances.push(zoneEnd);
   return sampleDistances.map((target) => {
     let i = 1;
@@ -151,9 +470,17 @@ function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
     return {
       lon: coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * t,
       lat: coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * t,
-      radius_km: 0.09,
+      radius_km: 0.035,
     };
   });
+}
+
+function getControlledTestAvoidanceZones(route: CandidateRoute) {
+  const hotspot = (route.hotspots || []).find((item) => item.cause === "Controlled traffic test");
+  if (hotspot?.zone_path?.length) {
+    return hotspot.zone_path.map(([lon, lat]) => ({ lat, lon, radius_km: 0.035 }));
+  }
+  return getControlledZoneAvoidanceFallback(route);
 }
 
 function pointAtRouteDistance(route: CandidateRoute, targetDistanceM: number): [number, number] {
@@ -236,11 +563,17 @@ function applyControlledTrafficPhase(route: CandidateRoute, phase: CongestionLev
   };
 }
 
-function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocation: Coordinate): CandidateRoute | null {
+function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocation: Coordinate, expectedDistanceM?: number): CandidateRoute | null {
   const planned = activeRoute.controlled_test_bypass_route;
   const sourceCoords = (planned?.geometry?.coordinates || []) as [number, number][];
   if (!planned || sourceCoords.length < 2) return null;
   const projection = projectPointOntoRoute(currentLocation, planned);
+  if (typeof expectedDistanceM === "number" && Math.abs(projection.distanceAlongRouteMeters - expectedDistanceM) > Math.max(150, expectedDistanceM * 0.025)) {
+    console.warn("[TrafficTest] Planned bypass projection does not align with the expected switch distance.", {
+      expectedDistanceM, projectedDistanceM: projection.distanceAlongRouteMeters,
+    });
+    return null;
+  }
   if (projection.distanceToRouteMeters > 30) {
     console.warn("[TrafficTest] Planned bypass does not join the vehicle's current road.", { distanceM: projection.distanceToRouteMeters });
     return null;
@@ -277,7 +610,7 @@ function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocatio
   return {
     ...planned, route_id: `controlled-bypass-${Date.now()}`, source: "controlled-test-bypass", route_index: 0,
     distance_meters: distanceM, duration_seconds: durationS, predicted_duration_seconds: durationS, predicted_duration_minutes: Number((durationS / 60).toFixed(1)),
-    geometry: { ...planned.geometry, coordinates: coords as number[][] }, steps, segments: [clearSegment], hotspots: (planned.hotspots || []).filter((hotspot) => hotspot.cause !== "Controlled traffic test"),
+    geometry: { ...planned.geometry, coordinates: coords as number[][] }, steps, segments: [clearSegment], hotspots: [],
     clear_distance_km: Number((distanceM / 1000).toFixed(2)), moderate_distance_km: 0, heavy_distance_km: 0, severe_distance_km: 0, total_delay_seconds: 0,
     controlled_test_bypass_route: null, controlled_test_switch_distance_m: null, controlled_test_zone_start_distance_m: null, controlled_test_zone_end_distance_m: null,
   };
@@ -356,6 +689,7 @@ interface NavigationContextType {
   startNavigation: (mode: NavigationMode) => Promise<boolean>;
   stopNavigation: () => void;
   gpsStatus: GPSStatus;
+  gpsLocationSource: GPSLocationSource;
   gpsAccuracyMeters: number | null;
   gpsError: string | null;
   backendOnline: boolean | null;
@@ -428,10 +762,14 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const isNavigatingRef = useRef(false);
   isNavigatingRef.current = isNavigating;
   const [gpsStatus, setGpsStatus] = useState<GPSStatus>("idle");
+  const [gpsLocationSource, setGpsLocationSource] = useState<GPSLocationSource>("device");
+  const gpsLocationSourceRef = useRef<GPSLocationSource>("device");
+  gpsLocationSourceRef.current = gpsLocationSource;
   const [gpsAccuracyMeters, setGpsAccuracyMeters] = useState<number | null>(null);
   const [gpsError, setGpsError] = useState<string | null>(null);
   const gpsStartRequestRef = useRef(0);
   const gpsSessionRef = useRef(0);
+  const gpsAcquisitionCleanupRef = useRef<(() => void) | null>(null);
   const gpsLastSampleRef = useRef<{ lat: number; lon: number; timestamp: number; accuracy: number } | null>(null);
   const gpsOffRouteSamplesRef = useRef(0);
   const gpsRerouteInProgressRef = useRef(false);
@@ -499,6 +837,11 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const recentRoutesRef = useRef<Array<any>>([]);
   
   const activeRouteRef = useRef<CandidateRoute | null>(null);
+  activeRouteRef.current = routes[activeRouteIndex] || null;
+  const activeRerouteRecommendationRef = useRef<RerouteRecommendation | null>(null);
+  activeRerouteRecommendationRef.current = activeRerouteRecommendation;
+  const bypassAlignmentAttemptsRef = useRef<number>(0);
+
   const latestCalculateRoutesRef = useRef<(
     origin?: Coordinate | null,
     dest?: Coordinate | null,
@@ -591,7 +934,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         !testCongestionConsumedRef.current
       );
       if (response.success && response.candidates.length > 0) {
-        const displayedRoutes = selectDisplayedRouteOptions(response.candidates);
+        const displayedRoutes = selectDisplayedRouteOptions(response.candidates, trafficMode);
         setRoutes(displayedRoutes);
         // Keep synchronous consumers (notably GPS callbacks during recovery) on the same
         // route as the state update before React's passive ref-sync effect runs.
@@ -629,14 +972,33 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const startNavigation = async (mode: NavigationMode): Promise<boolean> => {
     // Invalidate a pending GPS startup whenever a new mode is selected.
     const requestId = ++gpsStartRequestRef.current;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
     setGpsError(null);
 
     if (mode === "simulation") {
-      if (!routes[activeRouteIndex] || !selectedDestination) {
+      const activeRoute = routes[activeRouteIndex];
+      if (!activeRoute || !selectedDestination) {
         setGpsError("Choose a destination and calculate a route before starting navigation.");
         return false;
       }
+      const controlledMode = trafficTestModeRef.current;
+      const isControlled = controlledMode === "heavy" || controlledMode === "severe" || controlledMode === "dynamic";
+      if (isControlled) {
+        const hasValidBypass =
+          typeof activeRoute.controlled_test_switch_distance_m === "number" &&
+          activeRoute.controlled_test_bypass_route &&
+          Array.isArray(activeRoute.controlled_test_bypass_route.geometry?.coordinates) &&
+          activeRoute.controlled_test_bypass_route.geometry.coordinates.length >= 2;
+        if (!hasValidBypass) {
+          setNoRouteReason("This route could not produce a validated test bypass. Simulation will continue on the current route without rerouting.");
+        }
+      }
       setNavigationMode("simulation");
+      gpsLocationSourceRef.current = "device";
+      setGpsLocationSource("device");
       setGpsStatus("idle");
       setGpsAccuracyMeters(null);
       gpsLastSampleRef.current = null;
@@ -655,116 +1017,212 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       setGpsError("Choose a destination before starting GPS navigation.");
       return false;
     }
-    if (typeof window === "undefined" || typeof navigator === "undefined" || !navigator.geolocation) {
-      setGpsStatus("error");
-      setGpsError("This browser does not support GPS location. Use a compatible browser or choose Simulation.");
-      return false;
-    }
-    const isLocalhost = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1";
-    if (!window.isSecureContext && !isLocalhost) {
-      setGpsStatus("error");
-      setGpsError("GPS requires HTTPS or localhost. Open the secure deployed site, or choose Simulation.");
-      return false;
-    }
 
     setGpsStatus("locating");
     setGpsAccuracyMeters(null);
-    setGpsError("Getting your current location…");
-    try {
-      const position = await readBrowserPosition({ enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
-      if (requestId !== gpsStartRequestRef.current) return false;
+    setGpsError(null);
 
-      const { latitude, longitude, accuracy } = position.coords;
-      const timestamp = position.timestamp || Date.now();
-      if (
-        !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
-        latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180
-      ) {
-        throw new Error("The device returned invalid GPS coordinates. Please try again.");
-      }
-      if (Date.now() - timestamp > 30000) {
-        throw new Error("The location fix is too old. Please try again where your GPS signal is stronger.");
-      }
-      if (!Number.isFinite(accuracy) || accuracy <= 0 || accuracy > 150) {
-        throw new Error("GPS accuracy is too low to start safely. Move near a window or outdoors and try again.");
-      }
+    let locationSource: GPSLocationSource = "demo";
+    let origin: Coordinate = { ...GPS_DEMO_FALLBACK_ORIGIN };
+    let accuracy: number | null = null;
+    let timestamp = 0;
+    let totalSamples = 0;
+    const isLocalhost = typeof window !== "undefined" &&
+      (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+    const secureLocationContext = typeof window !== "undefined" && (window.isSecureContext || isLocalhost);
+    const canTryDeviceLocation = typeof navigator !== "undefined" &&
+      Boolean(navigator.geolocation) && secureLocationContext;
 
-      let originName = "Current GPS Location";
+    if (canTryDeviceLocation) {
+      const abortSignal = { isAborted: false };
+      const acquisition = acquireAccuratePosition({
+        targetAccuracyMeters: 75,
+        maxAcceptableAccuracyMeters: GPS_REAL_FIX_MAX_ACCURACY_METERS,
+        timeoutMs: 6500,
+        refinementWindowMs: 1200,
+        signal: abortSignal,
+        onProgress: (progress) => {
+          if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return;
+          setGpsAccuracyMeters(progress.accuracy);
+          setGpsError(null);
+        },
+      });
+      gpsAcquisitionCleanupRef.current = () => {
+        abortSignal.isAborted = true;
+        acquisition.cancel();
+      };
+
+      try {
+        const acquired = await acquisition.promise;
+        totalSamples = acquired.totalSamples;
+        if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return false;
+        const candidate = acquired.position;
+        const candidateAccuracy = candidate.coords.accuracy;
+        const candidateTimestamp = candidate.timestamp || Date.now();
+        const candidateAgeMs = Math.max(0, Date.now() - candidateTimestamp);
+        const { latitude, longitude } = candidate.coords;
+        const validCoordinates = Number.isFinite(latitude) && Number.isFinite(longitude) &&
+          latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+        if (validCoordinates && Number.isFinite(candidateAccuracy) && candidateAccuracy > 0 &&
+            candidateAccuracy <= GPS_REAL_FIX_MAX_ACCURACY_METERS && candidateAgeMs <= 30000) {
+          locationSource = "device";
+          accuracy = candidateAccuracy;
+          timestamp = candidateTimestamp;
+          origin = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+          logGpsDiagnostic("RELIABLE_DEVICE_FIX_ACCEPTED", {
+            lat: latitude, lon: longitude, accuracyMeters: Math.round(candidateAccuracy), totalSamples,
+          });
+        } else {
+          logGpsWarning("STARTUP_FIX_NOT_RELIABLE_USING_STATIONARY_PREVIEW", {
+            accuracyMeters: Number.isFinite(candidateAccuracy) ? Math.round(candidateAccuracy) : null,
+            ageMs: candidateAgeMs,
+          });
+        }
+      } catch (error) {
+        if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return false;
+        logGpsWarning("DEVICE_LOCATION_UNAVAILABLE_USING_STATIONARY_PREVIEW", {
+          reason: error instanceof Error ? error.message : "Unknown geolocation error",
+        });
+      } finally {
+        if (requestId === gpsStartRequestRef.current) gpsAcquisitionCleanupRef.current = null;
+      }
+    } else {
+      logGpsWarning("DEVICE_GEOLOCATION_UNAVAILABLE_USING_STATIONARY_PREVIEW", {
+        geolocationAvailable: typeof navigator !== "undefined" && Boolean(navigator.geolocation),
+        secureContext: secureLocationContext,
+      });
+    }
+
+    if (requestId !== gpsStartRequestRef.current) return false;
+    setGpsError(null);
+    setGpsAccuracyMeters(locationSource === "device" ? accuracy : null);
+
+    if (locationSource === "device") {
       try {
         const geocode = await Promise.race([
-          reverseGeocode(latitude, longitude),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+          reverseGeocode(origin.lat, origin.lon),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 1600)),
         ]);
-        if (geocode?.display_name) originName = geocode.display_name;
+        if (geocode?.display_name) origin = { ...origin, name: geocode.display_name };
       } catch {
-        // Reverse geocoding is a convenience; valid coordinates are enough to navigate.
+        // Reverse geocoding is a convenience; the validated coordinates remain usable.
       }
-      if (requestId !== gpsStartRequestRef.current) return false;
+    }
+    if (requestId !== gpsStartRequestRef.current) return false;
 
-      const origin: Coordinate = { lat: latitude, lon: longitude, name: originName };
-      const previousOrigin = selectedOrigin;
-      const previousSourceQuery = sourceQuery;
-      const previousTrafficMode = trafficTestModeRef.current;
-      // GPS journeys use the real-traffic path. Controlled synthetic congestion tests remain
-      // available through the explicit Simulation option.
-      trafficTestModeRef.current = "real";
-      setTrafficTestMode("real");
-      setSelectedOrigin(origin);
-      setSourceQuery(originName);
-      const routeLoaded = await calculateRoutes(origin, destination, false, "real", 0);
-      if (requestId !== gpsStartRequestRef.current) return false;
-      if (!routeLoaded) {
-        setSelectedOrigin(previousOrigin);
-        setSourceQuery(previousSourceQuery);
-        trafficTestModeRef.current = previousTrafficMode;
-        setTrafficTestMode(previousTrafficMode);
-        throw new Error("A route could not be calculated from your current GPS location. Check your connection and destination, then retry.");
-      }
+    const previousOrigin = selectedOrigin;
+    const previousSourceQuery = sourceQuery;
+    const previousTrafficMode = trafficTestModeRef.current;
+    // GPS mode always uses the real traffic route path. Synthetic controlled scenarios stay in Simulation.
+    trafficTestModeRef.current = "real";
+    setTrafficTestMode("real");
+    setSelectedOrigin(origin);
+    setSourceQuery(origin.name || "Current location");
+    const routeLoaded = await calculateRoutes(origin, destination, false, "real", 0);
+    if (requestId !== gpsStartRequestRef.current) return false;
+    if (!routeLoaded) {
+      setSelectedOrigin(previousOrigin);
+      setSourceQuery(previousSourceQuery);
+      trafficTestModeRef.current = previousTrafficMode;
+      setTrafficTestMode(previousTrafficMode);
+      setGpsStatus("error");
+      setGpsAccuracyMeters(null);
+      setGpsError("A route could not be calculated. Check your connection and destination, then retry.");
+      return false;
+    }
 
+    if (locationSource === "demo") {
+      // GPS mode must never run the simulation animation. With no reliable device fix,
+      // keep the vehicle at the configured PSG Tech start while retaining GPS guidance UI.
+      gpsLocationSourceRef.current = "demo";
+      setGpsLocationSource("demo");
       navigationModeRef.current = "gps";
       setNavigationMode("gps");
-      currentLocationRef.current = origin;
-      setCurrentLocation(origin);
+      currentLocationRef.current = { ...origin };
+      setCurrentLocation({ ...origin });
       setCurrentVehicleSpeed(0);
-      setGpsAccuracyMeters(accuracy);
-      gpsLastSampleRef.current = { lat: latitude, lon: longitude, timestamp, accuracy };
+      setVehicleBearing(0);
+      gpsLastSampleRef.current = null;
       gpsOffRouteSamplesRef.current = 0;
       gpsRerouteInProgressRef.current = false;
       gpsLastOffRouteRecalculationRef.current = 0;
       gpsArrivalSamplesRef.current = 0;
       gpsArrivedRef.current = false;
-      setGpsStatus(accuracy > 75 ? "degraded" : "tracking");
+      setGpsStatus("degraded");
+      setGpsAccuracyMeters(null);
       setGpsError(null);
+      setSimProgressPercent(0);
+      setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+      setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
       setIsSimPlaying(false);
       TTSService.warmUp();
       setIsNavigating(true);
+      logGpsDiagnostic("GPS_NAVIGATION_STARTED_WITH_STATIONARY_DEMO_ORIGIN", {
+        lat: origin.lat, lon: origin.lon, accuracyMeters: null, totalWarmupSamples: totalSamples,
+      });
       return true;
-    } catch (error) {
-      if (requestId !== gpsStartRequestRef.current) return false;
-      setGpsStatus("error");
-      setGpsError(describeGeolocationError(error));
-      setIsNavigating(false);
-      return false;
     }
+
+    gpsLocationSourceRef.current = locationSource;
+    setGpsLocationSource(locationSource);
+    navigationModeRef.current = "gps";
+    setNavigationMode("gps");
+    currentLocationRef.current = origin;
+    setCurrentLocation(origin);
+    setCurrentVehicleSpeed(0);
+    gpsLastSampleRef.current = locationSource === "device" && accuracy !== null
+      ? { lat: origin.lat, lon: origin.lon, timestamp, accuracy }
+      : null;
+    gpsOffRouteSamplesRef.current = 0;
+    gpsRerouteInProgressRef.current = false;
+    gpsLastOffRouteRecalculationRef.current = 0;
+    gpsArrivalSamplesRef.current = 0;
+    gpsArrivedRef.current = false;
+    setGpsAccuracyMeters(locationSource === "device" ? accuracy : null);
+    setGpsStatus(locationSource === "device" ? ((accuracy || 0) > 75 ? "degraded" : "tracking") : "degraded");
+    setGpsError(null);
+    setSimProgressPercent(0);
+    setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+    setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
+    setIsSimPlaying(false);
+    TTSService.warmUp();
+    setIsNavigating(true);
+
+    logGpsDiagnostic(locationSource === "device" ? "GPS_NAVIGATION_STARTED_WITH_DEVICE_FIX" : "GPS_NAVIGATION_STARTED_WITH_STATIONARY_DEMO_ORIGIN", {
+      lat: origin.lat, lon: origin.lon, accuracyMeters: accuracy === null ? null : Math.round(accuracy), totalWarmupSamples: totalSamples,
+    });
+    return true;
   };
 
   const stopNavigation = () => {
     gpsStartRequestRef.current += 1;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
     gpsArrivedRef.current = false;
     gpsLastSampleRef.current = null;
     gpsOffRouteSamplesRef.current = 0;
     gpsRerouteInProgressRef.current = false;
     setGpsStatus("idle");
+    gpsLocationSourceRef.current = "device";
+    setGpsLocationSource("device");
     setGpsAccuracyMeters(null);
     setGpsError(null);
     setNavigationMode("simulation");
-    setIsSimPlaying(true);
+    setIsSimPlaying(false);
     setIsNavigating(false);
   };
 
   const runTrafficTest = async (mode: TrafficTestMode) => {
     gpsStartRequestRef.current += 1;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
     setNavigationMode("simulation");
+    gpsLocationSourceRef.current = "device";
+    setGpsLocationSource("device");
     setGpsStatus("idle");
     setGpsAccuracyMeters(null);
     setGpsError(null);
@@ -1065,17 +1523,20 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       calculated_geometry_length: calcGeomLength
     });
 
-    // In the SEVERE controlled test only, the congestion event has already
-    // served its purpose once the driver accepts the bypass. Do not carry the
-    // synthetic hotspot onto the new active route, otherwise the accepted route
-    // can show a stray severe marker and later trigger a heavy/moderate alert.
+    // When accepting a bypass in a controlled test, the congestion event
+    // has served its purpose. Do not carry synthetic hotspots or bypass metadata
+    // onto the new active route.
     const routeToActivate =
-      trafficTestModeRef.current === "severe"
+      trafficTestModeRef.current !== "real"
         ? {
             ...recRoute,
             hotspots: (recRoute.hotspots || []).filter(
               (hotspot) => hotspot.cause !== "Controlled traffic test",
             ),
+            controlled_test_bypass_route: null,
+            controlled_test_switch_distance_m: null,
+            controlled_test_zone_start_distance_m: null,
+            controlled_test_zone_end_distance_m: null,
           }
         : recRoute;
 
@@ -1084,12 +1545,12 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setIsApplyingReroute(false);
     if (switched) {
       // Any accepted reroute during a controlled traffic test ends that
-      // test's synthetic congestion for the rest of the trip — not only an
+      // test's synthetic congestion for the rest of the trip â€” not only an
       // accepted congestion-avoidance suggestion. Gating this solely on
       // is_congestion_avoidance meant the "faster route" branch (surfaced by
       // the periodic, non-avoidance check) never marked the scenario
-      // consumed, so a later dynamic-mode phase change — or any fresh
-      // /route call — could still inject another synthetic HEAVY/SEVERE
+      // consumed, so a later dynamic-mode phase change â€” or any fresh
+      // /route call â€” could still inject another synthetic HEAVY/SEVERE
       // hotspot even though the driver had already rerouted once.
       if (trafficTestModeRef.current !== "real") {
         testCongestionConsumedRef.current = true;
@@ -1246,7 +1707,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         TTSService.announce(
           isEmergencyMode
             ? "Starting Emergency Priority Navigation. Clear corridor mode active."
-            : navigationMode === "gps" ? "GPS navigation started. Drive safely." : "Starting navigation simulation.",
+            : navigationMode === "gps" ? "Starting GPS navigation." : "Starting navigation simulation.",
           SpeechPriority.NORMAL,
           `navigation_started_${activeRoute.route_id || activeRouteIndex}`,
         );
@@ -1292,10 +1753,79 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const { latitude, longitude, accuracy, speed, heading } = position.coords;
       const timestamp = position.timestamp || Date.now();
       if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return;
-      if (!Number.isFinite(accuracy) || accuracy <= 0 || accuracy > 150 || Date.now() - timestamp > 30000) {
+      if (!Number.isFinite(accuracy) || accuracy <= 0) return;
+      if (Date.now() - timestamp > 30000) {
+        if (gpsLocationSourceRef.current !== "demo") {
+          setGpsStatus("degraded");
+          setGpsError("GPS signal is stale. Keeping the last reliable position while waiting for an updated fix.");
+        }
+        return;
+      }
+
+      // A fallback coordinate is for route preview only. Do not let coarse browser/IP
+      // locations move the marker, advance progress, trigger arrival, or initiate reroutes.
+      if (gpsLocationSourceRef.current === "demo") {
+        if (accuracy > GPS_REAL_FIX_MAX_ACCURACY_METERS) {
+          setGpsStatus("degraded");
+          setGpsAccuracyMeters(null);
+          setCurrentVehicleSpeed(0);
+          return;
+        }
+        if (gpsRerouteInProgressRef.current) return;
+        const destination = selectedDestinationRef.current;
+        if (!destination) return;
+        const promotedLocation: Coordinate = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+        gpsRerouteInProgressRef.current = true;
+        setGpsStatus("rerouting");
+        setGpsError("Reliable device location found. Updating the route…");
+        void (async () => {
+          let loaded = false;
+          try {
+            loaded = await latestCalculateRoutesRef.current(promotedLocation, destination, false, "real", 0);
+          } catch (error) {
+            console.warn("[ApexGuardian GPS] Device-location route refresh failed:", error);
+          }
+          if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps") return;
+          gpsRerouteInProgressRef.current = false;
+          if (loaded) {
+            gpsLocationSourceRef.current = "device";
+            setGpsLocationSource("device");
+            setSelectedOrigin(promotedLocation);
+            setSourceQuery("Current GPS Location");
+            currentLocationRef.current = promotedLocation;
+            setCurrentLocation(promotedLocation);
+            setCurrentVehicleSpeed(0);
+            gpsLastSampleRef.current = { lat: latitude, lon: longitude, timestamp, accuracy };
+            gpsOffRouteSamplesRef.current = 0;
+            gpsArrivalSamplesRef.current = 0;
+            gpsArrivedRef.current = false;
+            simDistanceTraversedRef.current = 0;
+            setSimProgressPercent(0);
+            setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+            setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
+            setGpsAccuracyMeters(accuracy);
+            setGpsStatus(accuracy > 75 ? "degraded" : "tracking");
+            setGpsError(accuracy > 100 ? `GPS accuracy is approximate (±${Math.round(accuracy)} m).` : null);
+            logGpsDiagnostic("REAL_FIX_REPLACED_STATIONARY_DEMO_ORIGIN", { lat: latitude, lon: longitude, accuracyMeters: Math.round(accuracy) });
+          } else {
+            gpsLocationSourceRef.current = "demo";
+            setGpsLocationSource("demo");
+            currentLocationRef.current = GPS_DEMO_FALLBACK_ORIGIN;
+            setCurrentLocation(GPS_DEMO_FALLBACK_ORIGIN);
+            setCurrentVehicleSpeed(0);
+            setGpsAccuracyMeters(null);
+            setGpsStatus("degraded");
+            setGpsError("A reliable device location was found, but the route could not be refreshed. The map remains stationary.");
+          }
+        })();
+        return;
+      }
+
+      // Ignore coarse fixes for all movement/progress calculations, not just guidance.
+      if (accuracy > GPS_REAL_FIX_MAX_ACCURACY_METERS) {
         setGpsStatus("degraded");
-        setGpsAccuracyMeters(Number.isFinite(accuracy) ? accuracy : null);
-        setGpsError("GPS signal is weak or stale. Keeping the last reliable position while waiting for a better fix.");
+        setGpsAccuracyMeters(accuracy);
+        setGpsError(`GPS accuracy is too coarse (±${Math.round(accuracy)} m). Holding the last reliable position.`);
         return;
       }
 
@@ -1334,9 +1864,28 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       currentBearingRef.current = nextBearing;
       setVehicleBearing(nextBearing);
       setGpsAccuracyMeters(accuracy);
+
+      const isCoarse = accuracy > 75;
       if (!gpsRerouteInProgressRef.current) {
-        setGpsError(null);
-        setGpsStatus(accuracy > 75 ? "degraded" : "tracking");
+        if (accuracy > 250) {
+          setGpsStatus("degraded");
+          setGpsError(
+            `GPS accuracy is poor (±${Math.round(accuracy)} m). Waiting for a better position fix.`
+          );
+        } else if (accuracy > 100) {
+          setGpsStatus("degraded");
+          setGpsError(
+            `GPS accuracy is approximate (±${Math.round(accuracy)} m). Navigation is using a coarse position fix.`
+          );
+        } else {
+          setGpsStatus(isCoarse ? "degraded" : "tracking");
+          setGpsError(null);
+        }
+      }
+
+      // Gate reliable route-progress updates, turn-by-turn confidence, off-route rerouting and arrival detection on suitable quality (≤250m)
+      if (!Number.isFinite(accuracy) || accuracy <= 0 || accuracy > 250) {
+        return;
       }
 
       const activeRoute = activeRouteRef.current;
@@ -1446,7 +1995,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
             const announcement = getManeuverAnnouncement(upcomingStep, distanceToTurnM);
             if (announcement) TTSService.announce(announcement, SpeechPriority.CRITICAL, `${routeId}_${upcomingStepIndex}_advance`, 30 * 60_000);
           } else if (distanceToTurnM <= 200) {
-            TTSService.announce(getManeuverInstruction(upcomingStep), SpeechPriority.CRITICAL, `${routeId}_${upcomingStepIndex}_imminent`, 30 * 60_000);
+            // Guard imminent turn announcements against degraded/coarse GPS fixes
+            if (accuracy <= 100) {
+              TTSService.announce(getManeuverInstruction(upcomingStep), SpeechPriority.CRITICAL, `${routeId}_${upcomingStepIndex}_imminent`, 30 * 60_000);
+            }
           }
         }
       }
@@ -1462,7 +2014,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         gpsOffRouteSamplesRef.current = 0;
         gpsRerouteInProgressRef.current = true;
         setGpsStatus("rerouting");
-        setGpsError("You appear to be off the planned route. Recalculating from your current GPS location…");
+        setGpsError("You appear to be off the planned route. Recalculating from your current GPS locationâ€¦");
         const origin: Coordinate = { lat: latitude, lon: longitude, name: "Current GPS Location" };
         void (async () => {
           const loaded = await latestCalculateRoutesRef.current(origin, destination, false, "real", 0);
@@ -1497,9 +2049,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       }
 
       // Arrival is based on consecutive actual GPS fixes near the destination, never on projected progress alone.
+      // Strictly guard against coarse GPS fixes (requires accuracy <= 50m) to prevent premature arrival.
       const distanceToDestinationM = haversineMeters(longitude, latitude, destination.lon, destination.lat);
-      const arrivalRadiusM = Math.min(75, Math.max(35, accuracy));
-      if (distanceToDestinationM <= arrivalRadiusM && accuracy <= 100) {
+      const arrivalRadiusM = Math.min(50, Math.max(25, accuracy));
+      if (distanceToDestinationM <= arrivalRadiusM && accuracy <= 50) {
         gpsArrivalSamplesRef.current += 1;
       } else {
         gpsArrivalSamplesRef.current = 0;
@@ -1528,6 +2081,12 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     const handleGpsError = (error: GeolocationPositionError) => {
       if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps") return;
       setGpsStatus("degraded");
+      if (gpsLocationSourceRef.current === "demo") {
+        setGpsAccuracyMeters(null);
+        setCurrentVehicleSpeed(0);
+        logGpsWarning("DEVICE_WATCH_UNAVAILABLE_PREVIEW_REMAINS_STATIONARY", { code: error.code });
+        return;
+      }
       setGpsError(`${describeGeolocationError(error)} Navigation is paused at the last reliable position; check location access to resume updates.`);
     };
 
@@ -1541,6 +2100,16 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       if (watchId !== null) navigator.geolocation.clearWatch(watchId);
     };
   }, [isNavigating, navigationMode]);
+
+  // Clean up any in-flight startup acquisition on unmount
+  useEffect(() => {
+    return () => {
+      if (gpsAcquisitionCleanupRef.current) {
+        gpsAcquisitionCleanupRef.current();
+        gpsAcquisitionCleanupRef.current = null;
+      }
+    };
+  }, []);
 
   // High-Frequency Smooth Interpolated Driving Simulation Loop (Section 4 & 5)
   useEffect(() => {
@@ -1738,7 +2307,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         if (hotspot) {
           const liveDistance = hotspot.distance_from_origin_m - newDist;
           if (liveDistance < -50) {
-            // Vehicle has passed the hotspot by more than 50m — clear the alert
+            // Vehicle has passed the hotspot by more than 50m â€” clear the alert
             AlertManager.dismissCurrentAlert();
           } else {
             AlertManager.updateLiveDistance(Math.max(0, liveDistance));
@@ -1889,69 +2458,134 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         }
       }
 
-      // Controlled traffic scenarios have their bypass preplanned before the simulation
-      // starts. The vehicle opens the chooser at the common road approach; no live OSRM
-      // request is awaited and a missing plan never freezes the animation.
+      // Controlled traffic tests trigger at the exact 1 km approach to their synthetic jam.
+      // A preplanned route pair places the common-road split at that same threshold; if no
+      // preplanned pair exists, a zone-specific live OSRM avoidance request is made from here.
       const controlledMode = trafficTestModeRef.current;
       const controlledTestEnabled = controlledMode === "heavy" || controlledMode === "severe" || controlledMode === "dynamic";
+      const controlledZone = controlledTestEnabled ? getControlledTestZoneDistances(activeRoute) : null;
       const plannedSwitchDistance = activeRoute.controlled_test_switch_distance_m;
-      const plannedZoneEnd = activeRoute.controlled_test_zone_end_distance_m;
+      const plannedZoneEnd = controlledZone?.endM ?? activeRoute.controlled_test_zone_end_distance_m;
+      const controlledTriggerDistance = controlledZone
+        ? Math.max(0, controlledZone.startM - CONTROLLED_REROUTE_LOOKAHEAD_METERS)
+        : null;
 
-      const offerPlannedControlledBypass = () => {
+      const offerControlledBypass = () => {
         if (testRerouteTriggeredRef.current || testCongestionConsumedRef.current || !selectedDestination) return;
-        const bypassRoute = buildControlledBypassSuffix(activeRoute, { lat: interpLat, lon: interpLon });
-        if (!bypassRoute) {
-          testRerouteTriggeredRef.current = true;
-          console.warn("[TrafficTest] Preplanned bypass was not aligned with the vehicle; continuing on the current route.");
-          setNoRouteReason(null);
-          return;
-        }
-        testRerouteTriggeredRef.current = true;
-        const remainingSeconds = Math.max(0, (1 - progressRatio) *
-          (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 600));
-        const bypassDuration = bypassRoute.predicted_duration_seconds || bypassRoute.duration_seconds || 0;
-        const etaDelta = remainingSeconds - bypassDuration;
-        const recommendation: RerouteRecommendation = {
-          is_reroute_recommended: true,
-          is_congestion_avoidance: true,
-          time_saved_seconds: etaDelta,
-          time_saved_minutes: Number((etaDelta / 60).toFixed(1)),
-          original_remaining_seconds: remainingSeconds,
-          recommended_duration_seconds: bypassDuration,
-          recommended_route: bypassRoute,
-          alternative_routes: [bypassRoute],
-          reason: "A preplanned OSRM street route avoids the complete synthetic congestion stretch and rejoins the destination without moving the vehicle.",
-        };
+        testRerouteTriggeredRef.current = true; // latch before any asynchronous network request
         testReroutePausedRef.current = true;
         setIsSimPlaying(false);
         setNoRouteReason(null);
-        setActiveRerouteRecommendation(recommendation);
+
+        const remainingSeconds = Math.max(0, (1 - progressRatio) *
+          (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 600));
+        const hasPlannedBypass = Boolean(
+          activeRoute.controlled_test_bypass_route?.geometry?.coordinates &&
+          activeRoute.controlled_test_bypass_route.geometry.coordinates.length >= 2 &&
+          typeof plannedSwitchDistance === "number"
+        );
+
+        if (hasPlannedBypass && typeof plannedSwitchDistance === "number") {
+          const bypassRoute = buildControlledBypassSuffix(
+            activeRoute, { lat: interpLat, lon: interpLon }, plannedSwitchDistance
+          );
+          if (bypassRoute) {
+            const bypassDuration = bypassRoute.predicted_duration_seconds || bypassRoute.duration_seconds || 0;
+            const etaDelta = remainingSeconds - bypassDuration;
+            const recommendation: RerouteRecommendation = {
+              is_reroute_recommended: true,
+              is_congestion_avoidance: true,
+              time_saved_seconds: etaDelta,
+              time_saved_minutes: Number((etaDelta / 60).toFixed(1)),
+              original_remaining_seconds: remainingSeconds,
+              recommended_duration_seconds: bypassDuration,
+              recommended_route: bypassRoute,
+              alternative_routes: [bypassRoute],
+              reason: "A preplanned OSRM route avoids the complete synthetic congestion stretch.",
+            };
+            setActiveRerouteRecommendation(recommendation);
+            return;
+          }
+          console.warn("[TrafficTest] Preplanned bypass could not be aligned at the 1 km threshold; trying live OSRM avoidance.");
+        }
+
+        const zones = getControlledTestAvoidanceZones(activeRoute);
+        if (!zones.length) {
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason("The controlled test has no valid congestion-zone geometry to avoid.");
+          return;
+        }
+
+        void (async () => {
+          const recommendation = await RerouteEngine.checkAndReevaluate(
+            interpLat,
+            interpLon,
+            selectedDestination.lat,
+            selectedDestination.lon,
+            remainingSeconds,
+            speedKmh,
+            isEmergencyMode,
+            true,
+            controlledMode,
+            Math.min(1, newDist / Math.max(1, totalRouteDistanceM)),
+            zones,
+            recentRoutesRef.current,
+            true,
+          );
+          if (recommendation?.is_reroute_recommended && recommendation.recommended_route) {
+            setNoRouteReason(null);
+            setActiveRerouteRecommendation(recommendation);
+            // Keep simulation paused while the chooser is visible.
+            testReroutePausedRef.current = true;
+            setIsSimPlaying(false);
+            return;
+          }
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason(recommendation?.reason || "No congestion-free OSRM alternative was found; continuing on the current route.");
+        })().catch((error) => {
+          console.error("[TrafficTest] Live OSRM avoidance failed:", error);
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason("The routing service could not find a congestion-free alternative. Continuing on the current route.");
+        });
       };
 
-      if (controlledTestEnabled && !testCongestionConsumedRef.current && typeof plannedSwitchDistance === "number") {
+      if (controlledTestEnabled && !testCongestionConsumedRef.current && controlledZone && controlledTriggerDistance !== null) {
         if (controlledMode === "dynamic") {
-          // Ramp LOW -> MODERATE -> HEAVY -> SEVERE as the vehicle approaches the
-          // planned split. SEVERE occurs at the switching point, before the synthetic jam.
-          const switchRatio = Math.max(0.12, Math.min(0.48, plannedSwitchDistance / Math.max(1, totalRouteDistanceM)));
-          const phaseProgress = Math.min(1, (scenarioProgress / switchRatio) * 0.40);
-          const phase = dynamicTrafficPhase(phaseProgress);
+          // All four severity phases are tied to route progress; the zone itself stays fixed.
+          // This gives DYNAMIC the same 1 km reroute trigger as HEAVY and SEVERE.
+          const phase = dynamicTrafficPhase(scenarioProgress);
           if (phase !== lastDynamicPhaseRef.current) {
             lastDynamicPhaseRef.current = phase;
             setRoutes((currentRoutes) => currentRoutes.map((route) =>
               route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, phase) : route
             ));
           }
-          if (phase === "SEVERE" && newDist >= plannedSwitchDistance - 5) offerPlannedControlledBypass();
-          if (typeof plannedZoneEnd === "number" && newDist > plannedZoneEnd + 30 && !testRerouteTriggeredRef.current) {
-            testCongestionConsumedRef.current = true;
-            lastDynamicPhaseRef.current = "LOW";
-            setRoutes((currentRoutes) => currentRoutes.map((route) =>
-              route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, "LOW") : route
-            ));
-            AlertManager.reset();
-          }
-        } else if (newDist >= plannedSwitchDistance - 5) {
-          offerPlannedControlledBypass();
+        }
+
+        const reachedAvoidanceThreshold = newDist >= controlledTriggerDistance;
+        const isAtPlannedSwitch = typeof plannedSwitchDistance !== "number" || newDist >= plannedSwitchDistance - 5;
+        if (reachedAvoidanceThreshold && isAtPlannedSwitch) {
+          offerControlledBypass();
+        }
+
+        // Clear the original-zone alert after passage, but never while paused at a reroute.
+        if (
+          typeof plannedZoneEnd === "number" &&
+          newDist >= plannedZoneEnd &&
+          !testCongestionConsumedRef.current &&
+          !testReroutePausedRef.current &&
+          !activeRerouteRecommendationRef.current
+        ) {
+          testCongestionConsumedRef.current = true;
+          lastDynamicPhaseRef.current = "LOW";
+          setRoutes((currentRoutes) => currentRoutes.map((route) =>
+            route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, "LOW") : route
+          ));
+          AlertManager.reset();
+          PushNotificationService.clearCongestionAlert();
         }
       }
       // Continuous automatic reroute re-evaluation is real-navigation behaviour.
@@ -2052,6 +2686,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         startNavigation,
         stopNavigation,
         gpsStatus,
+        gpsLocationSource,
         gpsAccuracyMeters,
         gpsError,
         backendOnline,
@@ -2086,7 +2721,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isSimPlaying,
         setIsSimPlaying,
         simSpeedMultiplier,
-        setSimSpeedMultiplier,
+            setSimSpeedMultiplier,
         activeAlert,
         dismissAlert,
         activeRerouteRecommendation,

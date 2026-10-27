@@ -47,7 +47,7 @@ ZONE_MIN_LEN_M = 300.0
 ZONE_MAX_LEN_M = 1000.0
 ZONE_MAX_ROUTE_FRACTION = 0.25
 DYNAMIC_CLEAR_MARGIN = 0.03     # cleared once progress passes zone end + 3 %
-ZONE_PATH_SAMPLE_M = 120.0
+ZONE_PATH_SAMPLE_M = 50.0
 
 
 def _hav(a: List[float], b: List[float]) -> float:
@@ -134,9 +134,9 @@ def _sample_zone_path(zone_segments: List[Dict[str, Any]]) -> List[List[float]]:
     last = zone_segments[-1].get("coordinates", [[0, 0]])[-1]
     if not pts or pts[-1] != [round(last[0], 6), round(last[1], 6)]:
         pts.append([round(last[0], 6), round(last[1], 6)])
-    if len(pts) > 14:
-        step = (len(pts) - 1) / 13.0
-        pts = [pts[round(i * step)] for i in range(14)]
+    if len(pts) > 28:
+        step = (len(pts) - 1) / 27.0
+        pts = [pts[round(i * step)] for i in range(28)]
     return pts
 
 

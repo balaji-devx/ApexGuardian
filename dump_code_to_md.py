@@ -94,7 +94,7 @@ def build_markdown(root, files):
 
 def main():
     parser = argparse.ArgumentParser(description="Dump all code files in a folder into one Markdown file.")
-    parser.add_argument("folder", help="Path to the project folder to scan")
+    parser.add_argument("folder", nargs="?", default=".", help="Path to the project folder to scan (default: .)")
     parser.add_argument("-o", "--output", default=None, help="Output .md file path (default: <folder>_dump.md)")
     parser.add_argument("--ext", nargs="*", default=None,
                         help="Only include these extensions (e.g. --ext .py .js). Default: broad built-in code list.")

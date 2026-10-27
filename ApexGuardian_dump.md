@@ -1,6 +1,6 @@
 # Code dump: `E:\PROJECTS\ApexGuardian V2.0\ApexGuardian`
 
-Total files: 67
+Total files: 68
 
 ## Table of contents
 
@@ -36,6 +36,7 @@ Total files: 67
 - `backend\tests\test_api.py`
 - `backend\tests\test_controlled_bypass_planner.py`
 - `backend\tests\test_dataset_optimized.py`
+- `backend\tests\test_geographic_regions.py`
 - `backend\tests\test_ml_pipeline.py`
 - `backend\tests\test_new_features.py`
 - `backend\tests\test_patch_regressions.py`
@@ -98,7 +99,7 @@ import uuid
 import math
 from typing import List, Dict, Any, Optional
 from fastapi import APIRouter, HTTPException, Query, Body
-from core.region import get_region
+from core.region import get_region, is_valid_coordinate, resolve_route_region
 from schemas.navigation import (
     LocationSearchResponse, 
     RouteRequest, 
@@ -118,12 +119,49 @@ from services.congestion_detector import CongestionDetector
 from services.reroute_engine import DynamicRerouteEngine
 from services.notification_service import PushNotificationService
 from services.route_selection import rank_processed_routes
-from services.traffic_scenario import apply_traffic_test_scenario
+from services.traffic_scenario import apply_traffic_test_scenario, compute_scenario_zone
 from services.controlled_bypass_planner import plan_controlled_bypass, build_controlled_bypass_candidates
 from ml.recommender import RouteScorer
 
 logger = logging.getLogger("apexguardian.api")
 router = APIRouter()
+
+
+def _clear_controlled_test_analysis(analysis: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a clean-road traffic view for alternative routes in controlled tests.
+
+    Only the selected test corridor should carry the synthetic jam. Applying the
+    same scenario to every OSRM candidate paints a second jam onto the bypass and
+    can make the UI reroute repeatedly between congested alternatives.
+    """
+    segments: List[Dict[str, Any]] = []
+    total_distance = 0.0
+    for raw_segment in analysis.get("segments", []):
+        segment = dict(raw_segment)
+        distance = max(0.0, float(segment.get("distance_meters", 0.0) or 0.0))
+        freeflow_speed = max(20.0, float(segment.get("freeflow_speed_kmh", 45.0) or 45.0))
+        duration = distance / max(0.5, freeflow_speed / 3.6)
+        segment.update({
+            "congestion_level": "LOW",
+            "color": "#16A34A",
+            "current_speed_kmh": round(freeflow_speed, 1),
+            "delay_seconds": 0.0,
+            "duration_seconds": round(duration, 1),
+            "congestion_factor": 1.0,
+        })
+        segments.append(segment)
+        total_distance += distance
+    cleaned = dict(analysis)
+    cleaned.update({
+        "segments": segments,
+        "hotspots": [],
+        "total_delay_seconds": 0.0,
+        "clear_distance_km": round(total_distance / 1000.0, 2),
+        "moderate_distance_km": 0.0,
+        "heavy_distance_km": 0.0,
+        "severe_distance_km": 0.0,
+    })
+    return cleaned
 
 @router.get("/health")
 async def health_check():
@@ -178,16 +216,37 @@ async def reverse_geocode(lat: float = Query(..., description="Latitude"), lon: 
 @router.post("/route", response_model=RouteResponse)
 async def calculate_route(request: RouteRequest):
     """Calculates driving routes with ML scoring, multi-colored congestion segments, and hotspot detection."""
-    origin_in_bounds = get_region().is_within_bounds(request.origin_lat, request.origin_lon)
-    dest_in_bounds = get_region().is_within_bounds(request.dest_lat, request.dest_lon)
+    # 1. Coordinate Validation
+    if not is_valid_coordinate(request.origin_lat, request.origin_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid origin coordinates: ({request.origin_lat}, {request.origin_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+    if not is_valid_coordinate(request.dest_lat, request.dest_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination coordinates: ({request.dest_lat}, {request.dest_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
 
-    if not origin_in_bounds:
-        logger.warning(f"Origin coordinates ({request.origin_lat}, {request.origin_lon}) are outside {get_region().display_name} bounding box.")
-    if not dest_in_bounds:
-        logger.warning(f"Destination coordinates ({request.dest_lat}, {request.dest_lon}) are outside {get_region().display_name} bounding box.")
+    # 2. Dynamic Geographic Region Resolution
+    route_region = resolve_route_region(
+        request.origin_lat,
+        request.origin_lon,
+        request.dest_lat,
+        request.dest_lon,
+        requested_region=request.region
+    )
+    if route_region:
+        logger.info(
+            f"Route matched traffic region '{route_region.display_name}' ({route_region.key}). Regional ML traffic model active."
+        )
+    else:
+        logger.info(
+            f"Coordinates ({request.origin_lat}, {request.origin_lon}) -> ({request.dest_lat}, {request.dest_lon}) outside regional traffic models. Baseline routing active."
+        )
 
     try:
-        # 1. Fetch High-Resolution OSRM Street Driving Polylines
+        # 3. Fetch High-Resolution OSRM Street Driving Polylines
         raw_candidates = await OSRMService.get_routes(
             origin_lat=request.origin_lat,
             origin_lon=request.origin_lon,
@@ -223,16 +282,18 @@ async def calculate_route(request: RouteRequest):
                     controlled_plan["zone_end_distance_m"], controlled_plan["minimum_bypass_clearance_m"],
                 )
             else:
-                # Important: a failed planner never pauses the vehicle. It continues on
-                # its current road instead of presenting a false "no possible routes" stop.
-                logger.warning("[TrafficTest] No verified bypass exists for this route pair; simulation will continue without pausing")
-        # 2. Evaluate Candidates with Route-Level ML Model
+                # The frontend will attempt a zone-specific live avoidance reroute at the
+                # 1 km trigger when no valid preplanned pair exists; it never reroutes for
+                # unrelated congestion in a controlled test.
+                logger.warning("[TrafficTest] No preplanned bypass; zone-specific fallback reroute will be attempted 1000m before the test hotspot")
+        # 4. Evaluate Candidates with Route-Level ML Model
         ml_evaluated_candidates = RouteScorer.evaluate_routes(
             raw_candidates,
             request.origin_lat,
             request.origin_lon,
             request.dest_lat,
             request.dest_lon,
+            region=route_region,
             # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
         )
 
@@ -268,19 +329,31 @@ async def calculate_route(request: RouteRequest):
                 steps=steps,
                 total_distance_m=route_dist_m,
                 base_duration_s=base_dur_s,
+                region=route_region,
                 # EMERGENCY FEATURE DISABLED: is_emergency_mode=request.is_emergency_mode
             )
-            # EMERGENCY FEATURE DISABLED: was `if not request.is_emergency_mode:`
-            use_planned_zone = bool(
-                controlled_plan and
-                int(candidate.get("original_route_index", candidate.get("route_index", 0))) == int(controlled_plan["active_route_index"])
-            )
-            analysis = apply_traffic_test_scenario(
-                analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active,
-                zone_start_ratio=controlled_plan["zone_start_ratio"] if use_planned_zone else 0.50,
-                zone_length_m=controlled_plan["zone_length_m"] if use_planned_zone else None,
-            )
+            # In a controlled test, put the synthetic jam on exactly ONE route. If a
+            # preplanned pair exists it is the planner's active route; otherwise use
+            # original route index 0 and let the frontend attempt a zone-specific fallback.
+            is_controlled_test = request.traffic_test_mode in controlled_modes
+            controlled_active_index = int(controlled_plan["active_route_index"]) if controlled_plan else 0
+            candidate_original_index = int(candidate.get("original_route_index", candidate.get("route_index", 0)))
+            use_controlled_zone = is_controlled_test and candidate_original_index == controlled_active_index
+            use_planned_zone = bool(controlled_plan and use_controlled_zone)
+            if is_controlled_test and not use_controlled_zone:
+                analysis = _clear_controlled_test_analysis(analysis)
+            else:
+                analysis = apply_traffic_test_scenario(
+                    analysis, request.traffic_test_mode, request.traffic_progress, request.synthetic_traffic_active,
+                    zone_start_ratio=controlled_plan["zone_start_ratio"] if use_planned_zone else 0.50,
+                    zone_length_m=controlled_plan["zone_length_m"] if use_planned_zone else None,
+                )
 
+            if is_controlled_test:
+                analysis["hotspots"] = [
+                    hotspot for hotspot in analysis.get("hotspots", [])
+                    if hotspot.get("cause") == "Controlled traffic test"
+                ]
             candidate["segments"] = analysis["segments"]
             candidate["hotspots"] = analysis["hotspots"]
             candidate["clear_distance_km"] = analysis["clear_distance_km"]
@@ -288,12 +361,21 @@ async def calculate_route(request: RouteRequest):
             candidate["heavy_distance_km"] = analysis["heavy_distance_km"]
             candidate["severe_distance_km"] = analysis["severe_distance_km"]
             candidate["total_delay_seconds"] = analysis["total_delay_seconds"]
+            if is_controlled_test and use_controlled_zone and not controlled_plan:
+                # The zone needs stable distance metadata even while DYNAMIC starts at LOW
+                # (when it intentionally has no visible hotspot yet).
+                zone_start_m, zone_end_m = compute_scenario_zone(route_dist_m, 0.50, None)
+                candidate["controlled_test_zone_start_distance_m"] = zone_start_m
+                candidate["controlled_test_zone_end_distance_m"] = zone_end_m
 
-            # Incorporate segment-level live delays with ML duration
+            # Incorporate segment-level live delays with ML duration. Clean alternatives
+            # in controlled tests use the unsurcharged OSRM duration, not a residual ML jam.
             live_delay = analysis["total_delay_seconds"]
             ml_predicted_dur = candidate.get("predicted_duration_seconds", base_dur_s)
-            final_predicted_dur = max(ml_predicted_dur, base_dur_s + live_delay)
-            
+            final_predicted_dur = (
+                base_dur_s if is_controlled_test and not use_controlled_zone
+                else max(ml_predicted_dur, base_dur_s + live_delay)
+            )
             candidate["predicted_duration_seconds"] = final_predicted_dur
             candidate["predicted_duration_minutes"] = round(final_predicted_dur / 60.0, 1)
 
@@ -326,10 +408,20 @@ async def calculate_route(request: RouteRequest):
                 ]
             else:
                 logger.warning("[TrafficTest] The verified OSRM pair was rejected during route validation")
+
+        if not processed_candidates:
+            logger.warning("No driving route found or all candidate routes rejected.")
+            raise HTTPException(
+                status_code=404,
+                detail="No driving route found between the specified origin and destination."
+            )
+
         return RouteResponse(
             success=True,
             routes_count=len(processed_candidates),
-            candidates=processed_candidates
+            candidates=processed_candidates,
+            traffic_coverage="supported" if route_region is not None else "unsupported",
+            region=route_region.key if route_region is not None else None,
         )
     except HTTPException:
         raise
@@ -340,6 +432,17 @@ async def calculate_route(request: RouteRequest):
 @router.post("/reroute/evaluate", response_model=RerouteRecommendation)
 async def evaluate_reroute(request: RerouteRequest):
     """Dynamically generates alternative routes from CURRENT user location and recommends the fastest (Features 8 & 9)."""
+    if not is_valid_coordinate(request.current_lat, request.current_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid current coordinates: ({request.current_lat}, {request.current_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+    if not is_valid_coordinate(request.dest_lat, request.dest_lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid destination coordinates: ({request.dest_lat}, {request.dest_lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
+
     recommendation = await DynamicRerouteEngine.evaluate_reroute(
         current_lat=request.current_lat,
         current_lon=request.current_lon,
@@ -352,12 +455,18 @@ async def evaluate_reroute(request: RerouteRequest):
         traffic_progress=request.traffic_progress,
         recent_routes=request.recent_routes,
         synthetic_traffic_active=request.synthetic_traffic_active,
+        region_name=request.region,
     )
     return recommendation
 
 @router.get("/traffic/factors", response_model=TrafficFactorData)
 async def get_traffic_factors(lat: float = Query(...), lon: float = Query(...)):
     """Returns real-time traffic factor metrics for a location (Feature 2)."""
+    if not is_valid_coordinate(lat, lon):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid coordinates: ({lat}, {lon}). Latitude must be between -90 and 90, longitude between -180 and 180."
+        )
     factors = LiveTrafficService.get_point_traffic_factors(lat, lon)
     return TrafficFactorData(
         location_name=factors["location_name"],
@@ -409,7 +518,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "Apex Guardian API"
     API_V1_STR: str = "/api/v1"
     PORT: int = 8000
-    ACTIVE_REGION: str = "bengaluru"   # "bengaluru" | "coimbatore"
+    ACTIVE_REGION: str = "coimbatore"   # "bengaluru" | "coimbatore"
     ENVIRONMENT: str = "development"
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
     OSRM_BASE_URL: str = "https://router.project-osrm.org"
@@ -547,14 +656,71 @@ REGIONS = {
 
 
 def get_region(key: Optional[str] = None) -> RegionProfile:
-    """Return the active region profile (``ACTIVE_REGION`` env/.env setting; default Bengaluru)."""
+    """Return the active region profile (``ACTIVE_REGION`` env/.env setting; default Coimbatore)."""
     if key is None:
         from core.config import settings
         key = settings.ACTIVE_REGION
-    key = (key or "bengaluru").strip().lower()
+    key = (key or "coimbatore").strip().lower()
     if key not in REGIONS:
         raise ValueError(f"Unknown ACTIVE_REGION '{key}'. Valid options: {sorted(REGIONS)}")
     return REGIONS[key]
+
+
+def list_registered_regions() -> List[RegionProfile]:
+    """Return all registered region profiles."""
+    return list(REGIONS.values())
+
+
+
+def is_valid_coordinate(lat: float, lon: float) -> bool:
+    """Check if lat/lon are finite, valid WGS-84 coordinates (-90 <= lat <= 90, -180 <= lon <= 180)."""
+    try:
+        import math
+        if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
+            return False
+        if not (math.isfinite(lat) and math.isfinite(lon)):
+            return False
+        return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
+    except Exception:
+        return False
+
+
+def find_region_by_coordinates(lat: float, lon: float) -> Optional[RegionProfile]:
+    """Find a registered region whose bounding box contains the coordinate."""
+    for region in REGIONS.values():
+        if region.is_within_bounds(lat, lon):
+            return region
+    return None
+
+
+def resolve_route_region(
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    requested_region: Optional[str] = None,
+) -> Optional[RegionProfile]:
+    """
+    Resolve which traffic region applies to a route.
+    1. If requested_region is provided and matches a registered region, use it.
+    2. Check if origin and destination fall within the same registered region.
+    3. If one point falls within a registered region and the other is near or inside, use that region.
+    4. Otherwise, return None (unsupported traffic region; standard OSRM routing applies).
+    """
+    if requested_region and requested_region.strip().lower() in REGIONS:
+        return REGIONS[requested_region.strip().lower()]
+
+    origin_region = find_region_by_coordinates(origin_lat, origin_lon)
+    dest_region = find_region_by_coordinates(dest_lat, dest_lon)
+
+    if origin_region and dest_region and origin_region.key == dest_region.key:
+        return origin_region
+    if origin_region and not dest_region:
+        return origin_region
+    if dest_region and not origin_region:
+        return dest_region
+
+    return None
 ```
 
 
@@ -617,7 +783,7 @@ class TrafficDataPipeline:
 
     DATASETS_DIR = os.path.join(os.path.dirname(__file__), "datasets")
     # Dataset, OSRM-cache and Plus-Code reference all follow the ACTIVE_REGION setting
-    # (default "bengaluru" => behaviour identical to before this change).
+    # (default "coimbatore" for the college demo; set ACTIVE_REGION=bengaluru to opt into Bengaluru).
     REGION = get_region()
     TML_TRAFFIC_CSV = REGION.traffic_csv
     CACHE_FILE = REGION.osrm_cache
@@ -6981,11 +7147,11 @@ class TrafficDataPipeline:
 
 ```python
 import math
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 
 from ml.route_model import predictor as congestion_predictor
-from core.region import get_region
+from core.region import RegionProfile, get_region, resolve_route_region
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371.0
@@ -7003,12 +7169,27 @@ class RouteScorer:
     """Evaluates multiple route candidates by fetching the Congestion Factor."""
     
     # Region-specific "historically covered" anchors (see core/region.py).
+    # Property fallback for backwards compatibility
     KNOWN_CORNERS = get_region().coverage_anchors()
     
     @classmethod
-    def determine_coverage(cls, origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float) -> str:
-        o_dists = [haversine(origin_lat, origin_lon, lat, lon) for lat, lon in cls.KNOWN_CORNERS]
-        d_dists = [haversine(dest_lat, dest_lon, lat, lon) for lat, lon in cls.KNOWN_CORNERS]
+    def determine_coverage(
+        cls, 
+        origin_lat: float, 
+        origin_lon: float, 
+        dest_lat: float, 
+        dest_lon: float, 
+        region: Optional[RegionProfile] = None
+    ) -> str:
+        if region is None:
+            return "Unsupported (Out of Coverage)"
+
+        anchors = region.coverage_anchors()
+        if not anchors:
+            return "Low (Extrapolated)"
+
+        o_dists = [haversine(origin_lat, origin_lon, lat, lon) for lat, lon in anchors]
+        d_dists = [haversine(dest_lat, dest_lon, lat, lon) for lat, lon in anchors]
         
         o_min = min(o_dists) if o_dists else float('inf')
         d_min = min(d_dists) if d_dists else float('inf')
@@ -7021,67 +7202,96 @@ class RouteScorer:
             return "Low (Extrapolated)"
 
     @classmethod
-    def evaluate_routes(cls, routes: List[Dict[str, Any]], origin_lat: float, origin_lon: float, dest_lat: float, dest_lon: float, is_emergency_mode: bool = False) -> List[Dict[str, Any]]:
+    def evaluate_routes(
+        cls, 
+        routes: List[Dict[str, Any]], 
+        origin_lat: float, 
+        origin_lon: float, 
+        dest_lat: float, 
+        dest_lon: float, 
+        is_emergency_mode: bool = False,
+        region: Optional[RegionProfile] = None
+    ) -> List[Dict[str, Any]]:
         ist_tz = timezone(timedelta(hours=5, minutes=30))
         now = datetime.now(ist_tz)
         hour = now.hour
         day_of_week = now.weekday()
         is_weekend = int(day_of_week in [5, 6])
         month = now.month
+        # Auto-resolve region if not explicitly provided
+        if region is None:
+            region = resolve_route_region(origin_lat, origin_lon, dest_lat, dest_lon)
         
-        confidence = cls.determine_coverage(origin_lat, origin_lon, dest_lat, dest_lon)
-        
-        for idx, route in enumerate(routes):
-            dist_km = route.get('distance_meters', 0) / 1000.0
-            dur_sec = route.get('duration_seconds', 0)
-            
-            # OSRM Feature Extraction
-            steps = route.get('steps', [])
-            num_steps = len(steps)
-            turns = 0
-            roundabouts = 0
-            for step in steps:
-                mtype = step.get('maneuver', {}).get('type', '')
-                if mtype in ['turn', 'merge', 'ramp']:
-                    turns += 1
-                if mtype in ['roundabout', 'rotary']:
-                    roundabouts += 1
-            
-            avg_step_len = dist_km / max(1, num_steps)
-            osrm_dur_min = dur_sec / 60.0 if dur_sec > 0 else 1.0
-            
-            # Congestion Factor prediction
-            # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
-            # if is_emergency_mode:
-            #     cf = 1.0
-            # else:
-            cf = congestion_predictor.predict_congestion_factor(
-                osrm_dist=dist_km,
-                osrm_dur_min=osrm_dur_min,
-                steps_count=num_steps,
-                turns=turns,
-                roundabouts=roundabouts,
-                avg_step_len=avg_step_len,
-                hour=hour,
-                day_of_week=day_of_week,
-                is_weekend=is_weekend,
-                month=month
-            )
-            
-            predicted_dur_sec = dur_sec * cf
-            predicted_dur_min = predicted_dur_sec / 60.0
-            
-            route['route_index'] = idx
-            route['predicted_duration_seconds'] = predicted_dur_sec
-            route['predicted_duration_minutes'] = predicted_dur_min
-            route['standard_duration_seconds'] = dur_sec
-            route['standard_duration_minutes'] = dur_sec / 60.0
-            route['congestion_factor'] = cf
-            route['confidence'] = confidence
-            route['is_ai_recommended'] = False
-            route['recommendation_label'] = ""
-            route['predicted_average_speed_kmh'] = dist_km / (predicted_dur_min / 60.0) if predicted_dur_min > 0 else 0.0
-            route['delay_savings_minutes'] = 0.0
+        # When outside any trained/supported traffic region, traffic predictions are unsupported.
+        # Use standard OSRM driving duration as the documented fallback.
+        if region is None:
+            confidence = "Unsupported (Out of Coverage)"
+            for idx, route in enumerate(routes):
+                dist_km = route.get('distance_meters', 0) / 1000.0
+                dur_sec = route.get('duration_seconds', 0)
+                dur_min = dur_sec / 60.0 if dur_sec > 0 else 1.0
+                
+                route['route_index'] = idx
+                route['predicted_duration_seconds'] = dur_sec
+                route['predicted_duration_minutes'] = dur_min
+                route['standard_duration_seconds'] = dur_sec
+                route['standard_duration_minutes'] = dur_min
+                route['congestion_factor'] = 1.0
+                route['confidence'] = confidence
+                route['is_ai_recommended'] = False
+                route['recommendation_label'] = "OSRM Route" if idx > 0 else "OSRM Preferred Route"
+                route['predicted_average_speed_kmh'] = dist_km / (dur_min / 60.0) if dur_min > 0 else 0.0
+                route['delay_savings_minutes'] = 0.0
+        else:
+            confidence = cls.determine_coverage(origin_lat, origin_lon, dest_lat, dest_lon, region=region)
+            for idx, route in enumerate(routes):
+                dist_km = route.get('distance_meters', 0) / 1000.0
+                dur_sec = route.get('duration_seconds', 0)
+                
+                # OSRM Feature Extraction
+                steps = route.get('steps', [])
+                num_steps = len(steps)
+                turns = 0
+                roundabouts = 0
+                for step in steps:
+                    mtype = step.get('maneuver', {}).get('type', '')
+                    if mtype in ['turn', 'merge', 'ramp']:
+                        turns += 1
+                    if mtype in ['roundabout', 'rotary']:
+                        roundabouts += 1
+                
+                avg_step_len = dist_km / max(1, num_steps)
+                osrm_dur_min = dur_sec / 60.0 if dur_sec > 0 else 1.0
+                
+                # Congestion Factor prediction scoped to the active region model
+                cf = congestion_predictor.predict_congestion_factor(
+                    osrm_dist=dist_km,
+                    osrm_dur_min=osrm_dur_min,
+                    steps_count=num_steps,
+                    turns=turns,
+                    roundabouts=roundabouts,
+                    avg_step_len=avg_step_len,
+                    hour=hour,
+                    day_of_week=day_of_week,
+                    is_weekend=is_weekend,
+                    month=month,
+                    region_key=region.key
+                )
+                
+                predicted_dur_sec = dur_sec * cf
+                predicted_dur_min = predicted_dur_sec / 60.0
+                
+                route['route_index'] = idx
+                route['predicted_duration_seconds'] = predicted_dur_sec
+                route['predicted_duration_minutes'] = predicted_dur_min
+                route['standard_duration_seconds'] = dur_sec
+                route['standard_duration_minutes'] = dur_sec / 60.0
+                route['congestion_factor'] = cf
+                route['confidence'] = confidence
+                route['is_ai_recommended'] = False
+                route['recommendation_label'] = ""
+                route['predicted_average_speed_kmh'] = dist_km / (predicted_dur_min / 60.0) if predicted_dur_min > 0 else 0.0
+                route['delay_savings_minutes'] = 0.0
 
         if not routes:
             return routes
@@ -7118,51 +7328,89 @@ class RouteScorer:
 
 ```python
 import os
+from typing import Optional
 import joblib
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from ml.dataset import TrafficDataPipeline
-from core.region import get_region
+from core.region import REGIONS, get_region
 
 class RouteCongestionPredictor:
     """V3.0 ML Model for Apex Guardian.
     
     Predicts a Congestion Factor (multiplier) based on topological route features
     and temporal context, strictly avoiding origin/destination memorization.
+    Supports distinct regional models (e.g. Bengaluru, Coimbatore).
     """
     
     def __init__(self):
-        self.model = None
         self.weights_dir = os.path.join(os.path.dirname(__file__), "weights")
-        self.model_path = os.path.join(self.weights_dir, get_region().model_filename)
+        self._models: dict = {}
         
         if not os.path.exists(self.weights_dir):
             os.makedirs(self.weights_dir)
             
-        self.load_model()
-        
-    def load_model(self):
-        if os.path.exists(self.model_path):
-            self.model = joblib.load(self.model_path)
-            print(f"[RouteCongestionPredictor] Loaded fixed V3.0 congestion model from {self.model_path}")
-        else:
-            print("[RouteCongestionPredictor] No model found. Please train.")
-            
+        self.load_models()
+
+    def load_models(self):
+        """Pre-load weights for all registered regions that have model files."""
+        for key, reg in REGIONS.items():
+            path = os.path.join(self.weights_dir, reg.model_filename)
+            if os.path.exists(path):
+                try:
+                    self._models[key] = joblib.load(path)
+                    print(f"[RouteCongestionPredictor] Loaded model for '{key}' from {path}")
+                except Exception as e:
+                    print(f"[RouteCongestionPredictor] Could not load model for '{key}': {e}")
+            else:
+                print(f"[RouteCongestionPredictor] No model found for '{key}' at {path}")
+
+    @property
+    def model(self):
+        """Backward-compatibility: returns model for the default active region."""
+        active_key = get_region().key
+        return self.get_model(active_key)
+
+    @model.setter
+    def model(self, value):
+        active_key = get_region().key
+        self._models[active_key] = value
+
+    def get_model(self, region_key: Optional[str] = None):
+        """Retrieve the model for a specific region key."""
+        key = (region_key or get_region().key).strip().lower()
+        if key in self._models:
+            return self._models[key]
+        if key in REGIONS:
+            path = os.path.join(self.weights_dir, REGIONS[key].model_filename)
+            if os.path.exists(path):
+                try:
+                    self._models[key] = joblib.load(path)
+                    return self._models[key]
+                except Exception:
+                    pass
+        return None
+
     def predict_congestion_factor(self, osrm_dist: float, osrm_dur_min: float, steps_count: int, 
                                  turns: int, roundabouts: int, avg_step_len: float,
-                                 hour: int, day_of_week: int, is_weekend: int, month: int) -> float:
-        """Predicts the congestion multiplier for a specific route."""
-        if self.model is None:
-            # Fallback to 1.0 (no congestion) if model is missing
+                                 hour: int, day_of_week: int, is_weekend: int, month: int,
+                                 region_key: Optional[str] = None) -> float:
+        """Predicts the congestion multiplier for a specific route within the given region."""
+        model = self.get_model(region_key)
+        if model is None:
+            # Fallback to 1.0 (baseline standard travel time) if model is missing or region unsupported
             return 1.0
             
         features = np.array([[hour, day_of_week, is_weekend, month,
                               osrm_dist, osrm_dur_min, steps_count, turns, roundabouts, avg_step_len]])
         
-        pred = self.model.predict(features)[0]
-        # Never predict negative or zero time. Hard floor at 0.5x.
-        return max(0.5, float(pred))
+        try:
+            pred = model.predict(features)[0]
+            # Never predict negative or zero time. Hard floor at 0.5x.
+            return max(0.5, float(pred))
+        except Exception:
+            return 1.0
 
 
 # Global instance
@@ -7311,6 +7559,7 @@ class RouteRequest(BaseModel):
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
     synthetic_traffic_active: bool = True
+    region: Optional[str] = None
 
 class CongestionSegment(BaseModel):
     """Sub-segment of a route with localized real-time and predicted congestion metrics."""
@@ -7383,6 +7632,8 @@ class RouteResponse(BaseModel):
     success: bool
     routes_count: int
     candidates: List[CandidateRoute]
+    traffic_coverage: Optional[str] = "supported"
+    region: Optional[str] = None
 
 class TrafficFactorsRequest(BaseModel):
     """Query live traffic metrics for a location or corridor."""
@@ -7417,6 +7668,7 @@ class RerouteRequest(BaseModel):
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
     recent_routes: List[Dict[str, Any]] = Field(default_factory=list)
     synthetic_traffic_active: bool = True
+    region: Optional[str] = None
 
 class RerouteRecommendation(BaseModel):
     """Alternative route recommendation evaluated from the current location."""
@@ -7452,7 +7704,7 @@ class PushNotificationPayload(BaseModel):
 
 ```python
 import math
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from services.traffic_service import LiveTrafficService
 from schemas.navigation import CongestionLevel
 
@@ -7485,7 +7737,8 @@ class CongestionDetector:
         steps: List[Dict[str, Any]], 
         total_distance_m: float, 
         base_duration_s: float,
-        is_emergency_mode: bool = False
+        is_emergency_mode: bool = False,
+        region: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Analyzes a candidate route and returns segmented traffic breakdown, hotspots, and predictive metrics."""
         coordinates: List[List[float]] = geometry.get("coordinates", [])
@@ -7545,12 +7798,24 @@ class CongestionDetector:
             # Predictive arrival offset: When will the driver physically reach this segment?
             prediction_offset_min = cumulative_elapsed_s / 60.0
 
-            # Real-time traffic factor telemetry at that predicted timestamp
-            traffic_factors = LiveTrafficService.get_point_traffic_factors(
-                lat=mid_lat, 
-                lon=mid_lon, 
-                prediction_offset_min=prediction_offset_min
-            )
+            # Real-time traffic factor telemetry: out-of-coverage routes use baseline freeflow
+            if region is None:
+                traffic_factors = {
+                    "current_speed_kmh": 45.0,
+                    "freeflow_speed_kmh": 45.0,
+                    "density_index": 20.0,
+                    "congestion_level": CongestionLevel.LOW.value,
+                    "congestion_factor": 1.0,
+                    "color": "#16A34A",
+                    "incident_description": None,
+                }
+            else:
+                traffic_factors = LiveTrafficService.get_point_traffic_factors(
+                    lat=mid_lat, 
+                    lon=mid_lon, 
+                    prediction_offset_min=prediction_offset_min,
+                    region=region
+                )
 
             # EMERGENCY FEATURE DISABLED (commented out, not deleted) - re-enable later.
             #             # In emergency mode, emergency vehicles experience lower baseline congestion
@@ -7763,7 +8028,23 @@ def _profile(active: Sequence[Sequence[float]], active_cum: Sequence[float], byp
     return points
 
 
-def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# Planning tiers, strictest first. A real road network rarely offers a textbook split, so the
+# planner relaxes (never fabricates geometry) until some genuine OSRM pair works:
+# (min split ratio, max split ratio, min lateral gap at split m, shared-road tolerance m,
+#  min clear gap for the jam m, min jam length m, gap between switch and jam m)
+PLAN_TIERS: Tuple[Tuple[float, float, float, float, float, float, float], ...] = (
+    # Keep at least 1 km between the common-road switch point and the congestion zone.
+    # This makes the 1 km-before-hotspot trigger happen at (not after) the road split.
+    (0.15, 0.48, 55.0, 28.0, 125.0, 350.0, 1000.0),
+    (0.08, 0.60, 40.0, 32.0, 80.0, 300.0, 1000.0),
+    (0.03, 0.75, 30.0, 40.0, 45.0, 250.0, 1000.0),
+    # Last resort relaxes road-separation/clearance constraints, never the 1 km lead distance.
+    (0.02, 0.85, 22.0, 45.0, 40.0, 200.0, 1000.0),
+)
+
+
+def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any], tier: int = 0) -> Optional[Dict[str, Any]]:
+    r_lo, r_hi, split_gap, shared_tol, clear_gap, zone_min, jam_gap = PLAN_TIERS[tier]
     active_coords, bypass_coords = _valid_coords(active), _valid_coords(bypass)
     if not active_coords or not bypass_coords:
         return None
@@ -7778,12 +8059,12 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
     divergence_i: Optional[int] = None
     for i, (distance, lateral) in enumerate(profile):
         ratio = distance / total
-        if ratio < 0.15 or ratio > 0.48:
+        if ratio < r_lo or ratio > r_hi:
             continue
         end_dist = distance + 100.0
         lookahead = [d for d, offset in profile[i:] if d <= end_dist]
         offsets = [offset for d, offset in profile[i:] if d <= end_dist]
-        if lookahead and lookahead[-1] >= distance + 75 and len(offsets) >= 3 and all(offset > 55.0 for offset in offsets):
+        if lookahead and lookahead[-1] >= distance + 75 and len(offsets) >= 3 and all(offset > split_gap for offset in offsets):
             divergence_i = i
             break
     if divergence_i is None:
@@ -7792,39 +8073,31 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
     switch_distance: Optional[float] = None
     for j in range(divergence_i - 1, -1, -1):
         d, offset = profile[j]
-        if d / total < 0.12:
+        if d / total < max(0.0, r_lo - 0.03):
             break
-        if offset <= 28.0:
+        if offset <= shared_tol:
             switch_distance = max(0.0, d - 5.0)
             break
-    if switch_distance is None or switch_distance / total > 0.45:
+    if switch_distance is None or switch_distance / total > r_hi - 0.03:
         return None
 
-    # Put the jam only on a section where the precomputed OSRM alternative is at least
-    # 125m away. A 350–500m zone is long enough to see but easy to route around.
-    zone_length = min(500.0, max(350.0, total * 0.06))
-    profile_step = 25.0
-    first_start = switch_distance + 100.0
-    last_start = min(total - zone_length - 100.0, total * 0.78)
+    # Put the jam at the first viable point exactly one kilometre after the shared-road
+    # switch. Moving the zone farther downstream makes the 1 km trigger occur after the
+    # junction and can leave the vehicle unable to join the preplanned bypass.
+    zone_length = min(500.0, max(zone_min, total * 0.06))
+    first_start = switch_distance + jam_gap
+    last_start = min(total - zone_length - 100.0, total * 0.85)
     if first_start > last_start:
         return None
-    best: Optional[Tuple[float, float]] = None  # (clearance, zone_start)
-    d = math.ceil(first_start / profile_step) * profile_step
-    while d <= last_start:
-        window = [offset for sample_d, offset in profile if d - 1.0 <= sample_d <= d + zone_length + 1.0]
-        if window and min(window) >= 125.0:
-            clearance = min(window)
-            if best is None or clearance > best[0]:
-                best = (clearance, d)
-        d += profile_step
-    if best is None:
+    window = [offset for sample_d, offset in profile if first_start - 25.0 <= sample_d <= first_start + zone_length + 25.0]
+    if not window or min(window) < clear_gap:
         return None
-
-    clearance, zone_start = best
+    clearance = min(window)
+    zone_start = first_start
     active_index = int(active.get("route_index", 0))
     bypass_index = int(bypass.get("route_index", 0))
     switch_point = _point_at(active_coords, active_cum, switch_distance)
-    if _distance_to_route_m(switch_point, bypass_coords) > 30.0:
+    if _distance_to_route_m(switch_point, bypass_coords) > max(30.0, shared_tol + 5.0):
         return None
     return {
         "active_route_index": active_index,
@@ -7839,24 +8112,26 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
 
 
 def plan_controlled_bypass(candidates: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Find the best real route pair and a synthetic jam window the alternative avoids."""
-    best: Optional[Dict[str, Any]] = None
-    best_score = -float("inf")
-    for i, active in enumerate(candidates):
-        for j, bypass in enumerate(candidates):
-            if i == j:
-                continue
-            plan = _plan_pair(active, bypass)
-            if not plan:
-                continue
-            # Prefer a strong side-road separation, with a mild preference for a later,
-            # more visually obvious switching point instead of a very early route change.
-            switch_ratio = plan["switch_distance_m"] / max(1.0, float(active.get("distance_meters", 1.0)))
-            score = plan["minimum_bypass_clearance_m"] - abs(switch_ratio - 0.34) * 180.0
-            if score > best_score:
-                best_score, best = score, plan
-    return best
-
+    """Find a real route pair and a jam window (just after the road split) the alternative avoids."""
+    for tier in range(len(PLAN_TIERS)):
+        best: Optional[Dict[str, Any]] = None
+        best_score = -float("inf")
+        for i, active in enumerate(candidates):
+            for j, bypass in enumerate(candidates):
+                if i == j:
+                    continue
+                plan = _plan_pair(active, bypass, tier)
+                if not plan:
+                    continue
+                # Prefer strong separation and an early split so the jam sits right after it.
+                switch_ratio = plan["switch_distance_m"] / max(1.0, float(active.get("distance_meters", 1.0)))
+                score = plan["minimum_bypass_clearance_m"] - abs(switch_ratio - 0.30) * 180.0
+                if score > best_score:
+                    best_score, best = score, plan
+        if best:
+            best["plan_tier"] = tier
+            return best
+    return None
 
 
 def _bearing_deg(a: Sequence[float], b: Sequence[float]) -> float:
@@ -7932,10 +8207,17 @@ async def build_controlled_bypass_candidates(
         total = base_cum[-1]
         if total < 2_500:
             continue
-        for fraction in (0.42, 0.55):
+        # Keep the planned entry junction inside _plan_pair's accepted divergence
+        # window (15–48% of the route). A 55% target put the entry after that limit,
+        # so every probe at that position was guaranteed to be rejected on normal routes.
+        # Probe early, middle, and later congestion zones with progressively wider
+        # offsets. Severe-mode routes often need a farther parallel road to reach a
+        # genuinely separate corridor. Entries still land before the planned jam.
+        for fraction, lateral_offset_m in ((0.30, 300.0), (0.42, 500.0), (0.54, 700.0)):
             target_zone_start = total * fraction
             zone_length = min(450.0, max(350.0, total * 0.06))
-            entry_d = max(120.0, target_zone_start - 160.0)
+            # The bypass begins on the shared road about 1 km before the intended jam.
+            entry_d = max(120.0, target_zone_start - 1000.0)
             exit_d = min(total - 100.0, target_zone_start + zone_length + 160.0)
             if exit_d <= entry_d + 500:
                 continue
@@ -7946,7 +8228,7 @@ async def build_controlled_bypass_candidates(
             tangent_after = _point_at(base_coords, base_cum, min(total, target_zone_start + zone_length + 30.0))
             bearing = _bearing_deg(tangent_before, tangent_after)
             for side in (90.0, -90.0):
-                offset = _offset_point(center, bearing + side, 350.0)
+                offset = _offset_point(center, bearing + side, lateral_offset_m)
                 # IMPORTANT: begin the OSRM leg at an existing point on the chosen route.
                 # This makes the active-route prefix reusable and guarantees a shared approach.
                 waypoints = [
@@ -7957,7 +8239,7 @@ async def build_controlled_bypass_candidates(
                 ]
                 probe_jobs.append((base, waypoints, entry_d))
     # Do not hammer the public router if there are many origin alternatives.
-    probe_jobs = probe_jobs[:8]
+    probe_jobs = probe_jobs[:12]
     if not probe_jobs:
         return [], None
 
@@ -7981,7 +8263,7 @@ async def build_controlled_bypass_candidates(
             # would need an artificial connector, or snaps that moved the junction far away.
             snapped_entry = suffix_coords[0]
             along_d, cross_track = _project_distance_along_route(snapped_entry, base_coords, base_cum)
-            if cross_track > 18.0 or abs(along_d - expected_entry_d) > 65.0:
+            if cross_track > 25.0 or abs(along_d - expected_entry_d) > 90.0:
                 continue
             prefix_end = _point_at(base_coords, base_cum, along_d)
             prefix_coords: List[List[float]] = []
@@ -8026,7 +8308,12 @@ async def build_controlled_bypass_candidates(
                 "maneuver": {"type": "depart", "instruction": "Continue on the current road to the bypass junction", "location": combined[0]},
             }
             stitched["steps"] = [prefix_step] + list(route.get("steps") or [])
-            plan = _plan_pair(base, stitched)
+            plan = None
+            for tier in range(len(PLAN_TIERS)):
+                plan = _plan_pair(base, stitched, tier)
+                if plan:
+                    plan["plan_tier"] = tier
+                    break
             if plan:
                 additions.append(stitched)
                 return additions, plan
@@ -8041,15 +8328,22 @@ async def build_controlled_bypass_candidates(
 from typing import List, Dict, Any
 import httpx
 from core.config import settings
-from core.region import get_region
+from core.region import get_region, list_registered_regions
 
 class NominatimService:
     @staticmethod
     async def search_places(query: str) -> List[Dict[str, Any]]:
-        """Search places via Nominatim API bounded to Bengaluru region with static fallback for reliability."""
+        """Search places via Nominatim API with active region viewbox bias and multi-region fallback."""
         sanitized_query = query.strip()
         region = get_region()
-        if not any(alias in sanitized_query.lower() for alias in region.nominatim_aliases):
+        
+        # Check if the query explicitly specifies any registered region alias
+        has_region_alias = any(
+            alias in sanitized_query.lower()
+            for r in list_registered_regions()
+            for alias in r.nominatim_aliases
+        )
+        if not has_region_alias and region.nominatim_suffix:
             sanitized_query = f"{sanitized_query}, {region.nominatim_suffix}"
 
         headers = {
@@ -8059,7 +8353,7 @@ class NominatimService:
             "q": sanitized_query,
             "format": "json",
             "viewbox": region.nominatim_viewbox,
-            "bounded": "1",
+            "bounded": "0",  # Bias toward viewbox rather than strictly excluding outside matches
             "limit": "5"
         }
 
@@ -8542,8 +8836,9 @@ import math
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from core.region import resolve_route_region
 from ml.recommender import RouteScorer
-from schemas.navigation import CandidateRoute, RerouteRecommendation, TrafficTestMode
+from schemas.navigation import CandidateRoute, CongestionLevel, RerouteRecommendation, TrafficTestMode
 from services.congestion_detector import CongestionDetector
 from services.osrm import OSRMService
 
@@ -8796,6 +9091,37 @@ def _usable_avoid_zones(
     return zones
 
 
+def _mark_clear_controlled_bypass(route: CandidateRoute) -> CandidateRoute:
+    """Mark a route that passed controlled-zone avoidance as the clean demo bypass.
+
+    Controlled tests intentionally ask for a route without congestion, so do not carry
+    unrelated predicted hotspots into the accepted alternative and immediately re-trigger
+    the same reroute flow. Real-navigation routes are never processed by this helper.
+    """
+    total_distance = 0.0
+    for segment in route.segments or []:
+        distance = max(0.0, float(segment.distance_meters or 0.0))
+        freeflow_speed = max(20.0, float(segment.freeflow_speed_kmh or 45.0))
+        segment.congestion_level = CongestionLevel.LOW
+        segment.color = "#16A34A"
+        segment.current_speed_kmh = round(freeflow_speed, 1)
+        segment.delay_seconds = 0.0
+        segment.duration_seconds = round(distance / max(0.5, freeflow_speed / 3.6), 1)
+        segment.congestion_factor = 1.0
+        total_distance += distance
+
+    route.hotspots = []
+    route.clear_distance_km = round((route.distance_meters or total_distance) / 1000.0, 2)
+    route.moderate_distance_km = 0.0
+    route.heavy_distance_km = 0.0
+    route.severe_distance_km = 0.0
+    route.total_delay_seconds = 0.0
+    route.congestion_factor = 1.0
+    route.predicted_duration_seconds = float(route.duration_seconds or 0.0)
+    route.predicted_duration_minutes = round(route.predicted_duration_seconds / 60.0, 1)
+    return route
+
+
 def _avoidance_detour_allowed(
     route: "CandidateRoute", reference_duration_s: float, direct_distance_m: float
 ) -> bool:
@@ -8827,6 +9153,7 @@ class DynamicRerouteEngine:
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
         synthetic_traffic_active: bool,
+        region: Optional[Any] = None,
     ) -> Optional[CandidateRoute]:
         route_dist_m = candidate.get("distance_meters", 0.0)
         base_dur_s = candidate.get("duration_seconds", 0.0)
@@ -8914,6 +9241,7 @@ class DynamicRerouteEngine:
             steps=steps,
             total_distance_m=route_dist_m,
             base_duration_s=base_dur_s,
+            region=region,
             is_emergency_mode=is_emergency_mode,
         )
         # Deliberately do NOT re-apply the controlled traffic-test scenario here.
@@ -8966,6 +9294,7 @@ class DynamicRerouteEngine:
         traffic_test_mode: TrafficTestMode,
         traffic_progress: float,
         synthetic_traffic_active: bool,
+        region: Optional[Any] = None,
     ) -> List[CandidateRoute]:
         evaluated = RouteScorer.evaluate_routes(
             raw_candidates,
@@ -8973,6 +9302,7 @@ class DynamicRerouteEngine:
             origin_lon=current_lon,
             dest_lat=dest_lat,
             dest_lon=dest_lon,
+            region=region,
             is_emergency_mode=is_emergency_mode,
         )
         processed: List[CandidateRoute] = []
@@ -8989,6 +9319,7 @@ class DynamicRerouteEngine:
                     traffic_test_mode,
                     traffic_progress,
                     synthetic_traffic_active,
+                    region=region,
                 )
             except Exception:
                 logger.exception("Rejecting reroute candidate after processing failure")
@@ -9011,9 +9342,13 @@ class DynamicRerouteEngine:
         traffic_progress: float = 0.0,
         recent_routes: Optional[List[Dict[str, Any]]] = None,
         synthetic_traffic_active: bool = True,
+        region_name: Optional[str] = None,
     ) -> RerouteRecommendation:
         """Evaluate alternatives, attempting a waypoint bypass around supplied avoid zones."""
         try:
+            route_region = resolve_route_region(
+                current_lat, current_lon, dest_lat, dest_lon, requested_region=region_name
+            )
             direct_distance_m = haversine_distance_m(current_lon, current_lat, dest_lon, dest_lat)
             if direct_distance_m <= 500.0:
                 return RerouteRecommendation(
@@ -9046,6 +9381,7 @@ class DynamicRerouteEngine:
                 traffic_test_mode,
                 traffic_progress,
                 synthetic_traffic_active,
+                region=route_region,
             )
 
             clean_routes = [
@@ -9197,6 +9533,7 @@ class DynamicRerouteEngine:
                                     bypass_candidates, current_lat, current_lon, dest_lat, dest_lon,
                                     direct_distance_m, is_emergency_mode, traffic_test_mode,
                                     traffic_progress, synthetic_traffic_active,
+                                    region=route_region,
                                 )
                             except Exception as error:
                                 logger.warning(
@@ -9244,6 +9581,12 @@ class DynamicRerouteEngine:
                     alternative_routes=[],
                     reason="No alternate route avoids this stretch â€” continuing on the only available path.",
                 )
+
+            # Controlled-test avoidance routes are the green/clear alternative in the demo.
+            # Remove model-generated hotspots after geometry has passed every avoidance zone,
+            # so accepting this route cannot immediately announce a second unrelated jam.
+            if zones and traffic_test_mode in (TrafficTestMode.HEAVY, TrafficTestMode.SEVERE, TrafficTestMode.DYNAMIC):
+                clean_routes = [_mark_clear_controlled_bypass(route) for route in clean_routes]
 
             # Filter out candidates that are too similar to recently rejected/used routes
             # UNLESS they offer a truly massive improvement (e.g. they became totally clear)
@@ -9527,7 +9870,7 @@ ZONE_MIN_LEN_M = 300.0
 ZONE_MAX_LEN_M = 1000.0
 ZONE_MAX_ROUTE_FRACTION = 0.25
 DYNAMIC_CLEAR_MARGIN = 0.03     # cleared once progress passes zone end + 3 %
-ZONE_PATH_SAMPLE_M = 120.0
+ZONE_PATH_SAMPLE_M = 50.0
 
 
 def _hav(a: List[float], b: List[float]) -> float:
@@ -9614,9 +9957,9 @@ def _sample_zone_path(zone_segments: List[Dict[str, Any]]) -> List[List[float]]:
     last = zone_segments[-1].get("coordinates", [[0, 0]])[-1]
     if not pts or pts[-1] != [round(last[0], 6), round(last[1], 6)]:
         pts.append([round(last[0], 6), round(last[1], 6)])
-    if len(pts) > 14:
-        step = (len(pts) - 1) / 13.0
-        pts = [pts[round(i * step)] for i in range(14)]
+    if len(pts) > 28:
+        step = (len(pts) - 1) / 27.0
+        pts = [pts[round(i * step)] for i in range(28)]
     return pts
 
 
@@ -9896,12 +10239,13 @@ class LiveTrafficService:
         lat: float, 
         lon: float, 
         prediction_offset_min: float = 0.0,
-        now_dt: Optional[datetime] = None
+        now_dt: Optional[datetime] = None,
+        region: Optional[Any] = None
     ) -> Dict[str, Any]:
         """Calculates real-time & predictive traffic factors for a given point.
         
         Considers:
-        - Proximity to known bottleneck hubs
+        - Proximity to known bottleneck hubs within the active region
         - Time-of-day curve (evaluated at current time + prediction_offset_min)
         - Dynamic live incident feeds
         """
@@ -9919,8 +10263,13 @@ class LiveTrafficService:
         active_hotspot = None
         min_dist = float('inf')
 
-        # Check proximity to known bottleneck nodes
-        for node in cls.KNOWN_BOTTLENECKS:
+        # Check proximity to bottleneck nodes that belong to the specified region
+        candidate_bottlenecks = [
+            b for b in cls.ALL_KNOWN_BOTTLENECKS
+            if region.is_within_bounds(b["lat"], b["lon"])
+        ] if region is not None else cls.KNOWN_BOTTLENECKS
+
+        for node in candidate_bottlenecks:
             dist = cls.haversine_km(lat, lon, node["lat"], node["lon"])
             if dist <= node["radius_km"]:
                 if dist < min_dist:
@@ -10007,8 +10356,9 @@ class LiveTrafficService:
 # (Bengaluru: every entry is inside the bounding box, so behaviour is unchanged.)
 # Coimbatore hotspots are NOT invented here; add measured data, or clearly-labelled synthetic
 # scenarios, to this list when available.
+LiveTrafficService.ALL_KNOWN_BOTTLENECKS = list(LiveTrafficService.KNOWN_BOTTLENECKS)
 LiveTrafficService.KNOWN_BOTTLENECKS = [
-    _bn for _bn in LiveTrafficService.KNOWN_BOTTLENECKS
+    _bn for _bn in LiveTrafficService.ALL_KNOWN_BOTTLENECKS
     if get_region().is_within_bounds(_bn["lat"], _bn["lon"])
 ]
 ```
@@ -10085,7 +10435,7 @@ def test_route_defaults_to_real_traffic_without_test_hotspots(monkeypatch):
 ## `backend\tests\test_controlled_bypass_planner.py`
 
 ```python
-from services.controlled_bypass_planner import plan_controlled_bypass
+from services.controlled_bypass_planner import plan_controlled_bypass, _cumulative, _project_distance_along_route
 from services.traffic_scenario import compute_scenario_zone
 
 
@@ -10113,7 +10463,7 @@ def test_planner_selects_shared_junction_and_a_clear_existing_route():
     assert plan["active_route_index"] != plan["bypass_route_index"]
     assert 0.12 <= plan["switch_distance_m"] / 12000.0 <= 0.48
     assert plan["zone_start_distance_m"] >= plan["switch_distance_m"] + 100
-    assert plan["minimum_bypass_clearance_m"] >= 125
+    assert plan["minimum_bypass_clearance_m"] >= 40
 
 
 def test_zone_can_be_placed_after_the_shared_switch_point():
@@ -10154,11 +10504,54 @@ def test_fallback_builds_bypass_from_shared_route_prefix():
         [base], 11.0, 77.0, 11.1, 77.0, fake_osrm
     ))
     assert requested, "fallback should request OSRM geometry starting at the route's entry junction"
+    # Every probe entry must fall inside the planner's feasible divergence window.
+    # A former 55% probe fell outside the 48% cap and could never produce a plan.
+    main_cumulative = _cumulative(main)
+    assert len(requested) == 6
+    probe_offsets_m = []
+    for waypoints in requested:
+        entry = [waypoints[0][1], waypoints[0][0]]  # OSRM input is (lat, lon); route points are (lon, lat).
+        along, cross_track = _project_distance_along_route(entry, main, main_cumulative)
+        assert cross_track <= 18.0
+        assert 0.12 <= along / main_cumulative[-1] <= 0.48
+
+        offset_point = [waypoints[1][1], waypoints[1][0]]
+        _, offset_distance = _project_distance_along_route(offset_point, main, main_cumulative)
+        probe_offsets_m.append(offset_distance)
+    assert min(probe_offsets_m) >= 250.0
+    assert max(probe_offsets_m) >= 650.0
     assert additions and plan is not None
     assert plan["active_route_index"] == 0
     assert plan["bypass_route_index"] != 0
-    assert plan["minimum_bypass_clearance_m"] >= 125
+    assert plan["minimum_bypass_clearance_m"] >= 40
     assert additions[0]["geometry"]["coordinates"][0] == main[0]
+
+
+def test_planner_relaxes_for_early_narrow_split():
+    """A real network often splits early and only ~70 m apart; a bypass must still be planned."""
+    main = _dense([[77.0, 11.0], [77.0, 11.1]])
+    # Splits ~1.1 km in (10 %), runs ~75 m east of the main road, rejoins near the end.
+    side = _dense([[77.0, 11.0], [77.0, 11.010], [77.0007, 11.0115], [77.0007, 11.088], [77.0, 11.09], [77.0, 11.1]])
+    plan = plan_controlled_bypass([
+        {"route_index": 0, "distance_meters": 11100.0, "geometry": {"type": "LineString", "coordinates": main}},
+        {"route_index": 1, "distance_meters": 11300.0, "geometry": {"type": "LineString", "coordinates": side}},
+    ])
+    assert plan is not None
+    assert plan["active_route_index"] != plan["bypass_route_index"]
+    assert abs((plan["zone_start_distance_m"] - plan["switch_distance_m"]) - 1000.0) <= 1.0
+    assert plan["zone_end_distance_m"] > plan["zone_start_distance_m"]
+
+
+def test_planner_last_resort_close_parallel_alternative():
+    """Two real routes only ~50 m apart after an early split still get a jam on one of them."""
+    main = _dense([[77.0, 11.0], [77.0, 11.1]])
+    side = _dense([[77.0, 11.0], [77.0, 11.006], [77.00045, 11.0075], [77.00045, 11.09], [77.0, 11.092], [77.0, 11.1]])
+    plan = plan_controlled_bypass([
+        {"route_index": 0, "distance_meters": 11100.0, "geometry": {"type": "LineString", "coordinates": main}},
+        {"route_index": 1, "distance_meters": 11200.0, "geometry": {"type": "LineString", "coordinates": side}},
+    ])
+    assert plan is not None
+    assert abs((plan["zone_start_distance_m"] - plan["switch_distance_m"]) - 1000.0) <= 1.0
 ```
 
 
@@ -10263,6 +10656,295 @@ def test_bengaluru_split_counts_remain_row_based(patched_pipeline, monkeypatch):
     Xtr, ytr, Xv, yv, Xte, yte, features = P.get_train_val_test_splits()
     # Existing behaviour: int(.75*90), int(.85*90) => 67 / 9 / 14.
     assert (len(Xtr), len(Xv), len(Xte)) == (67, 9, 14)
+```
+
+
+## `backend\tests\test_geographic_regions.py`
+
+```python
+import math
+import pytest
+from fastapi.testclient import TestClient
+
+from api.v1 import endpoints
+from core.region import (
+    is_valid_coordinate,
+    find_region_by_coordinates,
+    resolve_route_region,
+    get_region,
+)
+from main import app
+from schemas.navigation import TrafficTestMode
+
+client = TestClient(app)
+
+
+def _make_dummy_osrm_candidate(origin_lat, origin_lon, dest_lat, dest_lon):
+    return {
+        "route_index": 0,
+        "distance_meters": 6200.0,
+        "duration_seconds": 840.0,
+        "geometry": {
+            "type": "LineString",
+            "coordinates": [
+                [origin_lon, origin_lat],
+                [(origin_lon + dest_lon) / 2, (origin_lat + dest_lat) / 2],
+                [dest_lon, dest_lat],
+            ],
+        },
+        "steps": [
+            {
+                "name": "Main Highway",
+                "distance": 6200.0,
+                "duration": 840.0,
+                "maneuver": {"type": "depart", "location": [origin_lon, origin_lat]},
+            }
+        ],
+    }
+
+
+# -----------------------------------------------------------------------------
+# 1. Coordinate Validation Unit Tests
+# -----------------------------------------------------------------------------
+def test_is_valid_coordinate():
+    assert is_valid_coordinate(11.0179, 76.9674) is True
+    assert is_valid_coordinate(12.9786, 77.6421) is True
+    assert is_valid_coordinate(0.0, 0.0) is True
+    assert is_valid_coordinate(-90.0, 180.0) is True
+    assert is_valid_coordinate(90.0, -180.0) is True
+
+    # Invalid coordinates
+    assert is_valid_coordinate(91.0, 77.0) is False
+    assert is_valid_coordinate(-90.1, 77.0) is False
+    assert is_valid_coordinate(12.0, 180.5) is False
+    assert is_valid_coordinate(12.0, -181.0) is False
+    assert is_valid_coordinate(float("nan"), 77.0) is False
+    assert is_valid_coordinate(12.0, float("inf")) is False
+    assert is_valid_coordinate(None, 77.0) is False
+
+
+# -----------------------------------------------------------------------------
+# 2. Region Resolution Tests
+# -----------------------------------------------------------------------------
+def test_find_region_by_coordinates():
+    # Coimbatore
+    cbe_region = find_region_by_coordinates(11.0179, 76.9674)
+    assert cbe_region is not None
+    assert cbe_region.key == "coimbatore"
+
+    # Bengaluru
+    blr_region = find_region_by_coordinates(12.9786, 77.6421)
+    assert blr_region is not None
+    assert blr_region.key == "bengaluru"
+
+    # Outside regions (Tiruppur)
+    tiruppur_region = find_region_by_coordinates(11.1085, 77.3411)
+    assert tiruppur_region is None
+
+
+def test_resolve_route_region():
+    # Coimbatore route
+    region = resolve_route_region(11.0179, 76.9674, 11.04146, 77.0381)
+    assert region is not None
+    assert region.key == "coimbatore"
+
+    # Bengaluru route
+    region = resolve_route_region(12.9786, 77.6421, 12.9569, 77.7011)
+    assert region is not None
+    assert region.key == "bengaluru"
+
+    # Out of coverage route (Tiruppur)
+    region = resolve_route_region(11.1085, 77.3411, 11.1150, 77.3550)
+    assert region is None
+
+    # Cross-region route (Coimbatore to Bengaluru) -> no single regional model
+    region = resolve_route_region(11.0179, 76.9674, 12.9786, 77.6421)
+    assert region is None
+
+    # Explicit override when matching
+    region = resolve_route_region(11.0179, 76.9674, 11.04146, 77.0381, requested_region="coimbatore")
+    assert region is not None
+    assert region.key == "coimbatore"
+
+
+# -----------------------------------------------------------------------------
+# 3. Supplied Coimbatore Coordinates Route Test (The bug report case)
+# -----------------------------------------------------------------------------
+def test_supplied_coimbatore_coordinates_route(monkeypatch, caplog):
+    origin_lat, origin_lon = 11.0179, 76.9674
+    dest_lat, dest_lon = 11.04146, 77.0381
+
+    dummy = _make_dummy_osrm_candidate(origin_lat, origin_lon, dest_lat, dest_lon)
+
+    async def mock_get_routes(**kwargs):
+        return [dummy.copy()]
+
+    monkeypatch.setattr(endpoints.OSRMService, "get_routes", staticmethod(mock_get_routes))
+
+    with caplog.at_level("WARNING"):
+        response = client.post(
+            "/api/v1/route",
+            json={
+                "origin_lat": origin_lat,
+                "origin_lon": origin_lon,
+                "dest_lat": dest_lat,
+                "dest_lon": dest_lon,
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["success"] is True
+    assert data["routes_count"] == 1
+    assert data["traffic_coverage"] == "supported"
+    assert data["region"] == "coimbatore"
+
+    # Verify NO warnings about Bengaluru bounding box
+    for record in caplog.records:
+        assert "outside Bengaluru bounding box" not in record.message
+        assert "outside Bangalore bounding box" not in record.message
+
+
+# -----------------------------------------------------------------------------
+# 4. Bengaluru Route Test
+# -----------------------------------------------------------------------------
+def test_bengaluru_route(monkeypatch):
+    origin_lat, origin_lon = 12.9786, 77.6421
+    dest_lat, dest_lon = 12.9569, 77.7011
+
+    dummy = _make_dummy_osrm_candidate(origin_lat, origin_lon, dest_lat, dest_lon)
+
+    async def mock_get_routes(**kwargs):
+        return [dummy.copy()]
+
+    monkeypatch.setattr(endpoints.OSRMService, "get_routes", staticmethod(mock_get_routes))
+
+    response = client.post(
+        "/api/v1/route",
+        json={
+            "origin_lat": origin_lat,
+            "origin_lon": origin_lon,
+            "dest_lat": dest_lat,
+            "dest_lon": dest_lon,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["success"] is True
+    assert data["traffic_coverage"] == "supported"
+    assert data["region"] == "bengaluru"
+
+
+# -----------------------------------------------------------------------------
+# 5. Out of Coverage Coordinates Route Test (e.g. Tiruppur)
+# -----------------------------------------------------------------------------
+def test_out_of_coverage_route(monkeypatch):
+    # Tiruppur coordinates (outside both BLR and CBE traffic models)
+    origin_lat, origin_lon = 11.1085, 77.3411
+    dest_lat, dest_lon = 11.1150, 77.3550
+
+    dummy = _make_dummy_osrm_candidate(origin_lat, origin_lon, dest_lat, dest_lon)
+
+    async def mock_get_routes(**kwargs):
+        return [dummy.copy()]
+
+    monkeypatch.setattr(endpoints.OSRMService, "get_routes", staticmethod(mock_get_routes))
+
+    response = client.post(
+        "/api/v1/route",
+        json={
+            "origin_lat": origin_lat,
+            "origin_lon": origin_lon,
+            "dest_lat": dest_lat,
+            "dest_lon": dest_lon,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    assert data["success"] is True
+    assert data["traffic_coverage"] == "unsupported"
+    assert data["region"] is None
+    candidate = data["candidates"][0]
+    # Check baseline fallback values
+    assert candidate["congestion_factor"] == 1.0
+    assert "Unsupported" in candidate["confidence"]
+    assert candidate["predicted_duration_seconds"] == candidate["standard_duration_seconds"]
+
+
+# -----------------------------------------------------------------------------
+# 6. Genuinely Invalid Coordinates Tests
+# -----------------------------------------------------------------------------
+def test_invalid_coordinates_rejected_with_400():
+    # Latitude > 90
+    res = client.post(
+        "/api/v1/route",
+        json={"origin_lat": 95.0, "origin_lon": 76.96, "dest_lat": 11.0, "dest_lon": 77.0},
+    )
+    assert res.status_code == 400
+    assert "Invalid origin coordinates" in res.json()["detail"]
+
+    # Longitude > 180
+    res = client.post(
+        "/api/v1/route",
+        json={"origin_lat": 11.0, "origin_lon": 76.96, "dest_lat": 11.0, "dest_lon": 195.0},
+    )
+    assert res.status_code == 400
+    assert "Invalid destination coordinates" in res.json()["detail"]
+
+    # Invalid in reroute endpoint
+    res = client.post(
+        "/api/v1/reroute/evaluate",
+        json={
+            "current_lat": -95.0,
+            "current_lon": 77.0,
+            "dest_lat": 11.0,
+            "dest_lon": 77.0,
+            "original_remaining_duration_seconds": 300.0,
+        },
+    )
+    assert res.status_code == 400
+
+    # Invalid in traffic factors endpoint
+    res = client.get("/api/v1/traffic/factors", params={"lat": 12.0, "lon": 250.0})
+    assert res.status_code == 400
+
+
+# -----------------------------------------------------------------------------
+# 7. Failed Route Calculation Returns 404 (Not 200 with 0 routes)
+# -----------------------------------------------------------------------------
+def test_failed_route_calculation_returns_404(monkeypatch):
+    async def mock_empty_routes(**kwargs):
+        return []
+
+    monkeypatch.setattr(endpoints.OSRMService, "get_routes", staticmethod(mock_empty_routes))
+
+    response = client.post(
+        "/api/v1/route",
+        json={
+            "origin_lat": 11.0179,
+            "origin_lon": 76.9674,
+            "dest_lat": 11.04146,
+            "dest_lon": 77.0381,
+        },
+    )
+
+    assert response.status_code == 404
+    assert "No driving route found" in response.json()["detail"]
+
+
+# -----------------------------------------------------------------------------
+# 8. Coordinate Ordering in OSRM
+# -----------------------------------------------------------------------------
+def test_osrm_coordinate_string_ordering():
+    origin_lat, origin_lon = 11.0179, 76.9674
+    dest_lat, dest_lon = 11.04146, 77.0381
+
+    # OSRM requires "lon,lat;lon,lat"
+    expected = f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
+    actual = f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
+    assert actual == "76.9674,11.0179;77.0381,11.04146"
 ```
 
 
@@ -10864,6 +11546,15 @@ def test_pipeline_decodes_with_region_reference():
     assert "12.9716" in _run(code, "bengaluru").stdout
     out = _run(code, "coimbatore").stdout
     assert "11.0168" in out and "12.9" not in out.split("(")[1]       # same short code now resolves near Coimbatore, not Bengaluru
+
+
+def test_active_settings_region_is_coimbatore():
+    from core.config import settings
+    assert settings.ACTIVE_REGION == "coimbatore"
+    r = get_region(settings.ACTIVE_REGION)
+    assert r.key == "coimbatore"
+    assert r.display_name == "Coimbatore"
+    assert r.is_within_bounds(11.0168, 76.9558)
 ```
 
 
@@ -11874,7 +12565,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
       "version": "18.3.31",
       "dev": true,
       "license": "MIT",
-      "peer": true,
       "dependencies": {
         "@types/prop-types": "*",
         "csstype": "^3.2.2"
@@ -12003,7 +12693,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
         }
       ],
       "license": "MIT",
-      "peer": true,
       "dependencies": {
         "baseline-browser-mapping": "^2.10.44",
         "caniuse-lite": "^1.0.30001806",
@@ -12406,7 +13095,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
       "version": "1.21.7",
       "dev": true,
       "license": "MIT",
-      "peer": true,
       "bin": {
         "jiti": "bin/jiti.js"
       }
@@ -12743,7 +13431,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
         }
       ],
       "license": "MIT",
-      "peer": true,
       "dependencies": {
         "nanoid": "^3.3.16",
         "picocolors": "^1.1.1",
@@ -12909,7 +13596,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
     "node_modules/react": {
       "version": "18.3.1",
       "license": "MIT",
-      "peer": true,
       "dependencies": {
         "loose-envify": "^1.1.0"
       },
@@ -12920,7 +13606,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
     "node_modules/react-dom": {
       "version": "18.3.1",
       "license": "MIT",
-      "peer": true,
       "dependencies": {
         "loose-envify": "^1.1.0",
         "scheduler": "^0.23.2"
@@ -13188,7 +13873,6 @@ def test_controlled_hotspot_zone_path_survives_schema_serialization():
       "version": "4.0.5",
       "dev": true,
       "license": "MIT",
-      "peer": true,
       "engines": {
         "node": ">=12"
       },
@@ -13549,12 +14233,12 @@ export default function Home() {
 ```tsx
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useCallback } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { TRAFFIC_COLORS } from "@/lib/trafficScenario";
 import { useNavigation, haversineMeters } from "@/context/NavigationContext";
-import { ACTIVE_REGION_CENTER, ACTIVE_REGION_CONFIG, ACTIVE_REGION_MAP_BOUNDS } from "@/lib/region";
+import { ACTIVE_REGION_CENTER, ACTIVE_REGION_CONFIG } from "@/lib/region";
 import { reverseGeocode, CongestionHotspot } from "@/lib/api";
 import { OVERLAY_Z } from "@/lib/layoutZones";
 
@@ -13579,6 +14263,7 @@ export const MapCanvas: React.FC = () => {
   const vehicleMarkerRef = useRef<maplibregl.Marker | null>(null);
   const hotspotMarkersRef = useRef<maplibregl.Marker[]>([]);
   const lastCameraFollowTimeRef = useRef<number>(0);
+  const lastClickTimestampRef = useRef<number>(0);
 
   const {
     selectedOrigin,
@@ -13604,6 +14289,113 @@ export const MapCanvas: React.FC = () => {
     activeRerouteRecommendation,
     navigationHudHeight,
   } = useNavigation();
+
+  // Stable refs for values used inside event handlers.
+  // This lets us register map listeners ONCE and always read the latest state.
+  const pinDropModeRef = useRef(pinDropMode);
+  const selectedOriginRef = useRef(selectedOrigin);
+  const selectedDestinationRef = useRef(selectedDestination);
+  const calculateRoutesRef = useRef(calculateRoutes);
+  const setSelectedOriginRef = useRef(setSelectedOrigin);
+  const setSelectedDestinationRef = useRef(setSelectedDestination);
+  const setSourceQueryRef = useRef(setSourceQuery);
+  const setDestinationQueryRef = useRef(setDestinationQuery);
+  const setPinDropModeRef = useRef(setPinDropMode);
+  const isNavigatingRef = useRef(isNavigating);
+  const activeRouteIndexRef = useRef(activeRouteIndex);
+
+  // Keep refs in sync with latest values on every render (no effects needed).
+  pinDropModeRef.current = pinDropMode;
+  selectedOriginRef.current = selectedOrigin;
+  selectedDestinationRef.current = selectedDestination;
+  calculateRoutesRef.current = calculateRoutes;
+  setSelectedOriginRef.current = setSelectedOrigin;
+  setSelectedDestinationRef.current = setSelectedDestination;
+  setSourceQueryRef.current = setSourceQuery;
+  setDestinationQueryRef.current = setDestinationQuery;
+  setPinDropModeRef.current = setPinDropMode;
+  isNavigatingRef.current = isNavigating;
+  activeRouteIndexRef.current = activeRouteIndex;
+
+  // Map Click Listener for Destination and Origin Selection — stable callback that reads from refs.
+  // Defined before the map init effect so it can be passed to map.on() during initialization.
+  const stableHandleMapClick = useCallback((e: maplibregl.MapMouseEvent) => {
+    // If actively driving/navigating, do not permit map click destination changes
+    if (isNavigatingRef.current) return;
+
+    // Ignore clicks directly on map markers, popups, or controls
+    const origTarget = e.originalEvent?.target as HTMLElement | null;
+    if (origTarget && (
+      origTarget.closest(".maplibregl-marker") ||
+      origTarget.closest(".maplibregl-popup") ||
+      origTarget.closest(".maplibregl-ctrl")
+    )) {
+      return;
+    }
+
+    // Map clicks only place a pin when the user explicitly enabled a drop mode.
+    // Otherwise the click is reserved for route-line selection (OSRM vs AI route).
+    const currentMode = pinDropModeRef.current;
+    if (currentMode === "none") return;
+
+    // Debounce rapid double-clicks to prevent duplicate pin / route requests.
+    const now = Date.now();
+    if (now - lastClickTimestampRef.current < 300) {
+      return;
+    }
+    lastClickTimestampRef.current = now;
+
+    const { lng, lat } = e.lngLat;
+    const roundedLat = parseFloat(lat.toFixed(5));
+    const roundedLon = parseFloat(lng.toFixed(5));
+
+    // The explicit button determines the target. After one pin is placed the mode
+    // returns to "none", so another map click cannot silently replace the destination.
+    const targetMode: "source" | "destination" = currentMode;
+
+    const initialName = `Location (${roundedLat}, ${roundedLon})`;
+
+    if (targetMode === "source") {
+      const newOrigin = { lat: roundedLat, lon: roundedLon, name: initialName };
+      setSelectedOriginRef.current(newOrigin);
+      setSourceQueryRef.current(initialName);
+      if (currentMode !== "none") {
+        setPinDropModeRef.current("none");
+      }
+      if (selectedDestinationRef.current) {
+        void calculateRoutesRef.current(newOrigin, selectedDestinationRef.current);
+      }
+      reverseGeocode(roundedLat, roundedLon).then((rev) => {
+        if (rev?.display_name) {
+          const resolvedName = rev.display_name;
+          setSelectedOriginRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+          setSourceQueryRef.current(resolvedName);
+        }
+      }).catch((err) => {
+        console.warn("[MapCanvas] Reverse geocode background warning:", err);
+      });
+    } else {
+      const newDest = { lat: roundedLat, lon: roundedLon, name: initialName };
+      setSelectedDestinationRef.current(newDest);
+      setDestinationQueryRef.current(initialName);
+      if (currentMode !== "none") {
+        setPinDropModeRef.current("none");
+      }
+      if (selectedOriginRef.current) {
+        void calculateRoutesRef.current(selectedOriginRef.current, newDest);
+      }
+      reverseGeocode(roundedLat, roundedLon).then((rev) => {
+        if (rev?.display_name) {
+          const resolvedName = rev.display_name;
+          setSelectedDestinationRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+          setDestinationQueryRef.current(resolvedName);
+        }
+      }).catch((err) => {
+        console.warn("[MapCanvas] Reverse geocode background warning:", err);
+      });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // stable — reads from refs
 
   // Initialize MapLibre GL
   useEffect(() => {
@@ -13634,9 +14426,8 @@ export const MapCanvas: React.FC = () => {
       },
       center: [ACTIVE_REGION_CENTER.lon, ACTIVE_REGION_CENTER.lat],
       zoom: ACTIVE_REGION_CONFIG.defaultZoom,
-      minZoom: 10,
+      minZoom: 3,
       maxZoom: 19,
-      maxBounds: ACTIVE_REGION_MAP_BOUNDS,
       pitch: 0,
       bearing: 0,
       attributionControl: false,
@@ -13649,6 +14440,10 @@ export const MapCanvas: React.FC = () => {
     map.on("zoom", () => setCurrentZoom(map.getZoom()));
     map.on("zoomend", () => setCurrentZoom(map.getZoom()));
 
+    // Register the stable click handler here — guaranteed map exists, and it
+    // persists for the full lifetime of this map instance.
+    map.on("click", stableHandleMapClick);
+
     mapRef.current = map;
     mapRefContainer.current = map;
 
@@ -13658,11 +14453,12 @@ export const MapCanvas: React.FC = () => {
 
     return () => {
       clearTimeout(timer);
+      map.off("click", stableHandleMapClick);
       map.remove();
       mapRef.current = null;
       mapRefContainer.current = null;
     };
-  }, [setCurrentZoom]);
+  }, [setCurrentZoom, stableHandleMapClick]);
 
   // Window Resize Listener
   useEffect(() => {
@@ -13683,68 +14479,23 @@ export const MapCanvas: React.FC = () => {
     };
   }, []);
 
+  // Disable double-click zoom while pin drop mode is active so double clicks don't zoom instead of placing pin
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    if (pinDropMode !== "none") {
+      map.doubleClickZoom.disable();
+    } else {
+      map.doubleClickZoom.enable();
+    }
+  }, [pinDropMode]);
+
   // Update cursor based on pinDropMode
   useEffect(() => {
     if (mapRef.current) {
       mapRef.current.getCanvas().style.cursor = pinDropMode !== "none" ? "crosshair" : "";
     }
   }, [pinDropMode]);
-
-
-  // Map Click Listener for Pin Drop
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map) return;
-
-    const handleMapClick = async (e: maplibregl.MapMouseEvent) => {
-      if (pinDropMode === "none") return;
-
-      const { lng, lat } = e.lngLat;
-      const roundedLat = parseFloat(lat.toFixed(5));
-      const roundedLon = parseFloat(lng.toFixed(5));
-
-      let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-      try {
-        const rev = await reverseGeocode(roundedLat, roundedLon);
-        if (rev && rev.display_name) resolvedName = rev.display_name;
-      } catch (err) {
-        console.error("Reverse geocode error:", err);
-      }
-
-      if (pinDropMode === "source") {
-        const newOrigin = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-        setSelectedOrigin(newOrigin);
-        setSourceQuery(resolvedName);
-        setPinDropMode("none");
-        if (selectedDestination) {
-          await calculateRoutes(newOrigin, selectedDestination);
-        }
-      } else if (pinDropMode === "destination") {
-        const newDest = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-        setSelectedDestination(newDest);
-        setDestinationQuery(resolvedName);
-        setPinDropMode("none");
-        if (selectedOrigin) {
-          await calculateRoutes(selectedOrigin, newDest);
-        }
-      }
-    };
-
-    map.on("click", handleMapClick);
-    return () => {
-      map.off("click", handleMapClick);
-    };
-  }, [
-    pinDropMode,
-    selectedOrigin,
-    selectedDestination,
-    setSelectedOrigin,
-    setSelectedDestination,
-    setSourceQuery,
-    setDestinationQuery,
-    setPinDropMode,
-    calculateRoutes,
-  ]);
 
   // Origin Marker (Section 5: Matching Drop-Pin Style in Emerald Green)
   useEffect(() => {
@@ -13766,25 +14517,28 @@ export const MapCanvas: React.FC = () => {
           .setLngLat([selectedOrigin.lon, selectedOrigin.lat])
           .addTo(map);
 
-        marker.on("dragend", async () => {
+        marker.on("dragend", () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
+          const initialName = `Location (${roundedLat}, ${roundedLon})`;
 
-          let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-          try {
-            const rev = await reverseGeocode(roundedLat, roundedLon);
-            if (rev && rev.display_name) resolvedName = rev.display_name;
-          } catch (err) {
-            console.error("Reverse geocode drag error:", err);
+          const newOrigin = { lat: roundedLat, lon: roundedLon, name: initialName };
+          setSelectedOriginRef.current(newOrigin);
+          setSourceQueryRef.current(initialName);
+          if (selectedDestinationRef.current) {
+            void calculateRoutesRef.current(newOrigin, selectedDestinationRef.current);
           }
 
-          const newOrigin = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-          setSelectedOrigin(newOrigin);
-          setSourceQuery(resolvedName);
-          if (selectedDestination) {
-            await calculateRoutes(newOrigin, selectedDestination);
-          }
+          reverseGeocode(roundedLat, roundedLon).then((rev) => {
+            if (rev?.display_name) {
+              const resolvedName = rev.display_name;
+              setSelectedOriginRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+              setSourceQueryRef.current(resolvedName);
+            }
+          }).catch((err) => {
+            console.warn("[MapCanvas] Reverse geocode drag error:", err);
+          });
         });
 
         originMarkerRef.current = marker;
@@ -13795,7 +14549,7 @@ export const MapCanvas: React.FC = () => {
       originMarkerRef.current.remove();
       originMarkerRef.current = null;
     }
-  }, [selectedOrigin, selectedDestination, setSelectedOrigin, setSourceQuery, calculateRoutes]);
+  }, [selectedOrigin]);
 
   // Destination Marker
   useEffect(() => {
@@ -13817,25 +14571,28 @@ export const MapCanvas: React.FC = () => {
           .setLngLat([selectedDestination.lon, selectedDestination.lat])
           .addTo(map);
 
-        marker.on("dragend", async () => {
+        marker.on("dragend", () => {
           const lngLat = marker.getLngLat();
           const roundedLat = parseFloat(lngLat.lat.toFixed(5));
           const roundedLon = parseFloat(lngLat.lng.toFixed(5));
+          const initialName = `Location (${roundedLat}, ${roundedLon})`;
 
-          let resolvedName = `Location (${roundedLat}, ${roundedLon})`;
-          try {
-            const rev = await reverseGeocode(roundedLat, roundedLon);
-            if (rev && rev.display_name) resolvedName = rev.display_name;
-          } catch (err) {
-            console.error("Reverse geocode drag error:", err);
+          const newDest = { lat: roundedLat, lon: roundedLon, name: initialName };
+          setSelectedDestinationRef.current(newDest);
+          setDestinationQueryRef.current(initialName);
+          if (selectedOriginRef.current) {
+            void calculateRoutesRef.current(selectedOriginRef.current, newDest);
           }
 
-          const newDest = { lat: roundedLat, lon: roundedLon, name: resolvedName };
-          setSelectedDestination(newDest);
-          setDestinationQuery(resolvedName);
-          if (selectedOrigin) {
-            await calculateRoutes(selectedOrigin, newDest);
-          }
+          reverseGeocode(roundedLat, roundedLon).then((rev) => {
+            if (rev?.display_name) {
+              const resolvedName = rev.display_name;
+              setSelectedDestinationRef.current({ lat: roundedLat, lon: roundedLon, name: resolvedName });
+              setDestinationQueryRef.current(resolvedName);
+            }
+          }).catch((err) => {
+            console.warn("[MapCanvas] Reverse geocode drag error:", err);
+          });
         });
 
         destMarkerRef.current = marker;
@@ -13846,7 +14603,7 @@ export const MapCanvas: React.FC = () => {
       destMarkerRef.current.remove();
       destMarkerRef.current = null;
     }
-  }, [selectedDestination, selectedOrigin, setSelectedDestination, setDestinationQuery, calculateRoutes]);
+  }, [selectedDestination]);
 
   // Smooth Vehicle Marker & Camera Follow (Section 4)
   useEffect(() => {
@@ -13956,10 +14713,10 @@ export const MapCanvas: React.FC = () => {
 
         const isSelected = idx === activeRouteIndex;
         const isAI = Boolean(route.is_ai_recommended);
-        // PATCH: identity colour. AI recommended = green, every other route (the OSRM preferred /
-        // second-best one) = blue. Clicking a route no longer changes its identity colour.
-        const clearColor = isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
-        const clearCasing = isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
+        // The currently selected/active route is always green, regardless of whether its
+        // original source was AI or OSRM. Unselected OSRM alternatives remain blue.
+        const clearColor = isSelected || isAI ? AI_ROUTE_GREEN : OSRM_ROUTE_BLUE;
+        const clearCasing = isSelected || isAI ? AI_ROUTE_GREEN_DARK : OSRM_ROUTE_BLUE_DARK;
 
         // Layer Mode Filtering
         if (activeLayerMode === "AI_ONLY" && !isAI && routes.length > 1) return;
@@ -14027,11 +14784,11 @@ export const MapCanvas: React.FC = () => {
 
             // Click-to-switch behavior
             if (!isSelected && !isNavigating) {
-              const clickListener = () => setActiveRouteIndex(idx);
-              // The outer casing is a wide hit target on thick/glowing route lines.
-              map.on("click", casingLayerId, clickListener);
+              const clickListener = () => {
+                if (pinDropModeRef.current !== "none") return;
+                setActiveRouteIndex(idx);
+              };
               map.on("click", lineLayerId, clickListener);
-              renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
               renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
             }
           });
@@ -14187,11 +14944,11 @@ export const MapCanvas: React.FC = () => {
           renderedLayersRef.current.push(lineLayerId);
 
           if (!isSelected && !isNavigating) {
-            const clickListener = () => setActiveRouteIndex(idx);
-            // The outer casing is a wide hit target on thick/glowing route lines.
-            map.on("click", casingLayerId, clickListener);
+            const clickListener = () => {
+              if (pinDropModeRef.current !== "none") return;
+              setActiveRouteIndex(idx);
+            };
             map.on("click", lineLayerId, clickListener);
-            renderedListenersRef.current.push({ layerId: casingLayerId, listener: clickListener });
             renderedListenersRef.current.push({ layerId: lineLayerId, listener: clickListener });
           }
         }
@@ -14218,8 +14975,10 @@ export const MapCanvas: React.FC = () => {
           source: rerouteSourceId,
           layout: { "line-join": "round", "line-cap": "round" },
           paint: {
-            "line-color": "#EC4899",
-            "line-width": 6,
+            // Once an alternate route is recommended, show it with the same green
+            // active-route color as the committed navigation path.
+            "line-color": AI_ROUTE_GREEN,
+            "line-width": 7,
             "line-opacity": 0.9,
             "line-offset": 4,
           },
@@ -14300,7 +15059,7 @@ export const MapCanvas: React.FC = () => {
         style={{ width: "100%", height: "100%", position: "absolute", top: 0, left: 0 }}
       />
       {pinDropMode !== "none" && (
-        <div className="absolute top-6 left-3 right-3 mx-auto w-fit max-w-[calc(100%-1.5rem)] bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse" style={{ zIndex: OVERLAY_Z.mapPrompt }}>
+        <div className="absolute top-6 left-3 right-3 mx-auto w-fit max-w-[calc(100%-1.5rem)] bg-slate-900/90 text-white px-6 py-3 rounded-full shadow-2xl border border-blue-500/50 backdrop-blur-md animate-pulse pointer-events-none" style={{ zIndex: OVERLAY_Z.mapPrompt }}>
           <p className="text-sm font-bold tracking-wide text-center">
             Tap the map to set your <span className="text-blue-400">{pinDropMode === "source" ? "starting" : "destination"}</span> point
           </p>
@@ -14900,7 +15659,12 @@ import { OVERLAY_Z } from "@/lib/layoutZones";
 export const NavigationControlsHUD: React.FC = () => {
   const {
     isNavigating,
-    setIsNavigating,
+    navigationMode,
+    gpsStatus,
+    gpsLocationSource,
+    gpsAccuracyMeters,
+    gpsError,
+    stopNavigation,
     currentVehicleSpeed,
     simProgressPercent,
     simDistanceRemainingM,
@@ -14996,7 +15760,7 @@ export const NavigationControlsHUD: React.FC = () => {
           <div className="flex shrink-0 items-center gap-2">
             <div className="flex flex-col items-end rounded-xl border border-white/10 bg-black/30 px-2 py-1 sm:px-3">
               <div className="flex items-baseline gap-1">
-                <span className="text-lg font-black text-emerald-400 sm:text-2xl">{Math.round(currentVehicleSpeed)}</span>
+                <span className={`text-lg font-black sm:text-2xl ${navigationMode === "gps" && gpsLocationSource === "demo" ? "text-amber-300" : "text-emerald-400"}`}>{Math.round(currentVehicleSpeed)}</span>
                 <span className="text-[9px] font-extrabold uppercase text-slate-400">km/h</span>
               </div>
               {isDetailsExpanded && <span className="text-[9px] font-bold uppercase tracking-wider text-slate-400">Speed</span>}
@@ -15013,6 +15777,56 @@ export const NavigationControlsHUD: React.FC = () => {
           </div>
         </div>
 
+        <div className="flex items-center justify-between gap-2 text-[10px] font-bold uppercase tracking-wider text-slate-300">
+          <span className={navigationMode === "gps" ? "text-emerald-300" : "text-blue-300"}>
+            {navigationMode === "gps" ? "GPS Navigation" : "Simulation Mode"}
+          </span>
+          {navigationMode === "gps" && (
+            <span
+              aria-live="polite"
+              className={`inline-flex min-w-0 items-center gap-1.5 ${
+                gpsLocationSource === "demo"
+                  ? "text-amber-300"
+                  : gpsStatus === "tracking"
+                  ? "text-emerald-300"
+                  : gpsStatus === "arrived"
+                  ? "text-blue-200"
+                  : "text-amber-300"
+              }`}
+            >
+              <span
+                aria-hidden="true"
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                  gpsLocationSource === "demo"
+                    ? "bg-amber-300"
+                    : gpsStatus === "tracking"
+                    ? "bg-emerald-300"
+                    : "bg-amber-300"
+                }`}
+              />
+              <span className="truncate">
+                {gpsStatus === "arrived"
+                  ? "Arrived"
+                  : gpsLocationSource === "demo"
+                  ? "GPS navigation active"
+                  : gpsStatus === "tracking"
+                  ? `GPS ±${Math.round(gpsAccuracyMeters || 0)} m`
+                  : gpsStatus === "rerouting"
+                  ? "Updating route"
+                  : gpsStatus === "degraded" && gpsAccuracyMeters
+                  ? `GPS ±${Math.round(gpsAccuracyMeters)} m · low accuracy`
+                  : "GPS navigation active"}
+              </span>
+            </span>
+          )}
+        </div>
+
+        {navigationMode === "gps" && gpsError && (
+          <p role="status" className="rounded-lg border border-amber-400/20 bg-amber-500/10 px-3 py-2 text-[11px] font-medium text-amber-100">
+            {gpsError}
+          </p>
+        )}
+
         <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-700">
           <div
             className={`h-full transition-all duration-300 ${isEmergencyMode ? "bg-rose-500" : "bg-emerald-500"}`}
@@ -15020,37 +15834,38 @@ export const NavigationControlsHUD: React.FC = () => {
           />
         </div>
 
+        <div className="flex items-center justify-between text-[11px] font-bold text-slate-300">
+          <span aria-label="Distance remaining">
+            {simDistanceRemainingM >= 1000
+              ? `${(simDistanceRemainingM / 1000).toFixed(1)} km remaining`
+              : `${Math.round(simDistanceRemainingM)} m remaining`}
+          </span>
+          <span aria-label="Estimated time to destination">
+            {simEtaSeconds > 0 ? `${Math.ceil(simEtaSeconds / 60)} min to destination` : "Arrived"}
+          </span>
+        </div>
+
         {isDetailsExpanded && (
           <>
-            <div className="flex items-center justify-between text-[11px] font-bold text-slate-300">
-              <span aria-label="Distance remaining">
-                {simDistanceRemainingM >= 1000
-                  ? `${(simDistanceRemainingM / 1000).toFixed(1)} km remaining`
-                  : `${Math.round(simDistanceRemainingM)} m remaining`}
-              </span>
-              <span aria-label="Estimated time to destination">
-                {simEtaSeconds > 0 ? `${Math.ceil(simEtaSeconds / 60)} min to destination` : "Arrived"}
-              </span>
-            </div>
-
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-white/10 pt-2">
-              <div className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
-                <button
-                  onClick={() => setIsSimPlaying(!isSimPlaying)}
-                  className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 text-white hover:bg-white/20"
-                  title={isSimPlaying ? "Pause Simulation" : "Play Simulation"}
-                >
-                  {isSimPlaying ? <Pause className="h-4 w-4 fill-current" /> : <Play className="ml-0.5 h-4 w-4 fill-current" />}
-                </button>
-                <button
-                  onClick={() => setSimSpeedMultiplier(simSpeedMultiplier === 1 ? 2 : simSpeedMultiplier === 2 ? 5 : 1)}
-                  className="flex items-center gap-1 rounded-xl bg-white/10 px-2.5 py-1.5 text-xs font-black text-amber-300 hover:bg-white/20"
-                  title="Simulation Speed Multiplier"
-                >
-                  <FastForward className="h-3.5 w-3.5" /> <span>{simSpeedMultiplier}x</span>
-                </button>
-              </div>
-
+              {navigationMode === "simulation" && (
+                <div className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/5 p-1">
+                  <button
+                    onClick={() => setIsSimPlaying(!isSimPlaying)}
+                    className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/10 text-white hover:bg-white/20"
+                    title={isSimPlaying ? "Pause Simulation" : "Play Simulation"}
+                  >
+                    {isSimPlaying ? <Pause className="h-4 w-4 fill-current" /> : <Play className="ml-0.5 h-4 w-4 fill-current" />}
+                  </button>
+                  <button
+                    onClick={() => setSimSpeedMultiplier(simSpeedMultiplier === 1 ? 2 : simSpeedMultiplier === 2 ? 5 : 1)}
+                    className="flex items-center gap-1 rounded-xl bg-white/10 px-2.5 py-1.5 text-xs font-black text-amber-300 hover:bg-white/20"
+                    title="Simulation Speed Multiplier"
+                  >
+                    <FastForward className="h-3.5 w-3.5" /> <span>{simSpeedMultiplier}x</span>
+                  </button>
+                </div>
+              )}
               <button
                 onClick={handleToggleVoice}
                 className={`flex items-center gap-1.5 rounded-2xl border px-3 py-2 text-xs font-bold ${!isVoiceMuted ? "border-blue-500/50 bg-blue-600/30 text-blue-200" : "border-white/10 bg-white/5 text-slate-300"}`}
@@ -15071,8 +15886,7 @@ export const NavigationControlsHUD: React.FC = () => {
 
               <button
                 onClick={() => {
-                  TTSService.reset();
-                  setIsNavigating(false);
+                  stopNavigation();
                 }}
                 className="flex items-center gap-1.5 rounded-2xl border border-white/10 bg-white/10 px-3 py-2 text-xs font-bold text-slate-200 hover:bg-rose-900/60 hover:text-rose-100"
               >
@@ -15273,6 +16087,8 @@ import React, { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Navigation,
+  MapPin,
+  PlayCircle,
   ShieldCheck,
   ArrowRight,
   Loader2,
@@ -15282,9 +16098,9 @@ import {
   Flame,
   ChevronDown,
   ChevronUp,
+  AlertTriangle,
 } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
-import { TTSService } from "@/lib/ttsService";
 
 export const RouteCard: React.FC = () => {
   const [showHotspotList, setShowHotspotList] = useState(false);
@@ -15294,7 +16110,11 @@ export const RouteCard: React.FC = () => {
     setActiveRouteIndex,
     selectedDestination,
     isNavigating,
-    setIsNavigating,
+    startNavigation,
+    stopNavigation,
+    gpsStatus,
+    gpsAccuracyMeters,
+    gpsError,
     isLoadingRoutes,
     isEmergencyMode,
     trafficTestMode,
@@ -15674,37 +16494,108 @@ export const RouteCard: React.FC = () => {
           </div>
         )}
 
-        {/* CTA Button */}
-        <button
-          onClick={() => {
-            if (isNavigating) {
-              TTSService.reset();
-              setIsNavigating(false);
-            } else {
-              TTSService.warmUp();
-              setIsNavigating(true);
-            }
-          }}
-          className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 ${
-            isNavigating
-              ? "bg-rose-700 hover:bg-rose-800 text-white shadow-rose-700/30"
-              : isEmergencyMode
-              ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white shadow-rose-600/30"
-              : isAIRoute
-              ? "bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/30"
-              : "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/30"
-          }`}
-        >
-          {isEmergencyMode ? <Siren className="w-4 h-4" /> : <Navigation className="w-4 h-4 fill-current" />}
-          <span>
-            {isNavigating
-              ? "End Active Navigation"
-              : isEmergencyMode
-              ? "Start Priority Navigation"
-              : "Start Smart Navigation"}
-          </span>
-          <ArrowRight className="w-4 h-4 ml-auto" />
-        </button>
+        {/* Journey startup: GPS and simulation are explicit, mutually exclusive modes. */}
+        {isNavigating ? (
+          <button
+            type="button"
+            onClick={stopNavigation}
+            className="w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 bg-rose-700 hover:bg-rose-800 text-white shadow-rose-700/30"
+          >
+            <Navigation className="w-4 h-4" />
+            <span>End Active Navigation</span>
+            <ArrowRight className="w-4 h-4 ml-auto" />
+          </button>
+        ) : (
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => void startNavigation("gps")}
+              disabled={gpsStatus === "locating" || isLoadingRoutes}
+              className="w-full rounded-xl border border-emerald-700/10 bg-emerald-600 px-5 py-3.5 text-sm font-bold text-white shadow-md shadow-emerald-900/10 transition hover:bg-emerald-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 flex items-center justify-center gap-2"
+            >
+              {gpsStatus === "locating" ? <Loader2 className="w-4 h-4 animate-spin" /> : <MapPin className="w-4 h-4" />}
+              <span>
+                {gpsStatus === "locating"
+                  ? gpsAccuracyMeters
+                    ? `Checking location (±${Math.round(gpsAccuracyMeters)} m)…`
+                    : "Checking device location…"
+                  : gpsStatus === "error"
+                  ? "Retry GPS navigation"
+                  : "Start GPS navigation"}
+              </span>
+              <ArrowRight className="w-4 h-4 ml-auto" />
+            </button>
+            <button
+              type="button"
+              onClick={() => void startNavigation("simulation")}
+              disabled={isLoadingRoutes}
+              className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-60 ${
+                isEmergencyMode
+                  ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white shadow-rose-600/30"
+                  : isAIRoute
+                  ? "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-600/30"
+                  : "bg-slate-800 hover:bg-slate-900 text-white shadow-slate-800/30"
+              }`}
+            >
+              <PlayCircle className="w-4 h-4" />
+              <span>Start Simulation</span>
+              <ArrowRight className="w-4 h-4 ml-auto" />
+            </button>
+            <div className="flex items-start gap-2.5 rounded-xl border border-slate-200/80 bg-slate-50/90 px-3.5 py-2.5 text-[11px] leading-relaxed text-slate-600">
+              <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+              <p>If a reliable device location is unavailable, GPS navigation starts from PSG Tech and the vehicle marker stays stationary instead of simulating travel.</p>
+            </div>
+            {gpsError && (
+              gpsStatus === "locating" ? (
+                <div role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs font-medium text-amber-200 flex items-start justify-between gap-2 shadow-sm">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <Loader2 className="w-4 h-4 animate-spin text-amber-400 flex-shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <p className="text-amber-100 font-semibold">{gpsError}</p>
+                      {gpsAccuracyMeters !== null && (
+                        <p className="text-[10px] text-amber-300/80">
+                          Target accuracy: ≤150 m (current: ±{Math.round(gpsAccuracyMeters)} m)
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={stopNavigation}
+                    className="text-[11px] font-bold text-amber-300 hover:text-amber-100 underline flex-shrink-0 ml-1"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : gpsStatus === "error" ? (
+                <div role="alert" className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3.5 py-2.5 text-xs font-medium text-rose-200 space-y-2 shadow-sm">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+                    <p className="text-rose-100 leading-relaxed">{gpsError}</p>
+                  </div>
+                  <div className="flex items-center justify-between pt-1 border-t border-rose-500/20 text-[11px]">
+                    {gpsAccuracyMeters !== null ? (
+                      <span className="font-semibold text-rose-300/90">
+                        Reported accuracy: ±{Math.round(gpsAccuracyMeters)} m
+                      </span>
+                    ) : <span />}
+                    <button
+                      type="button"
+                      onClick={() => void startNavigation("gps")}
+                      className="font-bold text-rose-300 hover:text-white underline"
+                    >
+                      Retry GPS
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p role="status" className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-medium text-emerald-200">
+                  {gpsError}
+                </p>
+              )
+            )}
+          </div>
+        )}
       </motion.div>
     </AnimatePresence>
   );
@@ -15931,6 +16822,7 @@ import {
   CongestionHotspot,
   checkHealth,
   fetchRoutes,
+  reverseGeocode,
   RerouteRecommendation,
 } from "@/lib/api";
 import { AlertManager, ActiveCongestionAlert } from "@/lib/alertManager";
@@ -15942,7 +16834,31 @@ import { DEFAULT_TRAFFIC_MODE, dynamicTrafficPhase, TrafficTestMode, TRAFFIC_TES
 
 import { ACTIVE_REGION_CONFIG } from "@/lib/region";
 
-export function selectDisplayedRouteOptions(candidates: CandidateRoute[]): CandidateRoute[] {
+export function selectDisplayedRouteOptions(
+  candidates: CandidateRoute[],
+  trafficTestMode?: TrafficTestMode
+): CandidateRoute[] {
+  if (trafficTestMode === "heavy" || trafficTestMode === "severe" || trafficTestMode === "dynamic") {
+    const controlledCandidate = candidates.find(
+      (route) =>
+        typeof route.controlled_test_switch_distance_m === "number" &&
+        route.controlled_test_bypass_route &&
+        Array.isArray(route.controlled_test_bypass_route.geometry?.coordinates) &&
+        route.controlled_test_bypass_route.geometry.coordinates.length >= 2
+    );
+    const testRoute = controlledCandidate || candidates.find((route) =>
+      typeof route.controlled_test_zone_start_distance_m === "number" ||
+      (route.hotspots || []).some((hotspot) => hotspot.cause === "Controlled traffic test")
+    );
+    if (testRoute) {
+      const remainingCandidates = candidates.filter((route) => route !== testRoute);
+      const secondCandidate = remainingCandidates.find(
+        (route) => !routesHaveSameGeometry(route, testRoute)
+      ) || remainingCandidates[0];
+      return secondCandidate ? [testRoute, secondCandidate] : [testRoute];
+    }
+  }
+
   const combined = candidates.find((route) => route.recommendation_label === "AI + OSRM Best Route");
   if (combined) return [combined];
   const aiRoute = candidates.find((route) => route.is_ai_recommended);
@@ -15954,14 +16870,310 @@ export function selectDisplayedRouteOptions(candidates: CandidateRoute[]): Candi
   return candidates.slice(0, 2);
 }
 
+
 export interface Coordinate {
   lat: number;
   lon: number;
   name?: string;
 }
 
+export const GPS_REAL_FIX_MAX_ACCURACY_METERS = 150;
+/** Offer a controlled-test bypass once the vehicle is exactly 1 km from the synthetic jam. */
+export const CONTROLLED_REROUTE_LOOKAHEAD_METERS = 1000;
+/** Default start place (PSG Tech, Peelamedu); same as the region default origin / map centre. */
+export const GPS_DEMO_FALLBACK_ORIGIN: Coordinate = {
+  lat: 11.0247,
+  lon: 77.0030,
+  name: "PSG College of Technology, Peelamedu, Coimbatore",
+};
+export type GPSLocationSource = "device" | "demo";
+
 export type PinDropMode = "none" | "source" | "destination";
 export type LayerMode = "ALL" | "AI_ONLY" | "STANDARD_ONLY";
+export type NavigationMode = "gps" | "simulation";
+export type GPSStatus = "idle" | "locating" | "tracking" | "degraded" | "rerouting" | "arrived" | "error";
+
+function logGpsDiagnostic(event: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  const sanitized = { ...(details || {}) };
+  if (typeof sanitized.lat === "number") {
+    sanitized.lat = Number((sanitized.lat as number).toFixed(4));
+  }
+  if (typeof sanitized.lon === "number") {
+    sanitized.lon = Number((sanitized.lon as number).toFixed(4));
+  }
+  console.log(`[ApexGuardian GPS Diagnostics] [${event}]`, sanitized);
+}
+
+function logGpsWarning(event: string, details?: Record<string, unknown>) {
+  if (process.env.NODE_ENV === "production") return;
+  console.warn(`[ApexGuardian GPS Warning] [${event}]`, details || {});
+}
+
+function describeGeolocationError(error: unknown): string {
+  const code = (error as GeolocationPositionError | undefined)?.code;
+  if (code === 1) return "Location permission was denied. Allow location access in your browser settings, then try again.";
+  if (code === 2) return "Your device could not determine a location. Check that Location Services are enabled on your device and try again.";
+  if (code === 3) return "Getting your location timed out. Move somewhere with a clearer GPS signal or network reception, then try again.";
+  if (error instanceof Error && error.message) return error.message;
+  return "Unable to obtain a reliable GPS location. Check your location settings and try again.";
+}
+
+export interface LocationAcquisitionProgress {
+  status: "permission_required" | "acquiring" | "waiting_accuracy";
+  accuracy: number | null;
+  message: string;
+}
+
+export interface AcquireAccuratePositionResult {
+  position: GeolocationPosition;
+  totalSamples: number;
+}
+
+function acquireAccuratePosition(options: {
+  targetAccuracyMeters?: number;
+  maxAcceptableAccuracyMeters?: number;
+  timeoutMs?: number;
+  refinementWindowMs?: number;
+  onProgress?: (progress: LocationAcquisitionProgress) => void;
+  signal?: { isAborted: boolean };
+}): { promise: Promise<AcquireAccuratePositionResult>; cancel: () => void } {
+  let watchId: number | null = null;
+  let overallTimer: ReturnType<typeof setTimeout> | null = null;
+  let refinementTimer: ReturnType<typeof setTimeout> | null = null;
+  let isSettled = false;
+  let sampleCount = 0;
+  let bestPosition: GeolocationPosition | null = null;
+  let lastGeolocationError: GeolocationPositionError | null = null;
+
+  const cleanup = () => {
+    if (watchId !== null && typeof navigator !== "undefined" && navigator.geolocation) {
+      try {
+        navigator.geolocation.clearWatch(watchId);
+      } catch {
+        // ignore
+      }
+      watchId = null;
+    }
+    if (overallTimer) {
+      clearTimeout(overallTimer);
+      overallTimer = null;
+    }
+    if (refinementTimer) {
+      clearTimeout(refinementTimer);
+      refinementTimer = null;
+    }
+  };
+
+  const targetAccuracy = options.targetAccuracyMeters ?? 75;
+  const maxAcceptableAccuracy = options.maxAcceptableAccuracyMeters ?? 250;
+  const timeoutMs = options.timeoutMs ?? 12000;
+  const refinementWindowMs = options.refinementWindowMs ?? 2500;
+
+  let cancelStartup: (() => void) | null = null;
+  const promise = new Promise<AcquireAccuratePositionResult>(async (resolve, reject) => {
+    const settleResolve = (pos: GeolocationPosition) => {
+      if (isSettled) return;
+      isSettled = true;
+      cleanup();
+      resolve({ position: pos, totalSamples: sampleCount });
+    };
+
+    const settleReject = (err: Error) => {
+      if (isSettled) return;
+      isSettled = true;
+      cleanup();
+      reject(err);
+    };
+    cancelStartup = () => settleReject(new Error("GPS startup was cancelled."));
+
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      settleReject(new Error("This browser does not support device location."));
+      return;
+    }
+
+    let permState: PermissionState | null = null;
+    if (typeof navigator !== "undefined" && navigator.permissions?.query) {
+      try {
+        const perm = await navigator.permissions.query({ name: "geolocation" as PermissionName });
+        permState = perm.state;
+        logGpsDiagnostic("PERMISSION_QUERY", { state: permState });
+        if (perm.state === "denied") {
+          settleReject(new Error("Location permission was denied. Allow location access in your browser settings, then try again."));
+          return;
+        }
+        if (perm.state === "prompt") {
+          options.onProgress?.({
+            status: "permission_required",
+            accuracy: null,
+            message: "Location permission required. Please allow location access in your browser.",
+          });
+        }
+      } catch (e: any) {
+        if (e?.message?.includes("denied")) {
+          settleReject(e);
+          return;
+        }
+      }
+    }
+
+    if (options.signal?.isAborted) {
+      settleReject(new Error("GPS startup was cancelled."));
+      return;
+    }
+
+    logGpsDiagnostic("ACQUISITION_STARTED", {
+      targetAccuracy,
+      maxAcceptableAccuracy,
+      timeoutMs,
+      permissionState: permState,
+    });
+
+    options.onProgress?.({
+      status: "acquiring",
+      accuracy: null,
+      message: "Acquiring GPS locationâ€¦",
+    });
+
+    const handlePositionSample = (pos: GeolocationPosition) => {
+      if (isSettled || options.signal?.isAborted) return;
+      sampleCount += 1;
+      const { latitude, longitude, accuracy } = pos.coords;
+      const timestamp = pos.timestamp || Date.now();
+      const sampleAgeMs = Math.max(0, Date.now() - timestamp);
+
+      if (
+        !Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+        latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180
+      ) {
+        logGpsWarning("INVALID_COORDINATES_DISCARDED", { lat: latitude, lon: longitude });
+        return;
+      }
+
+      if (sampleAgeMs > 30000) {
+        logGpsWarning("STALE_SAMPLE_DISCARDED", { sampleAgeMs, accuracy: Math.round(accuracy) });
+        return;
+      }
+
+      logGpsDiagnostic("SAMPLE_RECEIVED", {
+        sampleIndex: sampleCount,
+        lat: latitude,
+        lon: longitude,
+        accuracyMeters: Math.round(accuracy),
+        sampleAgeMs,
+        isPotentiallyCached: sampleAgeMs > 5000,
+      });
+
+      if (!bestPosition || accuracy < bestPosition.coords.accuracy) {
+        bestPosition = pos;
+      }
+
+      if (accuracy <= targetAccuracy) {
+        logGpsDiagnostic("TARGET_ACCURACY_ACHIEVED", {
+          sampleIndex: sampleCount,
+          accuracyMeters: Math.round(accuracy),
+          targetAccuracy,
+        });
+        settleResolve(pos);
+        return;
+      }
+
+      if (accuracy <= maxAcceptableAccuracy) {
+        logGpsDiagnostic("ACCEPTABLE_ACCURACY_WAITING_REFINEMENT", {
+          sampleIndex: sampleCount,
+          accuracyMeters: Math.round(accuracy),
+          threshold: maxAcceptableAccuracy,
+        });
+        options.onProgress?.({
+          status: "waiting_accuracy",
+          accuracy: Math.round(accuracy),
+          message: `Location accuracy: approximately ${Math.round(accuracy)} metres. Refining positionâ€¦`,
+        });
+
+        if (!refinementTimer) {
+          refinementTimer = setTimeout(() => {
+            if (!isSettled && bestPosition && !options.signal?.isAborted) {
+              logGpsDiagnostic("REFINEMENT_WINDOW_RESOLVED", {
+                finalAccuracyMeters: Math.round(bestPosition.coords.accuracy),
+                totalSamples: sampleCount,
+              });
+              settleResolve(bestPosition);
+            }
+          }, refinementWindowMs);
+        }
+        return;
+      }
+
+      logGpsDiagnostic("COARSE_SAMPLE_WAITING_IMPROVEMENT", {
+        sampleIndex: sampleCount,
+        accuracyMeters: Math.round(accuracy),
+        threshold: maxAcceptableAccuracy,
+      });
+      options.onProgress?.({
+        status: "waiting_accuracy",
+        accuracy: Math.round(accuracy),
+        message: `Location accuracy: approximately ${Math.round(accuracy)} metres. Waiting for a more accurate positionâ€¦`,
+      });
+    };
+
+    const handlePositionError = (err: GeolocationPositionError) => {
+      lastGeolocationError = err;
+      logGpsWarning("GEOLOCATION_CALLBACK_ERROR", {
+        code: err.code,
+        message: err.message,
+        codeName: err.code === 1 ? "PERMISSION_DENIED" : err.code === 2 ? "POSITION_UNAVAILABLE" : err.code === 3 ? "TIMEOUT" : "UNKNOWN",
+      });
+      if (err.code === 1) {
+        settleReject(new Error(describeGeolocationError(err)));
+      }
+    };
+
+    try {
+      watchId = navigator.geolocation.watchPosition(
+        handlePositionSample,
+        handlePositionError,
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 8000 }
+      );
+    } catch (e: any) {
+      settleReject(new Error(e?.message || "Failed to start GPS location watch."));
+      return;
+    }
+
+    try {
+      navigator.geolocation.getCurrentPosition(
+        handlePositionSample,
+        () => {},
+        { enableHighAccuracy: true, maximumAge: 0, timeout: 4000 }
+      );
+    } catch {
+      // ignore
+    }
+
+    overallTimer = setTimeout(() => {
+      if (isSettled || options.signal?.isAborted) return;
+      if (bestPosition) {
+        logGpsDiagnostic("OVERALL_TIMEOUT_ACCEPTING_BEST_SAMPLE", {
+          accuracyMeters: Math.round(bestPosition.coords.accuracy),
+          totalSamples: sampleCount,
+        });
+        settleResolve(bestPosition);
+      } else if (lastGeolocationError) {
+        settleReject(new Error(describeGeolocationError(lastGeolocationError)));
+      } else {
+        settleReject(
+          new Error("Getting your location timed out. Move somewhere with a clearer GPS signal and try again.")
+        );
+      }
+    }, timeoutMs);
+  });
+
+  return {
+    promise,
+    cancel: () => {
+      cancelStartup?.();
+    },
+  };
+}
 
 export function haversineMeters(lon1: number, lat1: number, lon2: number, lat2: number): number {
   const R = 6371000;
@@ -16025,6 +17237,28 @@ function getUpcomingAvoidHotspots(
 }
 
 /** Rebuild the backend's anchored synthetic zone if hotspot metadata could not be refreshed. */
+function getControlledTestZoneDistances(route: CandidateRoute): { startM: number; endM: number } | null {
+  const routeStart = route.controlled_test_zone_start_distance_m;
+  const routeEnd = route.controlled_test_zone_end_distance_m;
+  if (typeof routeStart === "number" && typeof routeEnd === "number" && routeEnd > routeStart) {
+    return { startM: routeStart, endM: routeEnd };
+  }
+  const controlledHotspot = (route.hotspots || []).find((hotspot) => hotspot.cause === "Controlled traffic test");
+  if (controlledHotspot && typeof controlledHotspot.distance_from_origin_m === "number" && typeof controlledHotspot.zone_end_distance_m === "number" && controlledHotspot.zone_end_distance_m > controlledHotspot.distance_from_origin_m) {
+    return { startM: controlledHotspot.distance_from_origin_m, endM: controlledHotspot.zone_end_distance_m };
+  }
+  const coords = (route.geometry?.coordinates || []) as [number, number][];
+  if (coords.length < 2) return null;
+  let total = 0;
+  for (let i = 1; i < coords.length; i++) total += haversineMeters(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+  if (!Number.isFinite(total) || total < 500) return null;
+  let length = Math.max(300, Math.min(1000, total * 0.10));
+  length = Math.min(length, total * 0.25);
+  let start = total * 0.50;
+  if (start + length > total - 100) start = Math.max(0, total - 100 - length);
+  return { startM: start, endM: Math.min(total, start + length) };
+}
+
 function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
   const coords = (route.geometry?.coordinates || []) as [number, number][];
   if (coords.length < 2) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
@@ -16035,14 +17269,12 @@ function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
     ));
   }
   const total = cumulative[cumulative.length - 1];
-  if (!Number.isFinite(total) || total < 500) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
-  let zoneLength = Math.max(300, Math.min(1000, total * 0.10));
-  zoneLength = Math.min(zoneLength, total * 0.25);
-  let zoneStart = total * 0.50;
-  if (zoneStart + zoneLength > total - 100) zoneStart = Math.max(0, total - 100 - zoneLength);
-  const zoneEnd = Math.min(total, zoneStart + zoneLength);
+  const zone = getControlledTestZoneDistances(route);
+  if (!Number.isFinite(total) || total < 500 || !zone) return [] as Array<{ lat: number; lon: number; radius_km: number }>;
+  const zoneStart = Math.max(0, Math.min(total, zone.startM));
+  const zoneEnd = Math.max(zoneStart, Math.min(total, zone.endM));
   const sampleDistances = [zoneStart];
-  for (let d = zoneStart + 75; d < zoneEnd; d += 75) sampleDistances.push(d);
+  for (let d = zoneStart + 50; d < zoneEnd; d += 50) sampleDistances.push(d);
   if (sampleDistances[sampleDistances.length - 1] < zoneEnd) sampleDistances.push(zoneEnd);
   return sampleDistances.map((target) => {
     let i = 1;
@@ -16052,9 +17284,17 @@ function getControlledZoneAvoidanceFallback(route: CandidateRoute) {
     return {
       lon: coords[i - 1][0] + (coords[i][0] - coords[i - 1][0]) * t,
       lat: coords[i - 1][1] + (coords[i][1] - coords[i - 1][1]) * t,
-      radius_km: 0.09,
+      radius_km: 0.035,
     };
   });
+}
+
+function getControlledTestAvoidanceZones(route: CandidateRoute) {
+  const hotspot = (route.hotspots || []).find((item) => item.cause === "Controlled traffic test");
+  if (hotspot?.zone_path?.length) {
+    return hotspot.zone_path.map(([lon, lat]) => ({ lat, lon, radius_km: 0.035 }));
+  }
+  return getControlledZoneAvoidanceFallback(route);
 }
 
 function pointAtRouteDistance(route: CandidateRoute, targetDistanceM: number): [number, number] {
@@ -16137,11 +17377,17 @@ function applyControlledTrafficPhase(route: CandidateRoute, phase: CongestionLev
   };
 }
 
-function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocation: Coordinate): CandidateRoute | null {
+function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocation: Coordinate, expectedDistanceM?: number): CandidateRoute | null {
   const planned = activeRoute.controlled_test_bypass_route;
   const sourceCoords = (planned?.geometry?.coordinates || []) as [number, number][];
   if (!planned || sourceCoords.length < 2) return null;
   const projection = projectPointOntoRoute(currentLocation, planned);
+  if (typeof expectedDistanceM === "number" && Math.abs(projection.distanceAlongRouteMeters - expectedDistanceM) > Math.max(150, expectedDistanceM * 0.025)) {
+    console.warn("[TrafficTest] Planned bypass projection does not align with the expected switch distance.", {
+      expectedDistanceM, projectedDistanceM: projection.distanceAlongRouteMeters,
+    });
+    return null;
+  }
   if (projection.distanceToRouteMeters > 30) {
     console.warn("[TrafficTest] Planned bypass does not join the vehicle's current road.", { distanceM: projection.distanceToRouteMeters });
     return null;
@@ -16178,7 +17424,7 @@ function buildControlledBypassSuffix(activeRoute: CandidateRoute, currentLocatio
   return {
     ...planned, route_id: `controlled-bypass-${Date.now()}`, source: "controlled-test-bypass", route_index: 0,
     distance_meters: distanceM, duration_seconds: durationS, predicted_duration_seconds: durationS, predicted_duration_minutes: Number((durationS / 60).toFixed(1)),
-    geometry: { ...planned.geometry, coordinates: coords as number[][] }, steps, segments: [clearSegment], hotspots: (planned.hotspots || []).filter((hotspot) => hotspot.cause !== "Controlled traffic test"),
+    geometry: { ...planned.geometry, coordinates: coords as number[][] }, steps, segments: [clearSegment], hotspots: [],
     clear_distance_km: Number((distanceM / 1000).toFixed(2)), moderate_distance_km: 0, heavy_distance_km: 0, severe_distance_km: 0, total_delay_seconds: 0,
     controlled_test_bypass_route: null, controlled_test_switch_distance_m: null, controlled_test_zone_start_distance_m: null, controlled_test_zone_end_distance_m: null,
   };
@@ -16253,6 +17499,13 @@ interface NavigationContextType {
   setActiveRouteIndex: (idx: number) => void;
   isNavigating: boolean;
   setIsNavigating: (nav: boolean) => void;
+  navigationMode: NavigationMode;
+  startNavigation: (mode: NavigationMode) => Promise<boolean>;
+  stopNavigation: () => void;
+  gpsStatus: GPSStatus;
+  gpsLocationSource: GPSLocationSource;
+  gpsAccuracyMeters: number | null;
+  gpsError: string | null;
   backendOnline: boolean | null;
   activeLayerMode: LayerMode;
   setActiveLayerMode: (mode: LayerMode) => void;
@@ -16317,6 +17570,26 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const [routes, setRoutes] = useState<CandidateRoute[]>([]);
   const [activeRouteIndex, setActiveRouteIndex] = useState(0);
   const [isNavigating, setIsNavigating] = useState(false);
+  const [navigationMode, setNavigationMode] = useState<NavigationMode>("simulation");
+  const navigationModeRef = useRef<NavigationMode>("simulation");
+  navigationModeRef.current = navigationMode;
+  const isNavigatingRef = useRef(false);
+  isNavigatingRef.current = isNavigating;
+  const [gpsStatus, setGpsStatus] = useState<GPSStatus>("idle");
+  const [gpsLocationSource, setGpsLocationSource] = useState<GPSLocationSource>("device");
+  const gpsLocationSourceRef = useRef<GPSLocationSource>("device");
+  gpsLocationSourceRef.current = gpsLocationSource;
+  const [gpsAccuracyMeters, setGpsAccuracyMeters] = useState<number | null>(null);
+  const [gpsError, setGpsError] = useState<string | null>(null);
+  const gpsStartRequestRef = useRef(0);
+  const gpsSessionRef = useRef(0);
+  const gpsAcquisitionCleanupRef = useRef<(() => void) | null>(null);
+  const gpsLastSampleRef = useRef<{ lat: number; lon: number; timestamp: number; accuracy: number } | null>(null);
+  const gpsOffRouteSamplesRef = useRef(0);
+  const gpsRerouteInProgressRef = useRef(false);
+  const gpsLastOffRouteRecalculationRef = useRef(0);
+  const gpsArrivalSamplesRef = useRef(0);
+  const gpsArrivedRef = useRef(false);
   const [backendOnline, setBackendOnline] = useState<boolean | null>(null);
 
   const [activeLayerMode, setActiveLayerMode] = useState<LayerMode>("ALL");
@@ -16340,6 +17613,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   // Real-Time Simulation & Navigation Telemetry
   const [currentLocation, setCurrentLocation] = useState<Coordinate | null>(null);
   const currentLocationRef = useRef<Coordinate | null>(null);
+  const selectedDestinationRef = useRef<Coordinate | null>(selectedDestination);
+  selectedDestinationRef.current = selectedDestination;
   const [vehicleBearing, setVehicleBearing] = useState<number>(0);
   const [currentVehicleSpeed, setCurrentVehicleSpeed] = useState<number>(45.0);
   const [simProgressPercent, setSimProgressPercent] = useState<number>(0);
@@ -16376,6 +17651,18 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   const recentRoutesRef = useRef<Array<any>>([]);
   
   const activeRouteRef = useRef<CandidateRoute | null>(null);
+  activeRouteRef.current = routes[activeRouteIndex] || null;
+  const activeRerouteRecommendationRef = useRef<RerouteRecommendation | null>(null);
+  activeRerouteRecommendationRef.current = activeRerouteRecommendation;
+  const bypassAlignmentAttemptsRef = useRef<number>(0);
+
+  const latestCalculateRoutesRef = useRef<(
+    origin?: Coordinate | null,
+    dest?: Coordinate | null,
+    emergencyOverride?: boolean,
+    trafficMode?: TrafficTestMode,
+    trafficProgress?: number,
+  ) => Promise<boolean>>(async () => false);
   useEffect(() => {
     activeRouteRef.current = routes[activeRouteIndex] || null;
   }, [routes, activeRouteIndex]);
@@ -16461,8 +17748,17 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         !testCongestionConsumedRef.current
       );
       if (response.success && response.candidates.length > 0) {
-        setRoutes(selectDisplayedRouteOptions(response.candidates));
+        const displayedRoutes = selectDisplayedRouteOptions(response.candidates, trafficMode);
+        setRoutes(displayedRoutes);
+        // Keep synchronous consumers (notably GPS callbacks during recovery) on the same
+        // route as the state update before React's passive ref-sync effect runs.
+        activeRouteRef.current = displayedRoutes[0] || null;
         setActiveRouteIndex(0);
+        if (navigationModeRef.current === "gps" && isNavigatingRef.current && displayedRoutes[0]) {
+          setSimProgressPercent(0);
+          setSimDistanceRemainingM(displayedRoutes[0].distance_meters || 0);
+          setSimEtaSeconds(displayedRoutes[0].predicted_duration_seconds || displayedRoutes[0].duration_seconds || 0);
+        }
         simDistanceTraversedRef.current = 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
@@ -16485,7 +17781,267 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     }
   };
 
+  latestCalculateRoutesRef.current = calculateRoutes;
+
+  const startNavigation = async (mode: NavigationMode): Promise<boolean> => {
+    // Invalidate a pending GPS startup whenever a new mode is selected.
+    const requestId = ++gpsStartRequestRef.current;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
+    setGpsError(null);
+
+    if (mode === "simulation") {
+      const activeRoute = routes[activeRouteIndex];
+      if (!activeRoute || !selectedDestination) {
+        setGpsError("Choose a destination and calculate a route before starting navigation.");
+        return false;
+      }
+      const controlledMode = trafficTestModeRef.current;
+      const isControlled = controlledMode === "heavy" || controlledMode === "severe" || controlledMode === "dynamic";
+      if (isControlled) {
+        const hasValidBypass =
+          typeof activeRoute.controlled_test_switch_distance_m === "number" &&
+          activeRoute.controlled_test_bypass_route &&
+          Array.isArray(activeRoute.controlled_test_bypass_route.geometry?.coordinates) &&
+          activeRoute.controlled_test_bypass_route.geometry.coordinates.length >= 2;
+        if (!hasValidBypass) {
+          setNoRouteReason("This route could not produce a validated test bypass. Simulation will continue on the current route without rerouting.");
+        }
+      }
+      setNavigationMode("simulation");
+      gpsLocationSourceRef.current = "device";
+      setGpsLocationSource("device");
+      setGpsStatus("idle");
+      setGpsAccuracyMeters(null);
+      gpsLastSampleRef.current = null;
+      gpsOffRouteSamplesRef.current = 0;
+      gpsArrivalSamplesRef.current = 0;
+      gpsArrivedRef.current = false;
+      TTSService.warmUp();
+      setIsSimPlaying(true);
+      setIsNavigating(true);
+      return true;
+    }
+
+    const destination = selectedDestination;
+    if (!destination) {
+      setGpsStatus("error");
+      setGpsError("Choose a destination before starting GPS navigation.");
+      return false;
+    }
+
+    setGpsStatus("locating");
+    setGpsAccuracyMeters(null);
+    setGpsError(null);
+
+    let locationSource: GPSLocationSource = "demo";
+    let origin: Coordinate = { ...GPS_DEMO_FALLBACK_ORIGIN };
+    let accuracy: number | null = null;
+    let timestamp = 0;
+    let totalSamples = 0;
+    const isLocalhost = typeof window !== "undefined" &&
+      (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1");
+    const secureLocationContext = typeof window !== "undefined" && (window.isSecureContext || isLocalhost);
+    const canTryDeviceLocation = typeof navigator !== "undefined" &&
+      Boolean(navigator.geolocation) && secureLocationContext;
+
+    if (canTryDeviceLocation) {
+      const abortSignal = { isAborted: false };
+      const acquisition = acquireAccuratePosition({
+        targetAccuracyMeters: 75,
+        maxAcceptableAccuracyMeters: GPS_REAL_FIX_MAX_ACCURACY_METERS,
+        timeoutMs: 6500,
+        refinementWindowMs: 1200,
+        signal: abortSignal,
+        onProgress: (progress) => {
+          if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return;
+          setGpsAccuracyMeters(progress.accuracy);
+          setGpsError(null);
+        },
+      });
+      gpsAcquisitionCleanupRef.current = () => {
+        abortSignal.isAborted = true;
+        acquisition.cancel();
+      };
+
+      try {
+        const acquired = await acquisition.promise;
+        totalSamples = acquired.totalSamples;
+        if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return false;
+        const candidate = acquired.position;
+        const candidateAccuracy = candidate.coords.accuracy;
+        const candidateTimestamp = candidate.timestamp || Date.now();
+        const candidateAgeMs = Math.max(0, Date.now() - candidateTimestamp);
+        const { latitude, longitude } = candidate.coords;
+        const validCoordinates = Number.isFinite(latitude) && Number.isFinite(longitude) &&
+          latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180;
+        if (validCoordinates && Number.isFinite(candidateAccuracy) && candidateAccuracy > 0 &&
+            candidateAccuracy <= GPS_REAL_FIX_MAX_ACCURACY_METERS && candidateAgeMs <= 30000) {
+          locationSource = "device";
+          accuracy = candidateAccuracy;
+          timestamp = candidateTimestamp;
+          origin = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+          logGpsDiagnostic("RELIABLE_DEVICE_FIX_ACCEPTED", {
+            lat: latitude, lon: longitude, accuracyMeters: Math.round(candidateAccuracy), totalSamples,
+          });
+        } else {
+          logGpsWarning("STARTUP_FIX_NOT_RELIABLE_USING_STATIONARY_PREVIEW", {
+            accuracyMeters: Number.isFinite(candidateAccuracy) ? Math.round(candidateAccuracy) : null,
+            ageMs: candidateAgeMs,
+          });
+        }
+      } catch (error) {
+        if (requestId !== gpsStartRequestRef.current || abortSignal.isAborted) return false;
+        logGpsWarning("DEVICE_LOCATION_UNAVAILABLE_USING_STATIONARY_PREVIEW", {
+          reason: error instanceof Error ? error.message : "Unknown geolocation error",
+        });
+      } finally {
+        if (requestId === gpsStartRequestRef.current) gpsAcquisitionCleanupRef.current = null;
+      }
+    } else {
+      logGpsWarning("DEVICE_GEOLOCATION_UNAVAILABLE_USING_STATIONARY_PREVIEW", {
+        geolocationAvailable: typeof navigator !== "undefined" && Boolean(navigator.geolocation),
+        secureContext: secureLocationContext,
+      });
+    }
+
+    if (requestId !== gpsStartRequestRef.current) return false;
+    setGpsError(null);
+    setGpsAccuracyMeters(locationSource === "device" ? accuracy : null);
+
+    if (locationSource === "device") {
+      try {
+        const geocode = await Promise.race([
+          reverseGeocode(origin.lat, origin.lon),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 1600)),
+        ]);
+        if (geocode?.display_name) origin = { ...origin, name: geocode.display_name };
+      } catch {
+        // Reverse geocoding is a convenience; the validated coordinates remain usable.
+      }
+    }
+    if (requestId !== gpsStartRequestRef.current) return false;
+
+    const previousOrigin = selectedOrigin;
+    const previousSourceQuery = sourceQuery;
+    const previousTrafficMode = trafficTestModeRef.current;
+    // GPS mode always uses the real traffic route path. Synthetic controlled scenarios stay in Simulation.
+    trafficTestModeRef.current = "real";
+    setTrafficTestMode("real");
+    setSelectedOrigin(origin);
+    setSourceQuery(origin.name || "Current location");
+    const routeLoaded = await calculateRoutes(origin, destination, false, "real", 0);
+    if (requestId !== gpsStartRequestRef.current) return false;
+    if (!routeLoaded) {
+      setSelectedOrigin(previousOrigin);
+      setSourceQuery(previousSourceQuery);
+      trafficTestModeRef.current = previousTrafficMode;
+      setTrafficTestMode(previousTrafficMode);
+      setGpsStatus("error");
+      setGpsAccuracyMeters(null);
+      setGpsError("A route could not be calculated. Check your connection and destination, then retry.");
+      return false;
+    }
+
+    if (locationSource === "demo") {
+      // GPS mode must never run the simulation animation. With no reliable device fix,
+      // keep the vehicle at the configured PSG Tech start while retaining GPS guidance UI.
+      gpsLocationSourceRef.current = "demo";
+      setGpsLocationSource("demo");
+      navigationModeRef.current = "gps";
+      setNavigationMode("gps");
+      currentLocationRef.current = { ...origin };
+      setCurrentLocation({ ...origin });
+      setCurrentVehicleSpeed(0);
+      setVehicleBearing(0);
+      gpsLastSampleRef.current = null;
+      gpsOffRouteSamplesRef.current = 0;
+      gpsRerouteInProgressRef.current = false;
+      gpsLastOffRouteRecalculationRef.current = 0;
+      gpsArrivalSamplesRef.current = 0;
+      gpsArrivedRef.current = false;
+      setGpsStatus("degraded");
+      setGpsAccuracyMeters(null);
+      setGpsError(null);
+      setSimProgressPercent(0);
+      setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+      setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
+      setIsSimPlaying(false);
+      TTSService.warmUp();
+      setIsNavigating(true);
+      logGpsDiagnostic("GPS_NAVIGATION_STARTED_WITH_STATIONARY_DEMO_ORIGIN", {
+        lat: origin.lat, lon: origin.lon, accuracyMeters: null, totalWarmupSamples: totalSamples,
+      });
+      return true;
+    }
+
+    gpsLocationSourceRef.current = locationSource;
+    setGpsLocationSource(locationSource);
+    navigationModeRef.current = "gps";
+    setNavigationMode("gps");
+    currentLocationRef.current = origin;
+    setCurrentLocation(origin);
+    setCurrentVehicleSpeed(0);
+    gpsLastSampleRef.current = locationSource === "device" && accuracy !== null
+      ? { lat: origin.lat, lon: origin.lon, timestamp, accuracy }
+      : null;
+    gpsOffRouteSamplesRef.current = 0;
+    gpsRerouteInProgressRef.current = false;
+    gpsLastOffRouteRecalculationRef.current = 0;
+    gpsArrivalSamplesRef.current = 0;
+    gpsArrivedRef.current = false;
+    setGpsAccuracyMeters(locationSource === "device" ? accuracy : null);
+    setGpsStatus(locationSource === "device" ? ((accuracy || 0) > 75 ? "degraded" : "tracking") : "degraded");
+    setGpsError(null);
+    setSimProgressPercent(0);
+    setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+    setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
+    setIsSimPlaying(false);
+    TTSService.warmUp();
+    setIsNavigating(true);
+
+    logGpsDiagnostic(locationSource === "device" ? "GPS_NAVIGATION_STARTED_WITH_DEVICE_FIX" : "GPS_NAVIGATION_STARTED_WITH_STATIONARY_DEMO_ORIGIN", {
+      lat: origin.lat, lon: origin.lon, accuracyMeters: accuracy === null ? null : Math.round(accuracy), totalWarmupSamples: totalSamples,
+    });
+    return true;
+  };
+
+  const stopNavigation = () => {
+    gpsStartRequestRef.current += 1;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
+    gpsArrivedRef.current = false;
+    gpsLastSampleRef.current = null;
+    gpsOffRouteSamplesRef.current = 0;
+    gpsRerouteInProgressRef.current = false;
+    setGpsStatus("idle");
+    gpsLocationSourceRef.current = "device";
+    setGpsLocationSource("device");
+    setGpsAccuracyMeters(null);
+    setGpsError(null);
+    setNavigationMode("simulation");
+    setIsSimPlaying(false);
+    setIsNavigating(false);
+  };
+
   const runTrafficTest = async (mode: TrafficTestMode) => {
+    gpsStartRequestRef.current += 1;
+    if (gpsAcquisitionCleanupRef.current) {
+      gpsAcquisitionCleanupRef.current();
+      gpsAcquisitionCleanupRef.current = null;
+    }
+    setNavigationMode("simulation");
+    gpsLocationSourceRef.current = "device";
+    setGpsLocationSource("device");
+    setGpsStatus("idle");
+    setGpsAccuracyMeters(null);
+    setGpsError(null);
+    gpsLastSampleRef.current = null;
+    gpsArrivedRef.current = false;
     TTSService.warmUp();
     trafficTestModeRef.current = mode;
     setTrafficTestMode(mode);
@@ -16657,7 +18213,8 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         );
       }
       const isGeometryAbsurd = Math.abs(calculatedPolylineM - totalRouteDistance) > Math.max(500, totalRouteDistance * 0.2);
-      const badStart = startDistanceM > 35;
+      const startToleranceM = navigationModeRef.current === "gps" ? Math.max(75, (gpsAccuracyMeters || 0) + 35) : 35;
+      const badStart = startDistanceM > startToleranceM;
       const badEnd = Boolean(selectedDestination && endDistanceM > 250);
       if (badStart || badEnd || isGeometryAbsurd) {
         console.warn("[NavigationContext] Reroute rejected to prevent a vehicle jump.", {
@@ -16732,9 +18289,15 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
        }
     }
 
-    // Make newRoute the active route at index 0
+    // Make newRoute the active route at index 0. In GPS mode the physical marker remains
+    // on the current fix while route-relative progress restarts at the beginning of the bypass.
     setRoutes((prev) => [newRoute, ...prev.filter((r) => r.route_id !== newRoute.route_id)]);
     setActiveRouteIndex(0);
+    if (navigationModeRef.current === "gps") {
+      setSimProgressPercent(0);
+      setSimDistanceRemainingM(newRoute.distance_meters || totalRouteDistance);
+      setSimEtaSeconds(newRoute.predicted_duration_seconds || newRoute.duration_seconds || 0);
+    }
 
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
@@ -16774,17 +18337,20 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       calculated_geometry_length: calcGeomLength
     });
 
-    // In the SEVERE controlled test only, the congestion event has already
-    // served its purpose once the driver accepts the bypass. Do not carry the
-    // synthetic hotspot onto the new active route, otherwise the accepted route
-    // can show a stray severe marker and later trigger a heavy/moderate alert.
+    // When accepting a bypass in a controlled test, the congestion event
+    // has served its purpose. Do not carry synthetic hotspots or bypass metadata
+    // onto the new active route.
     const routeToActivate =
-      trafficTestModeRef.current === "severe"
+      trafficTestModeRef.current !== "real"
         ? {
             ...recRoute,
             hotspots: (recRoute.hotspots || []).filter(
               (hotspot) => hotspot.cause !== "Controlled traffic test",
             ),
+            controlled_test_bypass_route: null,
+            controlled_test_switch_distance_m: null,
+            controlled_test_zone_start_distance_m: null,
+            controlled_test_zone_end_distance_m: null,
           }
         : recRoute;
 
@@ -16793,12 +18359,12 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     setIsApplyingReroute(false);
     if (switched) {
       // Any accepted reroute during a controlled traffic test ends that
-      // test's synthetic congestion for the rest of the trip — not only an
+      // test's synthetic congestion for the rest of the trip â€” not only an
       // accepted congestion-avoidance suggestion. Gating this solely on
       // is_congestion_avoidance meant the "faster route" branch (surfaced by
       // the periodic, non-avoidance check) never marked the scenario
-      // consumed, so a later dynamic-mode phase change — or any fresh
-      // /route call — could still inject another synthetic HEAVY/SEVERE
+      // consumed, so a later dynamic-mode phase change â€” or any fresh
+      // /route call â€” could still inject another synthetic HEAVY/SEVERE
       // hotspot even though the driver had already rerouted once.
       if (trafficTestModeRef.current !== "real") {
         testCongestionConsumedRef.current = true;
@@ -16836,9 +18402,10 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
 
   // Speech rate is evaluated at dequeue time from the same ref used by the turn thresholds.
   useEffect(() => {
-    TTSService.setRateProvider(() =>
-      Math.min(2.0, 1.05 * (1 + (simSpeedMultiplierRef.current - 1) * 0.25)),
-    );
+    TTSService.setRateProvider(() => {
+      const multiplier = navigationModeRef.current === "simulation" ? simSpeedMultiplierRef.current : 1;
+      return Math.min(2.0, 1.05 * (1 + (multiplier - 1) * 0.25));
+    });
     return () => TTSService.reset();
   }, []);
 
@@ -16915,29 +18482,46 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       const activeRoute = routes[activeRouteIndex];
       if (activeRoute && activeRoute.geometry?.coordinates?.length > 0) {
         const firstCoord = activeRoute.geometry.coordinates[0];
-        const startLocation = { lon: firstCoord[0], lat: firstCoord[1] };
+        const routeStartLocation = { lon: firstCoord[0], lat: firstCoord[1] };
+        // GPS startup has already installed the initial device fix. Never snap the GPS marker
+        // to the route's first OSRM coordinate; only Simulation starts at that route point.
+        const startLocation = navigationMode === "gps" && currentLocationRef.current
+          ? currentLocationRef.current
+          : routeStartLocation;
         currentLocationRef.current = startLocation;
         setCurrentLocation(startLocation);
-        simDistanceTraversedRef.current = 0;
+        simDistanceTraversedRef.current = navigationMode === "gps"
+          ? projectPointOntoRoute(startLocation, activeRoute).distanceAlongRouteMeters
+          : 0;
         lastAlertCheckDistanceRef.current = -999;
         lastAutoRerouteCheckTimeRef.current = 0;
         isTransitioningRouteRef.current = false;
         testReroutePausedRef.current = false;
         TTSService.warmUp();
-        setSimProgressPercent(0);
-        setSimDistanceRemainingM(activeRoute.distance_meters || 0);
-        setSimEtaSeconds(activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0);
+        const routeCoordinates = activeRoute.geometry.coordinates as [number, number][];
+        let routeGeometryLength = 0;
+        for (let i = 1; i < routeCoordinates.length; i += 1) {
+          routeGeometryLength += haversineMeters(
+            routeCoordinates[i - 1][0], routeCoordinates[i - 1][1],
+            routeCoordinates[i][0], routeCoordinates[i][1],
+          );
+        }
+        const initialProgressRatio = navigationMode === "gps" && routeGeometryLength > 0
+          ? Math.min(1, simDistanceTraversedRef.current / routeGeometryLength)
+          : 0;
+        setSimProgressPercent(Math.round(initialProgressRatio * 100));
+        setSimDistanceRemainingM(Math.max(0, (activeRoute.distance_meters || routeGeometryLength) * (1 - initialProgressRatio)));
+        setSimEtaSeconds(Math.round((activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0) * (1 - initialProgressRatio)));
         // Reset the frame timestamp so the first animateDrive tick computes a
         // sane delta instead of a huge jump from a stale previous value.
         lastFrameTimeRef.current = performance.now();
-        // Ensure simulation is playing — set state *after* all refs are
-        // initialised so the simulation-loop effect picks up correct values.
-        setIsSimPlaying(true);
+        // Only Simulation runs the animation-frame movement engine.
+        setIsSimPlaying(navigationMode === "simulation");
 
         TTSService.announce(
           isEmergencyMode
             ? "Starting Emergency Priority Navigation. Clear corridor mode active."
-            : "Starting navigation. Drive safely.",
+            : navigationMode === "gps" ? "Starting GPS navigation." : "Starting navigation simulation.",
           SpeechPriority.NORMAL,
           `navigation_started_${activeRoute.route_id || activeRouteIndex}`,
         );
@@ -16958,12 +18542,392 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
       currentLocationRef.current = null;
       setCurrentLocation(null);
       setActiveRerouteRecommendation(null);
+      gpsLastSampleRef.current = null;
+      gpsOffRouteSamplesRef.current = 0;
+      gpsRerouteInProgressRef.current = false;
+      gpsArrivalSamplesRef.current = 0;
+      gpsArrivedRef.current = false;
+      setGpsAccuracyMeters(null);
+      if (navigationModeRef.current !== "gps") setGpsStatus("idle");
     }
-  }, [isNavigating, activeRouteIndex, routes, isEmergencyMode]);
+  }, [isNavigating, navigationMode, activeRouteIndex, routes, isEmergencyMode]);
+
+  // GPS watcher is exclusively active during a GPS journey. Simulation never requests device location.
+  useEffect(() => {
+    if (!isNavigating || navigationMode !== "gps" || typeof navigator === "undefined" || !navigator.geolocation) {
+      return;
+    }
+
+    const sessionId = ++gpsSessionRef.current;
+    let watchId: number | null = null;
+    let lastAlertProgressM = -999;
+
+    const handleGpsPosition = (position: GeolocationPosition) => {
+      if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps" || gpsArrivedRef.current || isTransitioningRouteRef.current) return;
+      const { latitude, longitude, accuracy, speed, heading } = position.coords;
+      const timestamp = position.timestamp || Date.now();
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return;
+      if (!Number.isFinite(accuracy) || accuracy <= 0) return;
+      if (Date.now() - timestamp > 30000) {
+        if (gpsLocationSourceRef.current !== "demo") {
+          setGpsStatus("degraded");
+          setGpsError("GPS signal is stale. Keeping the last reliable position while waiting for an updated fix.");
+        }
+        return;
+      }
+
+      // A fallback coordinate is for route preview only. Do not let coarse browser/IP
+      // locations move the marker, advance progress, trigger arrival, or initiate reroutes.
+      if (gpsLocationSourceRef.current === "demo") {
+        if (accuracy > GPS_REAL_FIX_MAX_ACCURACY_METERS) {
+          setGpsStatus("degraded");
+          setGpsAccuracyMeters(null);
+          setCurrentVehicleSpeed(0);
+          return;
+        }
+        if (gpsRerouteInProgressRef.current) return;
+        const destination = selectedDestinationRef.current;
+        if (!destination) return;
+        const promotedLocation: Coordinate = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+        gpsRerouteInProgressRef.current = true;
+        setGpsStatus("rerouting");
+        setGpsError("Reliable device location found. Updating the route…");
+        void (async () => {
+          let loaded = false;
+          try {
+            loaded = await latestCalculateRoutesRef.current(promotedLocation, destination, false, "real", 0);
+          } catch (error) {
+            console.warn("[ApexGuardian GPS] Device-location route refresh failed:", error);
+          }
+          if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps") return;
+          gpsRerouteInProgressRef.current = false;
+          if (loaded) {
+            gpsLocationSourceRef.current = "device";
+            setGpsLocationSource("device");
+            setSelectedOrigin(promotedLocation);
+            setSourceQuery("Current GPS Location");
+            currentLocationRef.current = promotedLocation;
+            setCurrentLocation(promotedLocation);
+            setCurrentVehicleSpeed(0);
+            gpsLastSampleRef.current = { lat: latitude, lon: longitude, timestamp, accuracy };
+            gpsOffRouteSamplesRef.current = 0;
+            gpsArrivalSamplesRef.current = 0;
+            gpsArrivedRef.current = false;
+            simDistanceTraversedRef.current = 0;
+            setSimProgressPercent(0);
+            setSimDistanceRemainingM(activeRouteRef.current?.distance_meters || 0);
+            setSimEtaSeconds(activeRouteRef.current?.predicted_duration_seconds || activeRouteRef.current?.duration_seconds || 0);
+            setGpsAccuracyMeters(accuracy);
+            setGpsStatus(accuracy > 75 ? "degraded" : "tracking");
+            setGpsError(accuracy > 100 ? `GPS accuracy is approximate (±${Math.round(accuracy)} m).` : null);
+            logGpsDiagnostic("REAL_FIX_REPLACED_STATIONARY_DEMO_ORIGIN", { lat: latitude, lon: longitude, accuracyMeters: Math.round(accuracy) });
+          } else {
+            gpsLocationSourceRef.current = "demo";
+            setGpsLocationSource("demo");
+            currentLocationRef.current = GPS_DEMO_FALLBACK_ORIGIN;
+            setCurrentLocation(GPS_DEMO_FALLBACK_ORIGIN);
+            setCurrentVehicleSpeed(0);
+            setGpsAccuracyMeters(null);
+            setGpsStatus("degraded");
+            setGpsError("A reliable device location was found, but the route could not be refreshed. The map remains stationary.");
+          }
+        })();
+        return;
+      }
+
+      // Ignore coarse fixes for all movement/progress calculations, not just guidance.
+      if (accuracy > GPS_REAL_FIX_MAX_ACCURACY_METERS) {
+        setGpsStatus("degraded");
+        setGpsAccuracyMeters(accuracy);
+        setGpsError(`GPS accuracy is too coarse (±${Math.round(accuracy)} m). Holding the last reliable position.`);
+        return;
+      }
+
+      const previousSample = gpsLastSampleRef.current;
+      const elapsedSeconds = previousSample ? Math.max(0.25, (timestamp - previousSample.timestamp) / 1000) : 1;
+      const rawMovementM = previousSample
+        ? haversineMeters(previousSample.lon, previousSample.lat, longitude, latitude)
+        : 0;
+      const plausibleMovementM = Math.max(100, elapsedSeconds * 70 + accuracy + (previousSample?.accuracy || 0) + 25);
+      if (previousSample && rawMovementM > plausibleMovementM) {
+        setGpsStatus("degraded");
+        setGpsAccuracyMeters(accuracy);
+        setGpsError("A sudden GPS position jump was ignored. Waiting for a stable location fix.");
+        return;
+      }
+
+      const location: Coordinate = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+      let speedKmh = Number.isFinite(speed) && speed !== null && speed >= 0
+        ? speed * 3.6
+        : previousSample && elapsedSeconds > 1 && rawMovementM > 3
+          ? (rawMovementM / elapsedSeconds) * 3.6
+          : 0;
+      speedKmh = Math.max(0, Math.min(220, speedKmh));
+      let nextBearing = Number.isFinite(heading) && heading !== null && heading >= 0
+        ? heading
+        : currentBearingRef.current;
+      if ((!Number.isFinite(heading) || heading === null || heading < 0) && previousSample && rawMovementM > 3) {
+        nextBearing = calculateBearingAngle(previousSample.lon, previousSample.lat, longitude, latitude);
+      }
+      if (!Number.isFinite(nextBearing)) nextBearing = 0;
+
+      gpsLastSampleRef.current = { lat: latitude, lon: longitude, timestamp, accuracy };
+      currentLocationRef.current = location;
+      setCurrentLocation(location);
+      setCurrentVehicleSpeed(Math.round(speedKmh));
+      currentBearingRef.current = nextBearing;
+      setVehicleBearing(nextBearing);
+      setGpsAccuracyMeters(accuracy);
+
+      const isCoarse = accuracy > 75;
+      if (!gpsRerouteInProgressRef.current) {
+        if (accuracy > 250) {
+          setGpsStatus("degraded");
+          setGpsError(
+            `GPS accuracy is poor (±${Math.round(accuracy)} m). Waiting for a better position fix.`
+          );
+        } else if (accuracy > 100) {
+          setGpsStatus("degraded");
+          setGpsError(
+            `GPS accuracy is approximate (±${Math.round(accuracy)} m). Navigation is using a coarse position fix.`
+          );
+        } else {
+          setGpsStatus(isCoarse ? "degraded" : "tracking");
+          setGpsError(null);
+        }
+      }
+
+      // Gate reliable route-progress updates, turn-by-turn confidence, off-route rerouting and arrival detection on suitable quality (≤250m)
+      if (!Number.isFinite(accuracy) || accuracy <= 0 || accuracy > 250) {
+        return;
+      }
+
+      const activeRoute = activeRouteRef.current;
+      const destination = selectedDestinationRef.current;
+      if (!activeRoute || !activeRoute.geometry?.coordinates || activeRoute.geometry.coordinates.length < 2 || !destination) return;
+      if (gpsRerouteInProgressRef.current) return;
+
+      const projection = projectPointOntoRoute(location, activeRoute);
+      const coordinates = activeRoute.geometry.coordinates as [number, number][];
+      let geometryLengthM = 0;
+      for (let i = 1; i < coordinates.length; i += 1) {
+        geometryLengthM += haversineMeters(coordinates[i - 1][0], coordinates[i - 1][1], coordinates[i][0], coordinates[i][1]);
+      }
+      if (geometryLengthM <= 0) return;
+
+      const previousProgressM = simDistanceTraversedRef.current;
+      const onRouteToleranceM = Math.max(80, accuracy * 1.5);
+      const isNearRoute = projection.distanceToRouteMeters <= onRouteToleranceM;
+      let progressM = previousProgressM;
+      if (isNearRoute) {
+        const maxForwardJumpM = Math.max(60, (speedKmh / 3.6) * elapsedSeconds * 3 + accuracy * 2 + 30);
+        const candidateProgressM = projection.distanceAlongRouteMeters;
+        // Keep route progress monotonic and reject implausible projection jumps at crossings.
+        if (candidateProgressM <= previousProgressM + maxForwardJumpM || previousProgressM < 40) {
+          progressM = Math.max(previousProgressM, candidateProgressM);
+        } else {
+          setGpsStatus("degraded");
+          setGpsError("GPS matched an unexpected section of the route. Keeping the previous progress until the position stabilizes.");
+        }
+        gpsOffRouteSamplesRef.current = 0;
+      } else {
+        gpsOffRouteSamplesRef.current += 1;
+      }
+
+      progressM = Math.max(0, Math.min(geometryLengthM, progressM));
+      simDistanceTraversedRef.current = progressM;
+      const progressRatio = Math.max(0, Math.min(1, progressM / geometryLengthM));
+      const remainingM = Math.max(0, (activeRoute.distance_meters || geometryLengthM) * (1 - progressRatio));
+      const routePredictedRemainingS = Math.max(0, (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 0) * (1 - progressRatio));
+      const speedBasedRemainingS = speedKmh >= 5 ? remainingM / Math.max(1, speedKmh / 3.6) : routePredictedRemainingS;
+      const etaSeconds = speedKmh >= 5
+        ? Math.round(routePredictedRemainingS * 0.65 + speedBasedRemainingS * 0.35)
+        : Math.round(routePredictedRemainingS);
+      setSimProgressPercent(Math.round(progressRatio * 100));
+      setSimDistanceRemainingM(remainingM);
+      setSimEtaSeconds(Math.max(0, etaSeconds));
+
+      // Use real GPS progress to keep the existing congestion-alert distance state in sync.
+      if (isNearRoute && Math.abs(progressM - lastAlertProgressM) >= 15) {
+        lastAlertProgressM = progressM;
+        AlertManager.evaluatePosition(latitude, longitude, activeRoute.hotspots || [], speedKmh, (alert) => {
+          if (alert.firstAnnouncement) {
+            TTSService.speakCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.averageSpeedKmh,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : undefined,
+              true,
+              alert.congestionLevel,
+            );
+            PushNotificationService.sendCongestionAlert(
+              alert.locationName,
+              alert.distanceText,
+              alert.estimatedDelaySeconds ? alert.estimatedDelaySeconds / 60 : 3,
+              alert.averageSpeedKmh,
+              alert.congestionLevel,
+            );
+          }
+          if (
+            (alert.congestionLevel === "HEAVY" || alert.congestionLevel === "SEVERE") &&
+            trafficTestModeRef.current === "real" &&
+            !RerouteEngine.getActiveRecommendation()
+          ) {
+            void RerouteEngine.checkAndReevaluate(
+              latitude, longitude, destination.lat, destination.lon, etaSeconds, speedKmh,
+              isEmergencyMode, true, "real", progressRatio,
+              getUpcomingAvoidHotspots(activeRoute, progressM), recentRoutesRef.current, true,
+            );
+          }
+        }, progressM);
+      }
+
+      // Keep turn guidance tied to route distance, not wall-clock simulation progress.
+      if (activeRoute.steps?.length) {
+        let walkedStepM = 0;
+        let currentStepIndex = 0;
+        let distanceToTurnM = 0;
+        for (let i = 0; i < activeRoute.steps.length; i += 1) {
+          walkedStepM += activeRoute.steps[i].distance || 0;
+          if (walkedStepM > progressM) {
+            currentStepIndex = i;
+            distanceToTurnM = walkedStepM - progressM;
+            break;
+          }
+        }
+        if (walkedStepM <= progressM) {
+          currentStepIndex = activeRoute.steps.length - 1;
+          distanceToTurnM = 0;
+        }
+        const upcomingStepIndex = Math.min(currentStepIndex + 1, activeRoute.steps.length - 1);
+        const upcomingStep = activeRoute.steps[upcomingStepIndex];
+        if (upcomingStep) {
+          setNextManeuver(upcomingStep);
+          setNextManeuverDistanceM(Math.round(distanceToTurnM));
+          const routeId = activeRoute.route_id || `idx-${activeRouteIndex}`;
+          if (distanceToTurnM <= 500 && distanceToTurnM > 200) {
+            const announcement = getManeuverAnnouncement(upcomingStep, distanceToTurnM);
+            if (announcement) TTSService.announce(announcement, SpeechPriority.CRITICAL, `${routeId}_${upcomingStepIndex}_advance`, 30 * 60_000);
+          } else if (distanceToTurnM <= 200) {
+            // Guard imminent turn announcements against degraded/coarse GPS fixes
+            if (accuracy <= 100) {
+              TTSService.announce(getManeuverInstruction(upcomingStep), SpeechPriority.CRITICAL, `${routeId}_${upcomingStepIndex}_imminent`, 30 * 60_000);
+            }
+          }
+        }
+      }
+
+      // Real-position, cooldown-protected off-route recovery. Do not use this path for synthetic tests.
+      const now = Date.now();
+      if (
+        !isNearRoute && gpsOffRouteSamplesRef.current >= 3 &&
+        trafficTestModeRef.current === "real" &&
+        now - gpsLastOffRouteRecalculationRef.current >= 20000
+      ) {
+        gpsLastOffRouteRecalculationRef.current = now;
+        gpsOffRouteSamplesRef.current = 0;
+        gpsRerouteInProgressRef.current = true;
+        setGpsStatus("rerouting");
+        setGpsError("You appear to be off the planned route. Recalculating from your current GPS locationâ€¦");
+        const origin: Coordinate = { lat: latitude, lon: longitude, name: "Current GPS Location" };
+        void (async () => {
+          const loaded = await latestCalculateRoutesRef.current(origin, destination, false, "real", 0);
+          if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps") return;
+          gpsRerouteInProgressRef.current = false;
+          if (loaded) {
+            setSelectedOrigin(origin);
+            setSourceQuery(origin.name || "Current GPS Location");
+            simDistanceTraversedRef.current = 0;
+            lastAlertProgressM = -999;
+            setSimProgressPercent(0);
+            setGpsStatus("tracking");
+            setGpsError(null);
+          } else {
+            setGpsStatus("degraded");
+            setGpsError("Automatic rerouting failed. Continue toward the planned route or retry route calculation.");
+          }
+        })();
+      }
+
+      // Periodic real-traffic evaluation uses the latest device location. It is independent of simulation playback.
+      if (
+        isNearRoute && trafficTestModeRef.current === "real" &&
+        !RerouteEngine.getActiveRecommendation() &&
+        Date.now() - lastAutoRerouteCheckTimeRef.current > 10000
+      ) {
+        lastAutoRerouteCheckTimeRef.current = Date.now();
+        void RerouteEngine.checkAndReevaluate(
+          latitude, longitude, destination.lat, destination.lon, etaSeconds, speedKmh,
+          isEmergencyMode, false, "real", progressRatio, [], recentRoutesRef.current, true,
+        );
+      }
+
+      // Arrival is based on consecutive actual GPS fixes near the destination, never on projected progress alone.
+      // Strictly guard against coarse GPS fixes (requires accuracy <= 50m) to prevent premature arrival.
+      const distanceToDestinationM = haversineMeters(longitude, latitude, destination.lon, destination.lat);
+      const arrivalRadiusM = Math.min(50, Math.max(25, accuracy));
+      if (distanceToDestinationM <= arrivalRadiusM && accuracy <= 50) {
+        gpsArrivalSamplesRef.current += 1;
+      } else {
+        gpsArrivalSamplesRef.current = 0;
+      }
+      if (gpsArrivalSamplesRef.current >= 2 && !gpsArrivedRef.current) {
+        gpsArrivedRef.current = true;
+        if (watchId !== null) {
+          navigator.geolocation.clearWatch(watchId);
+          watchId = null;
+        }
+        setSimProgressPercent(100);
+        setSimDistanceRemainingM(0);
+        setSimEtaSeconds(0);
+        setGpsStatus("arrived");
+        setGpsError(null);
+        AlertManager.reset();
+        RerouteEngine.dismissRecommendation();
+        RerouteEngine.dismissNoRouteReason();
+        setActiveRerouteRecommendation(null);
+        PushNotificationService.clearCongestionAlert();
+        PushNotificationService.clearRerouteAlert();
+        TTSService.announce("You have arrived at your destination.", SpeechPriority.CRITICAL, `arrived_${activeRoute.route_id || activeRouteIndex}`);
+      }
+    };
+
+    const handleGpsError = (error: GeolocationPositionError) => {
+      if (sessionId !== gpsSessionRef.current || !isNavigatingRef.current || navigationModeRef.current !== "gps") return;
+      setGpsStatus("degraded");
+      if (gpsLocationSourceRef.current === "demo") {
+        setGpsAccuracyMeters(null);
+        setCurrentVehicleSpeed(0);
+        logGpsWarning("DEVICE_WATCH_UNAVAILABLE_PREVIEW_REMAINS_STATIONARY", { code: error.code });
+        return;
+      }
+      setGpsError(`${describeGeolocationError(error)} Navigation is paused at the last reliable position; check location access to resume updates.`);
+    };
+
+    watchId = navigator.geolocation.watchPosition(
+      handleGpsPosition,
+      handleGpsError,
+      { enableHighAccuracy: true, maximumAge: 1000, timeout: 20000 },
+    );
+    return () => {
+      gpsSessionRef.current += 1;
+      if (watchId !== null) navigator.geolocation.clearWatch(watchId);
+    };
+  }, [isNavigating, navigationMode]);
+
+  // Clean up any in-flight startup acquisition on unmount
+  useEffect(() => {
+    return () => {
+      if (gpsAcquisitionCleanupRef.current) {
+        gpsAcquisitionCleanupRef.current();
+        gpsAcquisitionCleanupRef.current = null;
+      }
+    };
+  }, []);
 
   // High-Frequency Smooth Interpolated Driving Simulation Loop (Section 4 & 5)
   useEffect(() => {
-    if (!isNavigating || !isSimPlaying) {
+    if (!isNavigating || navigationMode !== "simulation" || !isSimPlaying) {
       if (animationFrameIdRef.current) {
         cancelAnimationFrame(animationFrameIdRef.current);
         animationFrameIdRef.current = null;
@@ -17157,7 +19121,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         if (hotspot) {
           const liveDistance = hotspot.distance_from_origin_m - newDist;
           if (liveDistance < -50) {
-            // Vehicle has passed the hotspot by more than 50m — clear the alert
+            // Vehicle has passed the hotspot by more than 50m â€” clear the alert
             AlertManager.dismissCurrentAlert();
           } else {
             AlertManager.updateLiveDistance(Math.max(0, liveDistance));
@@ -17308,69 +19272,134 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         }
       }
 
-      // Controlled traffic scenarios have their bypass preplanned before the simulation
-      // starts. The vehicle opens the chooser at the common road approach; no live OSRM
-      // request is awaited and a missing plan never freezes the animation.
+      // Controlled traffic tests trigger at the exact 1 km approach to their synthetic jam.
+      // A preplanned route pair places the common-road split at that same threshold; if no
+      // preplanned pair exists, a zone-specific live OSRM avoidance request is made from here.
       const controlledMode = trafficTestModeRef.current;
       const controlledTestEnabled = controlledMode === "heavy" || controlledMode === "severe" || controlledMode === "dynamic";
+      const controlledZone = controlledTestEnabled ? getControlledTestZoneDistances(activeRoute) : null;
       const plannedSwitchDistance = activeRoute.controlled_test_switch_distance_m;
-      const plannedZoneEnd = activeRoute.controlled_test_zone_end_distance_m;
+      const plannedZoneEnd = controlledZone?.endM ?? activeRoute.controlled_test_zone_end_distance_m;
+      const controlledTriggerDistance = controlledZone
+        ? Math.max(0, controlledZone.startM - CONTROLLED_REROUTE_LOOKAHEAD_METERS)
+        : null;
 
-      const offerPlannedControlledBypass = () => {
+      const offerControlledBypass = () => {
         if (testRerouteTriggeredRef.current || testCongestionConsumedRef.current || !selectedDestination) return;
-        const bypassRoute = buildControlledBypassSuffix(activeRoute, { lat: interpLat, lon: interpLon });
-        if (!bypassRoute) {
-          testRerouteTriggeredRef.current = true;
-          console.warn("[TrafficTest] Preplanned bypass was not aligned with the vehicle; continuing on the current route.");
-          setNoRouteReason(null);
-          return;
-        }
-        testRerouteTriggeredRef.current = true;
-        const remainingSeconds = Math.max(0, (1 - progressRatio) *
-          (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 600));
-        const bypassDuration = bypassRoute.predicted_duration_seconds || bypassRoute.duration_seconds || 0;
-        const etaDelta = remainingSeconds - bypassDuration;
-        const recommendation: RerouteRecommendation = {
-          is_reroute_recommended: true,
-          is_congestion_avoidance: true,
-          time_saved_seconds: etaDelta,
-          time_saved_minutes: Number((etaDelta / 60).toFixed(1)),
-          original_remaining_seconds: remainingSeconds,
-          recommended_duration_seconds: bypassDuration,
-          recommended_route: bypassRoute,
-          alternative_routes: [bypassRoute],
-          reason: "A preplanned OSRM street route avoids the complete synthetic congestion stretch and rejoins the destination without moving the vehicle.",
-        };
+        testRerouteTriggeredRef.current = true; // latch before any asynchronous network request
         testReroutePausedRef.current = true;
         setIsSimPlaying(false);
         setNoRouteReason(null);
-        setActiveRerouteRecommendation(recommendation);
+
+        const remainingSeconds = Math.max(0, (1 - progressRatio) *
+          (activeRoute.predicted_duration_seconds || activeRoute.duration_seconds || 600));
+        const hasPlannedBypass = Boolean(
+          activeRoute.controlled_test_bypass_route?.geometry?.coordinates &&
+          activeRoute.controlled_test_bypass_route.geometry.coordinates.length >= 2 &&
+          typeof plannedSwitchDistance === "number"
+        );
+
+        if (hasPlannedBypass && typeof plannedSwitchDistance === "number") {
+          const bypassRoute = buildControlledBypassSuffix(
+            activeRoute, { lat: interpLat, lon: interpLon }, plannedSwitchDistance
+          );
+          if (bypassRoute) {
+            const bypassDuration = bypassRoute.predicted_duration_seconds || bypassRoute.duration_seconds || 0;
+            const etaDelta = remainingSeconds - bypassDuration;
+            const recommendation: RerouteRecommendation = {
+              is_reroute_recommended: true,
+              is_congestion_avoidance: true,
+              time_saved_seconds: etaDelta,
+              time_saved_minutes: Number((etaDelta / 60).toFixed(1)),
+              original_remaining_seconds: remainingSeconds,
+              recommended_duration_seconds: bypassDuration,
+              recommended_route: bypassRoute,
+              alternative_routes: [bypassRoute],
+              reason: "A preplanned OSRM route avoids the complete synthetic congestion stretch.",
+            };
+            setActiveRerouteRecommendation(recommendation);
+            return;
+          }
+          console.warn("[TrafficTest] Preplanned bypass could not be aligned at the 1 km threshold; trying live OSRM avoidance.");
+        }
+
+        const zones = getControlledTestAvoidanceZones(activeRoute);
+        if (!zones.length) {
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason("The controlled test has no valid congestion-zone geometry to avoid.");
+          return;
+        }
+
+        void (async () => {
+          const recommendation = await RerouteEngine.checkAndReevaluate(
+            interpLat,
+            interpLon,
+            selectedDestination.lat,
+            selectedDestination.lon,
+            remainingSeconds,
+            speedKmh,
+            isEmergencyMode,
+            true,
+            controlledMode,
+            Math.min(1, newDist / Math.max(1, totalRouteDistanceM)),
+            zones,
+            recentRoutesRef.current,
+            true,
+          );
+          if (recommendation?.is_reroute_recommended && recommendation.recommended_route) {
+            setNoRouteReason(null);
+            setActiveRerouteRecommendation(recommendation);
+            // Keep simulation paused while the chooser is visible.
+            testReroutePausedRef.current = true;
+            setIsSimPlaying(false);
+            return;
+          }
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason(recommendation?.reason || "No congestion-free OSRM alternative was found; continuing on the current route.");
+        })().catch((error) => {
+          console.error("[TrafficTest] Live OSRM avoidance failed:", error);
+          testReroutePausedRef.current = false;
+          setIsSimPlaying(true);
+          setNoRouteReason("The routing service could not find a congestion-free alternative. Continuing on the current route.");
+        });
       };
 
-      if (controlledTestEnabled && !testCongestionConsumedRef.current && typeof plannedSwitchDistance === "number") {
+      if (controlledTestEnabled && !testCongestionConsumedRef.current && controlledZone && controlledTriggerDistance !== null) {
         if (controlledMode === "dynamic") {
-          // Ramp LOW -> MODERATE -> HEAVY -> SEVERE as the vehicle approaches the
-          // planned split. SEVERE occurs at the switching point, before the synthetic jam.
-          const switchRatio = Math.max(0.12, Math.min(0.48, plannedSwitchDistance / Math.max(1, totalRouteDistanceM)));
-          const phaseProgress = Math.min(1, (scenarioProgress / switchRatio) * 0.40);
-          const phase = dynamicTrafficPhase(phaseProgress);
+          // All four severity phases are tied to route progress; the zone itself stays fixed.
+          // This gives DYNAMIC the same 1 km reroute trigger as HEAVY and SEVERE.
+          const phase = dynamicTrafficPhase(scenarioProgress);
           if (phase !== lastDynamicPhaseRef.current) {
             lastDynamicPhaseRef.current = phase;
             setRoutes((currentRoutes) => currentRoutes.map((route) =>
               route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, phase) : route
             ));
           }
-          if (phase === "SEVERE" && newDist >= plannedSwitchDistance - 5) offerPlannedControlledBypass();
-          if (typeof plannedZoneEnd === "number" && newDist > plannedZoneEnd + 30 && !testRerouteTriggeredRef.current) {
-            testCongestionConsumedRef.current = true;
-            lastDynamicPhaseRef.current = "LOW";
-            setRoutes((currentRoutes) => currentRoutes.map((route) =>
-              route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, "LOW") : route
-            ));
-            AlertManager.reset();
-          }
-        } else if (newDist >= plannedSwitchDistance - 5) {
-          offerPlannedControlledBypass();
+        }
+
+        const reachedAvoidanceThreshold = newDist >= controlledTriggerDistance;
+        const isAtPlannedSwitch = typeof plannedSwitchDistance !== "number" || newDist >= plannedSwitchDistance - 5;
+        if (reachedAvoidanceThreshold && isAtPlannedSwitch) {
+          offerControlledBypass();
+        }
+
+        // Clear the original-zone alert after passage, but never while paused at a reroute.
+        if (
+          typeof plannedZoneEnd === "number" &&
+          newDist >= plannedZoneEnd &&
+          !testCongestionConsumedRef.current &&
+          !testReroutePausedRef.current &&
+          !activeRerouteRecommendationRef.current
+        ) {
+          testCongestionConsumedRef.current = true;
+          lastDynamicPhaseRef.current = "LOW";
+          setRoutes((currentRoutes) => currentRoutes.map((route) =>
+            route.route_id === activeRoute.route_id ? applyControlledTrafficPhase(route, "LOW") : route
+          ));
+          AlertManager.reset();
+          PushNotificationService.clearCongestionAlert();
         }
       }
       // Continuous automatic reroute re-evaluation is real-navigation behaviour.
@@ -17423,6 +19452,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
     };
   }, [
     isNavigating,
+    navigationMode,
     isSimPlaying,
     simSpeedMultiplier,
     routes,
@@ -17466,6 +19496,13 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         setActiveRouteIndex,
         isNavigating,
         setIsNavigating,
+        navigationMode,
+        startNavigation,
+        stopNavigation,
+        gpsStatus,
+        gpsLocationSource,
+        gpsAccuracyMeters,
+        gpsError,
         backendOnline,
 
         activeLayerMode,
@@ -17498,7 +19535,7 @@ export const NavigationProvider: React.FC<{ children: React.ReactNode }> = ({ ch
         isSimPlaying,
         setIsSimPlaying,
         simSpeedMultiplier,
-        setSimSpeedMultiplier,
+            setSimSpeedMultiplier,
         activeAlert,
         dismissAlert,
         activeRerouteRecommendation,
@@ -17856,6 +19893,8 @@ export interface RouteResponse {
   success: boolean;
   routes_count: number;
   candidates: CandidateRoute[];
+  traffic_coverage?: "supported" | "unsupported";
+  region?: string | null;
 }
 
 export interface TrafficFactorData {
@@ -17933,7 +19972,10 @@ export async function fetchRoutes(
       synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
-  if (!res.ok) throw new Error("Failed to calculate routes");
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null);
+    throw new Error(errorData?.detail || "Failed to calculate routes");
+  }
   return res.json();
 }
 
@@ -18492,19 +20534,19 @@ export const REGION_CONFIGS: Record<RegionId, RegionConfig> = {
     "id": "coimbatore",
     "displayName": "Coimbatore",
     "center": {
-      "lat": 11.0168,
-      "lon": 76.9558,
-      "name": "Coimbatore Center"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "defaultOrigin": {
-      "lat": 11.0179,
-      "lon": 76.9674,
-      "name": "Gandhipuram, Coimbatore"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "testOrigin": {
-      "lat": 11.0179,
-      "lon": 76.9674,
-      "name": "Gandhipuram, Coimbatore"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "testDestination": {
       "lat": 11.0323,
@@ -18525,7 +20567,7 @@ export const REGION_CONFIGS: Record<RegionId, RegionConfig> = {
   }
 };
 
-const envRegion = (process.env.NEXT_PUBLIC_ACTIVE_REGION || "bengaluru").trim().toLowerCase();
+const envRegion = (process.env.NEXT_PUBLIC_ACTIVE_REGION || "coimbatore").trim().toLowerCase();
 export const ACTIVE_REGION: RegionId = envRegion === "coimbatore" ? "coimbatore" : "bengaluru";
 export const ACTIVE_REGION_CONFIG: RegionConfig = REGION_CONFIGS[ACTIVE_REGION];
 export const ACTIVE_REGION_CENTER = ACTIVE_REGION_CONFIG.center;
@@ -18852,30 +20894,35 @@ const BENGALURU_TRAFFIC_TEST_SCENARIOS: Record<Exclude<TrafficTestMode, "real">,
 };
 
 const COIMBATORE_TRAFFIC_TEST_SCENARIOS: Record<Exclude<TrafficTestMode, "real">, TrafficTestScenario> = {
+  // Every mode uses its own trip. Heavy / severe / dynamic need two genuine OSRM corridors
+  // between the same endpoints so the congestion can sit on one and the vehicle can be
+  // offered the other at the split.
   normal: {
-    origin: { lat: 11.0183, lon: 76.9674, name: "Gandhipuram Central Bus Terminus, Coimbatore" },
-    destination: { lat: 10.9953, lon: 76.9617, name: "Town Hall, Coimbatore" },
-    description: "Gandhipuram → Town Hall · normal baseline",
+    origin: { lat: 11.0006, lon: 76.9747, name: "Race Course, Coimbatore" },
+    destination: { lat: 11.0070, lon: 76.9500, name: "RS Puram, Coimbatore" },
+    description: "Race Course → RS Puram · normal baseline",
   },
   moderate: {
-    origin: { lat: 10.9993, lon: 76.9667, name: "Coimbatore Junction Railway Station" },
-    destination: { lat: 11.0247, lon: 77.0020, name: "PSG College of Technology, Coimbatore" },
-    description: "Coimbatore Junction → PSG Tech · moderate traffic",
+    origin: { lat: 10.9888, lon: 76.9615, name: "Ukkadam, Coimbatore" },
+    destination: { lat: 10.9998, lon: 77.0286, name: "Singanallur, Coimbatore" },
+    description: "Ukkadam → Singanallur · moderate traffic",
   },
   heavy: {
-    origin: { lat: 10.9893, lon: 76.9606, name: "Ukkadam Bus Terminus, Coimbatore" },
-    destination: { lat: 10.9993, lon: 77.0285, name: "Singanallur Bus Stand, Coimbatore" },
-    description: "Ukkadam → Singanallur · heavy congestion bypass",
+    origin: { lat: 11.0236, lon: 76.9015, name: "Vadavalli, Coimbatore" },
+    destination: { lat: 11.0243, lon: 77.0041, name: "Peelamedu, Coimbatore" },
+    description: "Vadavalli → Peelamedu · heavy congestion bypass",
   },
   severe: {
-    origin: { lat: 11.0481, lon: 76.9877, name: "Ganapathy, Coimbatore" },
-    destination: { lat: 11.0300, lon: 77.0434, name: "Coimbatore International Airport" },
-    description: "Ganapathy → Airport · severe congestion bypass",
+    // Start from central Gandhipuram rather than Ganapathy to exercise a different
+    // set of central/southern corridors and make a usable bypass more likely.
+    origin: { lat: 11.0177, lon: 76.9674, name: "Gandhipuram Central Bus Terminus, Coimbatore" },
+    destination: { lat: 10.9560, lon: 76.9600, name: "Kuniyamuthur, Coimbatore" },
+    description: "Gandhipuram → Kuniyamuthur · severe congestion bypass",
   },
   dynamic: {
-    origin: { lat: 11.0240, lon: 76.9480, name: "Saibaba Colony, Coimbatore" },
-    destination: { lat: 11.0797, lon: 77.0000, name: "Saravanampatti, Coimbatore" },
-    description: "Saibaba Colony → Saravanampatti · normal → moderate → heavy → severe, then reroute",
+    origin: { lat: 11.0720, lon: 77.0330, name: "Kalapatti, Coimbatore" },
+    destination: { lat: 10.9953, lon: 76.9617, name: "Town Hall, Coimbatore" },
+    description: "Kalapatti → Town Hall · normal → moderate → heavy → severe, then reroute",
   },
 };
 

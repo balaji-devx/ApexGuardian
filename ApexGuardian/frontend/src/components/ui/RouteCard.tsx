@@ -15,6 +15,7 @@ import {
   Flame,
   ChevronDown,
   ChevronUp,
+  AlertTriangle,
 } from "lucide-react";
 import { useNavigation } from "@/context/NavigationContext";
 
@@ -29,6 +30,7 @@ export const RouteCard: React.FC = () => {
     startNavigation,
     stopNavigation,
     gpsStatus,
+    gpsAccuracyMeters,
     gpsError,
     isLoadingRoutes,
     isEmergencyMode,
@@ -426,16 +428,24 @@ export const RouteCard: React.FC = () => {
               type="button"
               onClick={() => void startNavigation("gps")}
               disabled={gpsStatus === "locating" || isLoadingRoutes}
-              className="w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-60 bg-emerald-600 hover:bg-emerald-700 text-white shadow-emerald-600/30"
+              className="w-full rounded-xl border border-emerald-700/10 bg-emerald-600 px-5 py-3.5 text-sm font-bold text-white shadow-md shadow-emerald-900/10 transition hover:bg-emerald-700 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 flex items-center justify-center gap-2"
             >
               {gpsStatus === "locating" ? <Loader2 className="w-4 h-4 animate-spin" /> : <MapPin className="w-4 h-4" />}
-              <span>{gpsStatus === "locating" ? "Getting GPS Location…" : "Start with GPS"}</span>
+              <span>
+                {gpsStatus === "locating"
+                  ? gpsAccuracyMeters
+                    ? `Checking location (±${Math.round(gpsAccuracyMeters)} m)…`
+                    : "Checking device location…"
+                  : gpsStatus === "error"
+                  ? "Retry GPS navigation"
+                  : "Start GPS navigation"}
+              </span>
               <ArrowRight className="w-4 h-4 ml-auto" />
             </button>
             <button
               type="button"
               onClick={() => void startNavigation("simulation")}
-              disabled={gpsStatus === "locating" || isLoadingRoutes}
+              disabled={isLoadingRoutes}
               className={`w-full py-3.5 px-5 rounded-xl font-bold text-sm flex items-center justify-center gap-2 shadow-lg transition active:scale-95 disabled:cursor-not-allowed disabled:opacity-60 ${
                 isEmergencyMode
                   ? "bg-gradient-to-r from-rose-600 to-red-600 hover:from-rose-700 hover:to-red-700 text-white shadow-rose-600/30"
@@ -448,10 +458,58 @@ export const RouteCard: React.FC = () => {
               <span>Start Simulation</span>
               <ArrowRight className="w-4 h-4 ml-auto" />
             </button>
+            <div className="flex items-start gap-2.5 rounded-xl border border-slate-200/80 bg-slate-50/90 px-3.5 py-2.5 text-[11px] leading-relaxed text-slate-600">
+              <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+              <p>If a reliable device location is unavailable, GPS navigation starts from PSG Tech and the vehicle marker stays stationary instead of simulating travel.</p>
+            </div>
             {gpsError && (
-              <p role="status" className={`rounded-lg border px-3 py-2 text-xs font-medium ${gpsStatus === "error" ? "border-rose-200 bg-rose-50 text-rose-700" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`}>
-                {gpsError}
-              </p>
+              gpsStatus === "locating" ? (
+                <div role="status" className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5 text-xs font-medium text-amber-200 flex items-start justify-between gap-2 shadow-sm">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <Loader2 className="w-4 h-4 animate-spin text-amber-400 flex-shrink-0 mt-0.5" />
+                    <div className="space-y-0.5">
+                      <p className="text-amber-100 font-semibold">{gpsError}</p>
+                      {gpsAccuracyMeters !== null && (
+                        <p className="text-[10px] text-amber-300/80">
+                          Target accuracy: ≤150 m (current: ±{Math.round(gpsAccuracyMeters)} m)
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={stopNavigation}
+                    className="text-[11px] font-bold text-amber-300 hover:text-amber-100 underline flex-shrink-0 ml-1"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              ) : gpsStatus === "error" ? (
+                <div role="alert" className="rounded-xl border border-rose-500/40 bg-rose-500/10 px-3.5 py-2.5 text-xs font-medium text-rose-200 space-y-2 shadow-sm">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-rose-400 flex-shrink-0 mt-0.5" />
+                    <p className="text-rose-100 leading-relaxed">{gpsError}</p>
+                  </div>
+                  <div className="flex items-center justify-between pt-1 border-t border-rose-500/20 text-[11px]">
+                    {gpsAccuracyMeters !== null ? (
+                      <span className="font-semibold text-rose-300/90">
+                        Reported accuracy: ±{Math.round(gpsAccuracyMeters)} m
+                      </span>
+                    ) : <span />}
+                    <button
+                      type="button"
+                      onClick={() => void startNavigation("gps")}
+                      className="font-bold text-rose-300 hover:text-white underline"
+                    >
+                      Retry GPS
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <p role="status" className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-3.5 py-2 text-xs font-medium text-emerald-200">
+                  {gpsError}
+                </p>
+              )
             )}
           </div>
         )}

@@ -101,7 +101,23 @@ def _profile(active: Sequence[Sequence[float]], active_cum: Sequence[float], byp
     return points
 
 
-def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+# Planning tiers, strictest first. A real road network rarely offers a textbook split, so the
+# planner relaxes (never fabricates geometry) until some genuine OSRM pair works:
+# (min split ratio, max split ratio, min lateral gap at split m, shared-road tolerance m,
+#  min clear gap for the jam m, min jam length m, gap between switch and jam m)
+PLAN_TIERS: Tuple[Tuple[float, float, float, float, float, float, float], ...] = (
+    # Keep at least 1 km between the common-road switch point and the congestion zone.
+    # This makes the 1 km-before-hotspot trigger happen at (not after) the road split.
+    (0.15, 0.48, 55.0, 28.0, 125.0, 350.0, 1000.0),
+    (0.08, 0.60, 40.0, 32.0, 80.0, 300.0, 1000.0),
+    (0.03, 0.75, 30.0, 40.0, 45.0, 250.0, 1000.0),
+    # Last resort relaxes road-separation/clearance constraints, never the 1 km lead distance.
+    (0.02, 0.85, 22.0, 45.0, 40.0, 200.0, 1000.0),
+)
+
+
+def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any], tier: int = 0) -> Optional[Dict[str, Any]]:
+    r_lo, r_hi, split_gap, shared_tol, clear_gap, zone_min, jam_gap = PLAN_TIERS[tier]
     active_coords, bypass_coords = _valid_coords(active), _valid_coords(bypass)
     if not active_coords or not bypass_coords:
         return None
@@ -116,12 +132,12 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
     divergence_i: Optional[int] = None
     for i, (distance, lateral) in enumerate(profile):
         ratio = distance / total
-        if ratio < 0.15 or ratio > 0.48:
+        if ratio < r_lo or ratio > r_hi:
             continue
         end_dist = distance + 100.0
         lookahead = [d for d, offset in profile[i:] if d <= end_dist]
         offsets = [offset for d, offset in profile[i:] if d <= end_dist]
-        if lookahead and lookahead[-1] >= distance + 75 and len(offsets) >= 3 and all(offset > 55.0 for offset in offsets):
+        if lookahead and lookahead[-1] >= distance + 75 and len(offsets) >= 3 and all(offset > split_gap for offset in offsets):
             divergence_i = i
             break
     if divergence_i is None:
@@ -130,39 +146,31 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
     switch_distance: Optional[float] = None
     for j in range(divergence_i - 1, -1, -1):
         d, offset = profile[j]
-        if d / total < 0.12:
+        if d / total < max(0.0, r_lo - 0.03):
             break
-        if offset <= 28.0:
+        if offset <= shared_tol:
             switch_distance = max(0.0, d - 5.0)
             break
-    if switch_distance is None or switch_distance / total > 0.45:
+    if switch_distance is None or switch_distance / total > r_hi - 0.03:
         return None
 
-    # Put the jam only on a section where the precomputed OSRM alternative is at least
-    # 125m away. A 350–500m zone is long enough to see but easy to route around.
-    zone_length = min(500.0, max(350.0, total * 0.06))
-    profile_step = 25.0
-    first_start = switch_distance + 100.0
-    last_start = min(total - zone_length - 100.0, total * 0.78)
+    # Put the jam at the first viable point exactly one kilometre after the shared-road
+    # switch. Moving the zone farther downstream makes the 1 km trigger occur after the
+    # junction and can leave the vehicle unable to join the preplanned bypass.
+    zone_length = min(500.0, max(zone_min, total * 0.06))
+    first_start = switch_distance + jam_gap
+    last_start = min(total - zone_length - 100.0, total * 0.85)
     if first_start > last_start:
         return None
-    best: Optional[Tuple[float, float]] = None  # (clearance, zone_start)
-    d = math.ceil(first_start / profile_step) * profile_step
-    while d <= last_start:
-        window = [offset for sample_d, offset in profile if d - 1.0 <= sample_d <= d + zone_length + 1.0]
-        if window and min(window) >= 125.0:
-            clearance = min(window)
-            if best is None or clearance > best[0]:
-                best = (clearance, d)
-        d += profile_step
-    if best is None:
+    window = [offset for sample_d, offset in profile if first_start - 25.0 <= sample_d <= first_start + zone_length + 25.0]
+    if not window or min(window) < clear_gap:
         return None
-
-    clearance, zone_start = best
+    clearance = min(window)
+    zone_start = first_start
     active_index = int(active.get("route_index", 0))
     bypass_index = int(bypass.get("route_index", 0))
     switch_point = _point_at(active_coords, active_cum, switch_distance)
-    if _distance_to_route_m(switch_point, bypass_coords) > 30.0:
+    if _distance_to_route_m(switch_point, bypass_coords) > max(30.0, shared_tol + 5.0):
         return None
     return {
         "active_route_index": active_index,
@@ -177,24 +185,26 @@ def _plan_pair(active: Dict[str, Any], bypass: Dict[str, Any]) -> Optional[Dict[
 
 
 def plan_controlled_bypass(candidates: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Find the best real route pair and a synthetic jam window the alternative avoids."""
-    best: Optional[Dict[str, Any]] = None
-    best_score = -float("inf")
-    for i, active in enumerate(candidates):
-        for j, bypass in enumerate(candidates):
-            if i == j:
-                continue
-            plan = _plan_pair(active, bypass)
-            if not plan:
-                continue
-            # Prefer a strong side-road separation, with a mild preference for a later,
-            # more visually obvious switching point instead of a very early route change.
-            switch_ratio = plan["switch_distance_m"] / max(1.0, float(active.get("distance_meters", 1.0)))
-            score = plan["minimum_bypass_clearance_m"] - abs(switch_ratio - 0.34) * 180.0
-            if score > best_score:
-                best_score, best = score, plan
-    return best
-
+    """Find a real route pair and a jam window (just after the road split) the alternative avoids."""
+    for tier in range(len(PLAN_TIERS)):
+        best: Optional[Dict[str, Any]] = None
+        best_score = -float("inf")
+        for i, active in enumerate(candidates):
+            for j, bypass in enumerate(candidates):
+                if i == j:
+                    continue
+                plan = _plan_pair(active, bypass, tier)
+                if not plan:
+                    continue
+                # Prefer strong separation and an early split so the jam sits right after it.
+                switch_ratio = plan["switch_distance_m"] / max(1.0, float(active.get("distance_meters", 1.0)))
+                score = plan["minimum_bypass_clearance_m"] - abs(switch_ratio - 0.30) * 180.0
+                if score > best_score:
+                    best_score, best = score, plan
+        if best:
+            best["plan_tier"] = tier
+            return best
+    return None
 
 
 def _bearing_deg(a: Sequence[float], b: Sequence[float]) -> float:
@@ -270,10 +280,17 @@ async def build_controlled_bypass_candidates(
         total = base_cum[-1]
         if total < 2_500:
             continue
-        for fraction in (0.42, 0.55):
+        # Keep the planned entry junction inside _plan_pair's accepted divergence
+        # window (15–48% of the route). A 55% target put the entry after that limit,
+        # so every probe at that position was guaranteed to be rejected on normal routes.
+        # Probe early, middle, and later congestion zones with progressively wider
+        # offsets. Severe-mode routes often need a farther parallel road to reach a
+        # genuinely separate corridor. Entries still land before the planned jam.
+        for fraction, lateral_offset_m in ((0.30, 300.0), (0.42, 500.0), (0.54, 700.0)):
             target_zone_start = total * fraction
             zone_length = min(450.0, max(350.0, total * 0.06))
-            entry_d = max(120.0, target_zone_start - 160.0)
+            # The bypass begins on the shared road about 1 km before the intended jam.
+            entry_d = max(120.0, target_zone_start - 1000.0)
             exit_d = min(total - 100.0, target_zone_start + zone_length + 160.0)
             if exit_d <= entry_d + 500:
                 continue
@@ -284,7 +301,7 @@ async def build_controlled_bypass_candidates(
             tangent_after = _point_at(base_coords, base_cum, min(total, target_zone_start + zone_length + 30.0))
             bearing = _bearing_deg(tangent_before, tangent_after)
             for side in (90.0, -90.0):
-                offset = _offset_point(center, bearing + side, 350.0)
+                offset = _offset_point(center, bearing + side, lateral_offset_m)
                 # IMPORTANT: begin the OSRM leg at an existing point on the chosen route.
                 # This makes the active-route prefix reusable and guarantees a shared approach.
                 waypoints = [
@@ -295,7 +312,7 @@ async def build_controlled_bypass_candidates(
                 ]
                 probe_jobs.append((base, waypoints, entry_d))
     # Do not hammer the public router if there are many origin alternatives.
-    probe_jobs = probe_jobs[:8]
+    probe_jobs = probe_jobs[:12]
     if not probe_jobs:
         return [], None
 
@@ -319,7 +336,7 @@ async def build_controlled_bypass_candidates(
             # would need an artificial connector, or snaps that moved the junction far away.
             snapped_entry = suffix_coords[0]
             along_d, cross_track = _project_distance_along_route(snapped_entry, base_coords, base_cum)
-            if cross_track > 18.0 or abs(along_d - expected_entry_d) > 65.0:
+            if cross_track > 25.0 or abs(along_d - expected_entry_d) > 90.0:
                 continue
             prefix_end = _point_at(base_coords, base_cum, along_d)
             prefix_coords: List[List[float]] = []
@@ -364,7 +381,12 @@ async def build_controlled_bypass_candidates(
                 "maneuver": {"type": "depart", "instruction": "Continue on the current road to the bypass junction", "location": combined[0]},
             }
             stitched["steps"] = [prefix_step] + list(route.get("steps") or [])
-            plan = _plan_pair(base, stitched)
+            plan = None
+            for tier in range(len(PLAN_TIERS)):
+                plan = _plan_pair(base, stitched, tier)
+                if plan:
+                    plan["plan_tier"] = tier
+                    break
             if plan:
                 additions.append(stitched)
                 return additions, plan

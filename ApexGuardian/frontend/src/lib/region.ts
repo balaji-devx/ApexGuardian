@@ -57,19 +57,19 @@ export const REGION_CONFIGS: Record<RegionId, RegionConfig> = {
     "id": "coimbatore",
     "displayName": "Coimbatore",
     "center": {
-      "lat": 11.0168,
-      "lon": 76.9558,
-      "name": "Coimbatore Center"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "defaultOrigin": {
-      "lat": 11.0179,
-      "lon": 76.9674,
-      "name": "Gandhipuram, Coimbatore"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "testOrigin": {
-      "lat": 11.0179,
-      "lon": 76.9674,
-      "name": "Gandhipuram, Coimbatore"
+      "lat": 11.0247,
+      "lon": 77.003,
+      "name": "PSG College of Technology, Peelamedu, Coimbatore"
     },
     "testDestination": {
       "lat": 11.0323,
@@ -90,7 +90,7 @@ export const REGION_CONFIGS: Record<RegionId, RegionConfig> = {
   }
 };
 
-const envRegion = (process.env.NEXT_PUBLIC_ACTIVE_REGION || "bengaluru").trim().toLowerCase();
+const envRegion = (process.env.NEXT_PUBLIC_ACTIVE_REGION || "coimbatore").trim().toLowerCase();
 export const ACTIVE_REGION: RegionId = envRegion === "coimbatore" ? "coimbatore" : "bengaluru";
 export const ACTIVE_REGION_CONFIG: RegionConfig = REGION_CONFIGS[ACTIVE_REGION];
 export const ACTIVE_REGION_CENTER = ACTIVE_REGION_CONFIG.center;

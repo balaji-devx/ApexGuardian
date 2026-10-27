@@ -36,6 +36,7 @@ class RouteRequest(BaseModel):
     traffic_test_mode: TrafficTestMode = TrafficTestMode.REAL
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
     synthetic_traffic_active: bool = True
+    region: Optional[str] = None
 
 class CongestionSegment(BaseModel):
     """Sub-segment of a route with localized real-time and predicted congestion metrics."""
@@ -108,6 +109,8 @@ class RouteResponse(BaseModel):
     success: bool
     routes_count: int
     candidates: List[CandidateRoute]
+    traffic_coverage: Optional[str] = "supported"
+    region: Optional[str] = None
 
 class TrafficFactorsRequest(BaseModel):
     """Query live traffic metrics for a location or corridor."""
@@ -142,6 +145,7 @@ class RerouteRequest(BaseModel):
     traffic_progress: float = Field(default=0.0, ge=0.0, le=1.0)
     recent_routes: List[Dict[str, Any]] = Field(default_factory=list)
     synthetic_traffic_active: bool = True
+    region: Optional[str] = None
 
 class RerouteRecommendation(BaseModel):
     """Alternative route recommendation evaluated from the current location."""

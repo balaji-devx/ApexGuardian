@@ -104,6 +104,8 @@ export interface RouteResponse {
   success: boolean;
   routes_count: number;
   candidates: CandidateRoute[];
+  traffic_coverage?: "supported" | "unsupported";
+  region?: string | null;
 }
 
 export interface TrafficFactorData {
@@ -181,7 +183,10 @@ export async function fetchRoutes(
       synthetic_traffic_active: syntheticTrafficActive,
     }),
   });
-  if (!res.ok) throw new Error("Failed to calculate routes");
+  if (!res.ok) {
+    const errorData = await res.json().catch(() => null);
+    throw new Error(errorData?.detail || "Failed to calculate routes");
+  }
   return res.json();
 }
 

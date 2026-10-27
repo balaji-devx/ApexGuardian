@@ -46,30 +46,35 @@ const BENGALURU_TRAFFIC_TEST_SCENARIOS: Record<Exclude<TrafficTestMode, "real">,
 };
 
 const COIMBATORE_TRAFFIC_TEST_SCENARIOS: Record<Exclude<TrafficTestMode, "real">, TrafficTestScenario> = {
+  // Every mode uses its own trip. Heavy / severe / dynamic need two genuine OSRM corridors
+  // between the same endpoints so the congestion can sit on one and the vehicle can be
+  // offered the other at the split.
   normal: {
-    origin: { lat: 11.0183, lon: 76.9674, name: "Gandhipuram Central Bus Terminus, Coimbatore" },
-    destination: { lat: 10.9953, lon: 76.9617, name: "Town Hall, Coimbatore" },
-    description: "Gandhipuram → Town Hall · normal baseline",
+    origin: { lat: 11.0006, lon: 76.9747, name: "Race Course, Coimbatore" },
+    destination: { lat: 11.0070, lon: 76.9500, name: "RS Puram, Coimbatore" },
+    description: "Race Course → RS Puram · normal baseline",
   },
   moderate: {
-    origin: { lat: 10.9993, lon: 76.9667, name: "Coimbatore Junction Railway Station" },
-    destination: { lat: 11.0247, lon: 77.0020, name: "PSG College of Technology, Coimbatore" },
-    description: "Coimbatore Junction → PSG Tech · moderate traffic",
+    origin: { lat: 10.9888, lon: 76.9615, name: "Ukkadam, Coimbatore" },
+    destination: { lat: 10.9998, lon: 77.0286, name: "Singanallur, Coimbatore" },
+    description: "Ukkadam → Singanallur · moderate traffic",
   },
   heavy: {
-    origin: { lat: 10.9893, lon: 76.9606, name: "Ukkadam Bus Terminus, Coimbatore" },
-    destination: { lat: 10.9993, lon: 77.0285, name: "Singanallur Bus Stand, Coimbatore" },
-    description: "Ukkadam → Singanallur · heavy congestion bypass",
+    origin: { lat: 11.0236, lon: 76.9015, name: "Vadavalli, Coimbatore" },
+    destination: { lat: 11.0243, lon: 77.0041, name: "Peelamedu, Coimbatore" },
+    description: "Vadavalli → Peelamedu · heavy congestion bypass",
   },
   severe: {
-    origin: { lat: 11.0481, lon: 76.9877, name: "Ganapathy, Coimbatore" },
-    destination: { lat: 11.0300, lon: 77.0434, name: "Coimbatore International Airport" },
-    description: "Ganapathy → Airport · severe congestion bypass",
+    // Start from central Gandhipuram rather than Ganapathy to exercise a different
+    // set of central/southern corridors and make a usable bypass more likely.
+    origin: { lat: 11.0177, lon: 76.9674, name: "Gandhipuram Central Bus Terminus, Coimbatore" },
+    destination: { lat: 10.9560, lon: 76.9600, name: "Kuniyamuthur, Coimbatore" },
+    description: "Gandhipuram → Kuniyamuthur · severe congestion bypass",
   },
   dynamic: {
-    origin: { lat: 11.0240, lon: 76.9480, name: "Saibaba Colony, Coimbatore" },
-    destination: { lat: 11.0797, lon: 77.0000, name: "Saravanampatti, Coimbatore" },
-    description: "Saibaba Colony → Saravanampatti · normal → moderate → heavy → severe, then reroute",
+    origin: { lat: 11.0720, lon: 77.0330, name: "Kalapatti, Coimbatore" },
+    destination: { lat: 10.9953, lon: 76.9617, name: "Town Hall, Coimbatore" },
+    description: "Kalapatti → Town Hall · normal → moderate → heavy → severe, then reroute",
   },
 };
 
